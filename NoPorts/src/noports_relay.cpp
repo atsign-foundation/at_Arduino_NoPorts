@@ -101,6 +101,32 @@ static int _create_enc_dec(const unsigned char *key_c2d_b64, const unsigned char
   return 0;
 }
 
+// Internal: write all bytes to a WiFiClient, handling partial writes.
+// WiFiClient.write() may write fewer bytes than requested if the TCP
+// send buffer is full. We must retry to avoid dropping data, which
+// would desynchronize the AES-CTR counter on the other side.
+static bool _write_all(WiFiClient *client, const uint8_t *data, size_t len) {
+  size_t written = 0;
+  unsigned long start = millis();
+  while (written < len) {
+    if (!client->connected()) return false;
+    size_t n = client->write(data + written, len - written);
+    if (n > 0) {
+      written += n;
+      start = millis(); // reset timeout on progress
+    } else {
+      // TCP buffer full — yield briefly and retry
+      if ((millis() - start) > 5000) {
+        NOPORTS_LOGE(TAG, "write_all stalled for 5s, giving up (%u/%u)",
+                     (unsigned)written, (unsigned)len);
+        return false;
+      }
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+  }
+  return true;
+}
+
 // Internal: encrypt/decrypt in-place using AES-CTR
 static int _aes_ctr_crypt(aes_ctr_state *state, size_t len,
                           const unsigned char *input, unsigned char *output) {
@@ -435,11 +461,9 @@ static void _relay_task(void *pvParameters) {
       NOPORTS_LOGI(TAG, "Replaying %d early bytes from data socket", early_len);
       if (data_encrypted && data_dec) {
         _aes_ctr_crypt(data_dec, early_len, early_raw, crypt_buf);
-        relay->local_client.write(crypt_buf, early_len);
-        relay->local_client.flush();
+        _write_all(&relay->local_client, crypt_buf, early_len);
       } else {
-        relay->local_client.write(early_raw, early_len);
-        relay->local_client.flush();
+        _write_all(&relay->local_client, early_raw, early_len);
       }
       total_rvd_to_local += early_len;
     }
@@ -474,9 +498,15 @@ static void _relay_task(void *pvParameters) {
         }
         if (data_encrypted && data_dec) {
           _aes_ctr_crypt(data_dec, n, buf, crypt_buf);
-          relay->local_client.write(crypt_buf, n);
+          if (!_write_all(&relay->local_client, crypt_buf, n)) {
+            NOPORTS_LOGI(TAG, "Local write failed (RVD->Local)");
+            break;
+          }
         } else {
-          relay->local_client.write(buf, n);
+          if (!_write_all(&relay->local_client, buf, n)) {
+            NOPORTS_LOGI(TAG, "Local write failed (RVD->Local)");
+            break;
+          }
         }
       } else if (n < 0) {
         NOPORTS_LOGI(TAG, "Data read error");
@@ -496,11 +526,15 @@ static void _relay_task(void *pvParameters) {
         }
         if (data_encrypted && data_enc) {
           _aes_ctr_crypt(data_enc, n, buf, crypt_buf);
-          data->write(crypt_buf, n);
-          data->flush();
+          if (!_write_all(data, crypt_buf, n)) {
+            NOPORTS_LOGI(TAG, "Data write failed (Local->RVD)");
+            break;
+          }
         } else {
-          data->write(buf, n);
-          data->flush();
+          if (!_write_all(data, buf, n)) {
+            NOPORTS_LOGI(TAG, "Data write failed (Local->RVD)");
+            break;
+          }
         }
       } else if (n < 0) {
         NOPORTS_LOGI(TAG, "Local read error");
