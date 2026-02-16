@@ -34,67 +34,67 @@ struct aes_ctr_state {
   size_t nc_off;
 };
 
-// Internal: create encrypter and decrypter from base64 key and IV
-static int _create_enc_dec(const unsigned char *key_b64, const unsigned char *iv_b64,
-                           aes_ctr_state **enc_out, aes_ctr_state **dec_out) {
-  // Decode key
+// Internal: create a single AES-CTR state from base64 key and IV
+static aes_ctr_state *_create_aes_ctr_state(const unsigned char *key_b64,
+                                              const unsigned char *iv_b64) {
   unsigned char aes_key[32];
-  size_t key_len = 0;
-
-  // Simple base64 decode (we reimplement to avoid atchops dependency in relay)
-  // Actually, use mbedtls base64 since it's always available on ESP32
-  int res;
   size_t olen;
 
-  res = mbedtls_base64_decode(aes_key, sizeof(aes_key), &olen,
-                              key_b64, strlen((const char *)key_b64));
+  int res = mbedtls_base64_decode(aes_key, sizeof(aes_key), &olen,
+                                  key_b64, strlen((const char *)key_b64));
   if (res != 0 || olen != 32) {
-    NOPORTS_LOGE(TAG, "Failed to decode AES key");
-    return -1;
+    NOPORTS_LOGE(TAG, "Failed to decode AES key (res=%d, len=%u)", res, (unsigned)olen);
+    return NULL;
   }
 
-  // Decode IV
   unsigned char iv[16];
   res = mbedtls_base64_decode(iv, sizeof(iv), &olen,
                               iv_b64, strlen((const char *)iv_b64));
   if (res != 0 || olen != 16) {
-    NOPORTS_LOGE(TAG, "Failed to decode IV");
-    return -1;
+    NOPORTS_LOGE(TAG, "Failed to decode IV (res=%d, len=%u)", res, (unsigned)olen);
+    return NULL;
   }
 
-  // Create encrypter
-  aes_ctr_state *enc = (aes_ctr_state *)calloc(1, sizeof(aes_ctr_state));
-  if (!enc) return -1;
+  aes_ctr_state *state = (aes_ctr_state *)calloc(1, sizeof(aes_ctr_state));
+  if (!state) return NULL;
 
-  mbedtls_aes_init(&enc->ctx);
-  res = mbedtls_aes_setkey_enc(&enc->ctx, aes_key, 256);
+  mbedtls_aes_init(&state->ctx);
+  res = mbedtls_aes_setkey_enc(&state->ctx, aes_key, 256);
   if (res != 0) {
-    free(enc);
-    return -1;
+    free(state);
+    return NULL;
   }
-  memcpy(enc->nonce_counter, iv, 16);
-  enc->nc_off = 0;
-  memset(enc->stream_block, 0, 16);
+  memcpy(state->nonce_counter, iv, 16);
+  state->nc_off = 0;
+  memset(state->stream_block, 0, 16);
 
-  // Create decrypter
-  aes_ctr_state *dec = (aes_ctr_state *)calloc(1, sizeof(aes_ctr_state));
-  if (!dec) {
-    mbedtls_aes_free(&enc->ctx);
-    free(enc);
-    return -1;
+  return state;
+}
+
+// Internal: create encrypter and decrypter from base64 key(s) and IV(s)
+// If key_d2c_b64/iv_d2c_b64 are non-NULL, twin-key mode: enc uses D2C, dec uses C2D
+// Otherwise, single-key mode: both enc and dec use the same key/IV
+static int _create_enc_dec(const unsigned char *key_c2d_b64, const unsigned char *iv_c2d_b64,
+                           const unsigned char *key_d2c_b64, const unsigned char *iv_d2c_b64,
+                           aes_ctr_state **enc_out, aes_ctr_state **dec_out) {
+  // Decrypter always uses C2D key (decrypts what client encrypted)
+  aes_ctr_state *dec = _create_aes_ctr_state(key_c2d_b64, iv_c2d_b64);
+  if (!dec) return -1;
+
+  // Encrypter uses D2C key if available, else same C2D key
+  aes_ctr_state *enc;
+  if (key_d2c_b64 && iv_d2c_b64) {
+    enc = _create_aes_ctr_state(key_d2c_b64, iv_d2c_b64);
+    NOPORTS_LOGI(TAG, "Twin-key mode: separate keys for enc (D2C) and dec (C2D)");
+  } else {
+    enc = _create_aes_ctr_state(key_c2d_b64, iv_c2d_b64);
+    NOPORTS_LOGI(TAG, "Single-key mode: same key for enc and dec");
   }
-
-  mbedtls_aes_init(&dec->ctx);
-  res = mbedtls_aes_setkey_enc(&dec->ctx, aes_key, 256);
-  if (res != 0) {
-    mbedtls_aes_free(&enc->ctx);
-    free(enc);
+  if (!enc) {
+    mbedtls_aes_free(&dec->ctx);
     free(dec);
     return -1;
   }
-  memcpy(dec->nonce_counter, iv, 16);
-  dec->nc_off = 0;
-  memset(dec->stream_block, 0, 16);
 
   *enc_out = enc;
   *dec_out = dec;
@@ -209,15 +209,10 @@ static void _relay_task(void *pvParameters) {
     ctrl_dec_A = (aes_ctr_state *)relay->decrypter;
     relay->decrypter = NULL;  // take ownership
 
-    // Create duplicate for sockB
+    // Create duplicate for sockB from the same C2D session keys
     if (relay->config.session_aes_key && relay->config.session_iv) {
-      aes_ctr_state *enc2 = NULL;
-      int r = _create_enc_dec(relay->config.session_aes_key,
-                              relay->config.session_iv, &enc2, &ctrl_dec_B);
-      if (r == 0 && enc2) {
-        mbedtls_aes_free(&enc2->ctx);
-        free(enc2);  // don't need the encrypter
-      }
+      ctrl_dec_B = _create_aes_ctr_state(relay->config.session_aes_key,
+                                          relay->config.session_iv);
     }
   }
 
@@ -338,20 +333,39 @@ static void _relay_task(void *pvParameters) {
       NOPORTS_LOGI(TAG, "No e2ee for data channel, plain relay");
       data_encrypted = false;
     } else {
-      char *colon = strchr(key_start, ':');
-      if (!colon) {
-        NOPORTS_LOGE(TAG, "Invalid connect message (missing IV separator)");
+      // Parse fields: connect:keyC2D:ivC2D[:keyD2C:ivD2C]\n
+      // Split on colons to find all fields
+      char *fields[4] = {NULL, NULL, NULL, NULL};
+      int nfields = 0;
+      char *p = key_start;
+      fields[nfields++] = p;
+      while (*p && nfields < 4) {
+        if (*p == ':') {
+          *p = '\0';
+          fields[nfields++] = p + 1;
+        }
+        p++;
+      }
+
+      if (nfields < 2) {
+        NOPORTS_LOGE(TAG, "Invalid connect message (need at least key:iv, got %d fields)", nfields);
         relay->state = RELAY_ERROR;
         goto cleanup;
       }
-      *colon = '\0';
-      char *iv_start = colon + 1;
 
-      NOPORTS_LOGI(TAG, "Data E2EE: key=%d chars, iv=%d chars",
-                   (int)strlen(key_start), (int)strlen(iv_start));
+      char *key_c2d = fields[0];
+      char *iv_c2d = fields[1];
+      char *key_d2c = (nfields >= 4) ? fields[2] : NULL;
+      char *iv_d2c = (nfields >= 4) ? fields[3] : NULL;
 
-      int enc_res = _create_enc_dec((const unsigned char *)key_start,
-                                     (const unsigned char *)iv_start,
+      NOPORTS_LOGI(TAG, "Data E2EE: keyC2D=%d iv=%d %s",
+                   (int)strlen(key_c2d), (int)strlen(iv_c2d),
+                   key_d2c ? "TWIN-KEY" : "single-key");
+
+      int enc_res = _create_enc_dec((const unsigned char *)key_c2d,
+                                     (const unsigned char *)iv_c2d,
+                                     (const unsigned char *)key_d2c,
+                                     (const unsigned char *)iv_d2c,
                                      &data_enc, &data_dec);
       if (enc_res != 0) {
         NOPORTS_LOGE(TAG, "Failed to create data channel AES-CTR state");
@@ -556,6 +570,14 @@ cleanup:
     free(relay->config.session_iv);
     relay->config.session_iv = NULL;
   }
+  if (relay->config.session_aes_key_d2c) {
+    free(relay->config.session_aes_key_d2c);
+    relay->config.session_aes_key_d2c = NULL;
+  }
+  if (relay->config.session_iv_d2c) {
+    free(relay->config.session_iv_d2c);
+    relay->config.session_iv_d2c = NULL;
+  }
 
   relay->state = RELAY_STOPPED;
   relay->task_handle = NULL;
@@ -589,15 +611,15 @@ int noports_relay_start(NoPortsRelay *relay, const NoPortsRelayConfig *config) {
   // Set up control channel decrypter from daemon-generated session keys.
   // This is used to decrypt the client's connect: message on the control channel.
   // The data channel uses separate keys from the connect: message itself.
+  // Control channel uses C2D key for decrypting (client encrypts with C2D).
   if (config->rv_e2ee && config->session_aes_key && config->session_iv) {
-    aes_ctr_state *enc = NULL, *dec = NULL;
-    int res = _create_enc_dec(config->session_aes_key, config->session_iv, &enc, &dec);
-    if (res != 0) {
-      NOPORTS_LOGE(TAG, "Failed to setup control channel encryption");
+    aes_ctr_state *dec = _create_aes_ctr_state(config->session_aes_key, config->session_iv);
+    if (!dec) {
+      NOPORTS_LOGE(TAG, "Failed to setup control channel decrypter");
       return -1;
     }
-    relay->encrypter = enc;  // not used for control channel, but kept for symmetry
     relay->decrypter = dec;  // used to decrypt incoming connect: message
+    relay->encrypter = NULL; // not needed for control channel
   }
 
   // Create FreeRTOS task (replaces fork() from C sshnpd)

@@ -885,34 +885,50 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
   }
 
   // Handle E2EE (from handler_commons.c setup_rvd_session_encryption)
-  // Daemon generates AES key + IV, encrypts them with client's ephemeral RSA PK,
-  // sends encrypted versions in success response, and uses plaintext versions
-  // for the control channel encryption.
+  // Daemon generates TWO AES key/IV pairs (C2D + D2C), encrypts them with
+  // client's ephemeral RSA PK, sends encrypted versions in success response,
+  // and uses plaintext versions for control channel encryption.
+  // Twin-key mode: C2D for Client→Daemon, D2C for Daemon→Client
   bool encrypt_rvd_traffic = cJSON_IsTrue(cJSON_GetObjectItem(payload, "encryptRvdTraffic"));
   char *session_aes_key_b64 = NULL;
   char *session_iv_b64 = NULL;
+  char *session_aes_key_d2c_b64 = NULL;
+  char *session_iv_d2c_b64 = NULL;
 
   if (encrypt_rvd_traffic) {
     relay_cfg.rv_e2ee = true;
 
-    // Generate session AES key and IV
+    // Generate C2D session AES key and IV
     unsigned char aes_key[32], iv[16];
     memset(aes_key, 0, 32);
     memset(iv, 0, 16);
-
     atchops_aes_generate_key(aes_key, ATCHOPS_AES_256);
     atchops_iv_generate(iv);
 
-    // Base64 encode plaintext key/IV for relay's control channel
+    // Generate D2C session AES key and IV
+    unsigned char aes_key_d2c[32], iv_d2c[16];
+    memset(aes_key_d2c, 0, 32);
+    memset(iv_d2c, 0, 16);
+    atchops_aes_generate_key(aes_key_d2c, ATCHOPS_AES_256);
+    atchops_iv_generate(iv_d2c);
+
+    // Base64 encode plaintext keys for relay's control channel
     relay_cfg.session_aes_key = (unsigned char *)malloc(49);
     relay_cfg.session_iv = (unsigned char *)malloc(25);
+    relay_cfg.session_aes_key_d2c = (unsigned char *)malloc(49);
+    relay_cfg.session_iv_d2c = (unsigned char *)malloc(25);
 
-    if (relay_cfg.session_aes_key && relay_cfg.session_iv) {
+    if (relay_cfg.session_aes_key && relay_cfg.session_iv &&
+        relay_cfg.session_aes_key_d2c && relay_cfg.session_iv_d2c) {
       size_t len;
       atchops_base64_encode(aes_key, 32, (char *)relay_cfg.session_aes_key, 49, &len);
       atchops_base64_encode(iv, 16, (char *)relay_cfg.session_iv, 25, &len);
+      atchops_base64_encode(aes_key_d2c, 32, (char *)relay_cfg.session_aes_key_d2c, 49, &len);
+      atchops_base64_encode(iv_d2c, 16, (char *)relay_cfg.session_iv_d2c, 25, &len);
 
-      // Encrypt the session key/IV with client's ephemeral RSA public key
+      NOPORTS_LOGI(TAG, "NPT: generated twin session keys (C2D + D2C)");
+
+      // Encrypt the session keys with client's ephemeral RSA public key
       cJSON *client_pk = cJSON_GetObjectItem(payload, "clientEphemeralPK");
       cJSON *client_pk_type = cJSON_GetObjectItem(payload, "clientEphemeralPKType");
 
@@ -926,27 +942,49 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
         res = atchops_rsa_key_populate_public_key(&ephem_pk, pk_str, strlen(pk_str));
 
         if (res == 0) {
-          // Encrypt AES key with client's ephemeral PK
-          unsigned char enc_key[256];
+          unsigned char enc_buf[256];
+
+          // Encrypt C2D AES key
           res = atchops_rsa_encrypt(&ephem_pk, relay_cfg.session_aes_key,
-                                    strlen((char *)relay_cfg.session_aes_key), enc_key);
+                                    strlen((char *)relay_cfg.session_aes_key), enc_buf);
           if (res == 0) {
             session_aes_key_b64 = (char *)malloc(384);
             if (session_aes_key_b64) {
               size_t b64_len;
-              atchops_base64_encode(enc_key, 256, session_aes_key_b64, 384, &b64_len);
+              atchops_base64_encode(enc_buf, 256, session_aes_key_b64, 384, &b64_len);
             }
           }
 
-          // Encrypt IV with client's ephemeral PK
-          unsigned char enc_iv[256];
+          // Encrypt C2D IV
           res = atchops_rsa_encrypt(&ephem_pk, relay_cfg.session_iv,
-                                    strlen((char *)relay_cfg.session_iv), enc_iv);
+                                    strlen((char *)relay_cfg.session_iv), enc_buf);
           if (res == 0) {
             session_iv_b64 = (char *)malloc(384);
             if (session_iv_b64) {
               size_t b64_len;
-              atchops_base64_encode(enc_iv, 256, session_iv_b64, 384, &b64_len);
+              atchops_base64_encode(enc_buf, 256, session_iv_b64, 384, &b64_len);
+            }
+          }
+
+          // Encrypt D2C AES key
+          res = atchops_rsa_encrypt(&ephem_pk, relay_cfg.session_aes_key_d2c,
+                                    strlen((char *)relay_cfg.session_aes_key_d2c), enc_buf);
+          if (res == 0) {
+            session_aes_key_d2c_b64 = (char *)malloc(384);
+            if (session_aes_key_d2c_b64) {
+              size_t b64_len;
+              atchops_base64_encode(enc_buf, 256, session_aes_key_d2c_b64, 384, &b64_len);
+            }
+          }
+
+          // Encrypt D2C IV
+          res = atchops_rsa_encrypt(&ephem_pk, relay_cfg.session_iv_d2c,
+                                    strlen((char *)relay_cfg.session_iv_d2c), enc_buf);
+          if (res == 0) {
+            session_iv_d2c_b64 = (char *)malloc(384);
+            if (session_iv_d2c_b64) {
+              size_t b64_len;
+              atchops_base64_encode(enc_buf, 256, session_iv_d2c_b64, 384, &b64_len);
             }
           }
         }
@@ -963,6 +1001,8 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
     cJSON_Delete(envelope);
     if (session_aes_key_b64) free(session_aes_key_b64);
     if (session_iv_b64) free(session_iv_b64);
+    if (session_aes_key_d2c_b64) free(session_aes_key_d2c_b64);
+    if (session_iv_d2c_b64) free(session_iv_d2c_b64);
     return;
   }
 
@@ -978,6 +1018,12 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
     }
     if (session_iv_b64) {
       cJSON_AddStringToObject(res_payload, "sessionIV", session_iv_b64);
+    }
+    if (session_aes_key_d2c_b64) {
+      cJSON_AddStringToObject(res_payload, "aesKeyD2C", session_aes_key_d2c_b64);
+    }
+    if (session_iv_d2c_b64) {
+      cJSON_AddStringToObject(res_payload, "ivD2C", session_iv_d2c_b64);
     }
 
     cJSON *res_envelope = cJSON_CreateObject();
@@ -1055,6 +1101,8 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
 
   if (session_aes_key_b64) free(session_aes_key_b64);
   if (session_iv_b64) free(session_iv_b64);
+  if (session_aes_key_d2c_b64) free(session_aes_key_d2c_b64);
+  if (session_iv_d2c_b64) free(session_iv_d2c_b64);
   cJSON_Delete(envelope);
 }
 

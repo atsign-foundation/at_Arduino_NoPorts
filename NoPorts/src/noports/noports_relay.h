@@ -52,8 +52,10 @@ struct NoPortsRelayConfig {
 
   // End-to-end encryption
   bool           rv_e2ee;             // encrypt traffic?
-  unsigned char *session_aes_key;     // base64 AES-256 key
-  unsigned char *session_iv;          // base64 IV
+  unsigned char *session_aes_key;     // base64 AES-256 key (C2D)
+  unsigned char *session_iv;          // base64 IV (C2D)
+  unsigned char *session_aes_key_d2c; // base64 AES-256 key (D2C), NULL for single-key
+  unsigned char *session_iv_d2c;      // base64 IV (D2C), NULL for single-key
 
   // Multi-mode (for NPT requests)
   bool multi;
