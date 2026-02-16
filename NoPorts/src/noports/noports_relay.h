@@ -1,0 +1,112 @@
+/**
+ * @file noports_relay.h
+ * @brief TCP socket relay (srv equivalent) for ESP32
+ *
+ * Replaces the srv (socket relay valve) component from the C sshnpd.
+ * The original srv uses pthreads + mbedtls_net for socket-to-socket relaying.
+ * This ESP32 version uses FreeRTOS tasks + WiFiClient for TCP connections.
+ *
+ * The relay creates a bidirectional bridge between:
+ *   - The RVD (rendezvous daemon) at rvd_host:rvd_port
+ *   - A local service at local_host:local_port
+ *
+ * Optionally supports:
+ *   - RVD authentication (signing session with RSA key)
+ *   - End-to-end AES-CTR encryption of traffic
+ */
+
+#ifndef NOPORTS_RELAY_H
+#define NOPORTS_RELAY_H
+
+#include <Arduino.h>
+#include <WiFiClient.h>
+
+// Forward declaration
+struct NoPortsRelayConfig;
+
+// Relay states
+enum NoPortsRelayState {
+  RELAY_IDLE,
+  RELAY_CONNECTING,
+  RELAY_AUTHENTICATING,
+  RELAY_RUNNING,
+  RELAY_ERROR,
+  RELAY_STOPPED,
+};
+
+/**
+ * @brief Configuration for a single relay instance
+ */
+struct NoPortsRelayConfig {
+  // RVD (rendezvous) side
+  const char *rvd_host;
+  uint16_t    rvd_port;
+
+  // Local service side
+  const char *local_host;   // typically "127.0.0.1" or "localhost"
+  uint16_t    local_port;
+
+  // Authentication
+  bool        rv_auth;           // authenticate to RVD?
+  char       *rvd_auth_string;   // JSON auth envelope
+
+  // End-to-end encryption
+  bool           rv_e2ee;             // encrypt traffic?
+  unsigned char *session_aes_key;     // base64 AES-256 key
+  unsigned char *session_iv;          // base64 IV
+
+  // Multi-mode (for NPT requests)
+  bool multi;
+
+  // Session ID for tracking
+  char session_id[64];
+};
+
+/**
+ * @brief A running relay instance
+ *
+ * Managed internally by the daemon. Each NPT request spawns one relay
+ * as a FreeRTOS task instead of fork()+pthread as in the Linux version.
+ */
+struct NoPortsRelay {
+  NoPortsRelayConfig config;
+  NoPortsRelayState  state;
+  TaskHandle_t       task_handle;
+  WiFiClient         rvd_client;    // connection to RVD
+  WiFiClient         local_client;  // connection to local service
+  volatile bool      should_run;
+
+  // AES-CTR state for encryption (if enabled)
+  // Uses mbedtls_aes_context from ESP-IDF's built-in mbedTLS
+  void *encrypter; // opaque, cast to internal aes_ctr_state*
+  void *decrypter;
+};
+
+/**
+ * @brief Initialize a relay config with defaults
+ */
+void noports_relay_config_init(NoPortsRelayConfig *cfg);
+
+/**
+ * @brief Start a relay as a FreeRTOS task
+ *
+ * This replaces the fork() + run_srv_process() from the C sshnpd.
+ * Returns immediately; the relay runs in the background.
+ *
+ * @param relay  Pointer to relay struct (caller must keep alive)
+ * @param config Relay configuration (copied internally)
+ * @return 0 on success, non-zero on failure
+ */
+int noports_relay_start(NoPortsRelay *relay, const NoPortsRelayConfig *config);
+
+/**
+ * @brief Stop a running relay
+ */
+void noports_relay_stop(NoPortsRelay *relay);
+
+/**
+ * @brief Check if a relay is still running
+ */
+bool noports_relay_is_running(const NoPortsRelay *relay);
+
+#endif // NOPORTS_RELAY_H
