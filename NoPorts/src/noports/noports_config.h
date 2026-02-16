@@ -14,8 +14,8 @@
 // ---------------------------------------------------------------------------
 // Version & protocol constants (from sshnpd/version.h and sshnpd/sshnpd.h)
 // ---------------------------------------------------------------------------
-#define NOPORTS_VERSION          "0.1.0"
-#define NOPORTS_CORE_PKG_VERSION "c0.1.0-arduino"
+#define NOPORTS_VERSION          "1.5.0"
+#define NOPORTS_CORE_PKG_VERSION "c1.5.0-arduino"
 
 #define NOPORTS_DEFAULT_ROOT_HOST "root.atsign.org"
 #define NOPORTS_DEFAULT_ROOT_PORT 64

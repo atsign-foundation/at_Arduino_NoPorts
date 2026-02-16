@@ -537,6 +537,9 @@ void NoPortsDaemon::_buildPingResponse() {
   cJSON_AddBoolToObject(features, "srE2ee", true);
   cJSON_AddBoolToObject(features, "acceptsPublicKeys", false); // no SSH keys on Arduino
   cJSON_AddBoolToObject(features, "supportsPortChoice", true);
+  cJSON_AddBoolToObject(features, "adjustableTimeout", true);
+  cJSON_AddBoolToObject(features, "controlChannelHeartbeats", true);
+  cJSON_AddBoolToObject(features, "twinKeys", true);
   cJSON_AddItemToObject(ping_json, "supportedFeatures", features);
 
   // Allowed services from permitopen config
@@ -849,6 +852,16 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
   relay_cfg.local_host = cJSON_GetStringValue(requested_host);
   relay_cfg.local_port = (uint16_t)cJSON_GetNumberValue(requested_port);
   relay_cfg.multi = true;
+
+  // Parse idle timeout from NPT request (sent in milliseconds by client)
+  cJSON *timeout_item = cJSON_GetObjectItem(payload, "timeout");
+  if (cJSON_IsNumber(timeout_item)) {
+    uint32_t timeout_ms = (uint32_t)cJSON_GetNumberValue(timeout_item);
+    relay_cfg.idle_timeout_ms = timeout_ms;
+    NOPORTS_LOGI(TAG, "NPT: client requested timeout %u ms", (unsigned)timeout_ms);
+  } else {
+    relay_cfg.idle_timeout_ms = 0; // use default
+  }
 
   strncpy(relay_cfg.session_id, cJSON_GetStringValue(session_id),
           sizeof(relay_cfg.session_id) - 1);

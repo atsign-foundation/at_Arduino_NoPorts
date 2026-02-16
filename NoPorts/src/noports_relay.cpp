@@ -186,7 +186,8 @@ static void _relay_task_inner(NoPortsRelay *relay) {
   unsigned long relay_start_time = 0;
   const unsigned long GRACE_PERIOD_MS = 15000;
   unsigned long idle_since = 0;
-  const unsigned long IDLE_TIMEOUT_MS = 60000;
+  const unsigned long IDLE_TIMEOUT_MS =
+      (relay->config.idle_timeout_ms > 0) ? relay->config.idle_timeout_ms : 60000UL;
   unsigned long total_rvd_to_local = 0;
   unsigned long total_local_to_rvd = 0;
   unsigned long last_stats_time = 0;
@@ -565,6 +566,19 @@ static void _relay_task_inner(NoPortsRelay *relay) {
       } else if (n < 0) {
         NOPORTS_LOGI(TAG, "Local read error");
         break;
+      }
+    }
+
+    // Drain control channel (heartbeats / keepalive messages)
+    // The NPT client sends periodic heartbeats on the control channel.
+    // If we don't read them, the TCP receive buffer fills up and SRVD
+    // may tear down the port. Read and discard any data.
+    if (ctrl && ctrl->available()) {
+      int n = ctrl->read(buf, RELAY_BUF_SIZE);
+      if (n > 0) {
+        activity = true;  // heartbeat counts as activity for idle timeout
+        idle_since = millis();
+        NOPORTS_LOGD(TAG, "Ctrl channel heartbeat: %d bytes drained", n);
       }
     }
 

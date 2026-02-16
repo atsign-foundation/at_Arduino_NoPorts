@@ -60,6 +60,9 @@ struct NoPortsRelayConfig {
   // Multi-mode (for NPT requests)
   bool multi;
 
+  // Idle timeout in milliseconds (0 = use default 60s)
+  uint32_t idle_timeout_ms;
+
   // Session ID for tracking
   char session_id[64];
 };
