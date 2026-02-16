@@ -29,10 +29,10 @@
 #define NOPORTS_MONITOR_NOOP_TIMEOUT_MS  40000
 
 // Maximum number of permitopen entries
-#define NOPORTS_MAX_PERMITOPEN 16
+#define NOPORTS_MAX_PERMITOPEN 255
 
 // Maximum number of manager atSigns
-#define NOPORTS_MAX_MANAGERS   4
+#define NOPORTS_MAX_MANAGERS   16
 
 // ---------------------------------------------------------------------------
 // Notification key types (from sshnpd/sshnpd.h)

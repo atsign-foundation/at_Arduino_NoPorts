@@ -158,7 +158,7 @@ ssh user@localhost -p 2222
 struct NoPortsConfig {
   const char *atsign;          // Device's atSign (required)
   const char *device_name;     // Device name for discovery (required)
-  const char *manager_list[4]; // Allowed manager atSigns
+  const char *manager_list[16]; // Allowed manager atSigns
   uint8_t     manager_count;   // Number of managers
 
   const char *root_domain;     // atDirectory host (default: root.atsign.org)
@@ -166,7 +166,7 @@ struct NoPortsConfig {
   bool        verbose;         // Enable debug logging
   bool        hide;            // Don't publish device info
 
-  NoPortsPermitOpen permitopen[16]; // Allowed tunnel targets (LAN hosts)
+  NoPortsPermitOpen permitopen[255]; // Allowed tunnel targets (LAN hosts)
   uint8_t           permitopen_count;
 
   // Callbacks (optional)
