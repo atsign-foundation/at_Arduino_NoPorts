@@ -1,46 +1,34 @@
 
-This directory is intended for project specific (private) libraries.
-PlatformIO will compile them to static libraries and link into the executable file.
+# Arduino Libraries
 
-The source code of each library should be placed in a separate directory
-("lib/your_library_name/[Code]").
+This directory contains the shared Arduino libraries used by packages in this
+repository.
 
-For example, see the structure of the following example libraries `Foo` and `Bar`:
+| Library | Description | Include |
+|---|---|---|
+| **at_client** | atSDK for ESP32 — atclient, atchops, atauth, atlogger, cJSON | `#include <atsdk.h>` |
+| **NoPorts** | NoPorts daemon (sshnpd) — secure tunneling via atProtocol | `#include <NoPorts.h>` |
 
-|--lib
-|  |
-|  |--Bar
-|  |  |--docs
-|  |  |--examples
-|  |  |--src
-|  |     |- Bar.c
-|  |     |- Bar.h
-|  |  |- library.json (optional. for custom build options, etc) https://docs.platformio.org/page/librarymanager/config.html
-|  |
-|  |--Foo
-|  |  |- Foo.c
-|  |  |- Foo.h
-|  |
-|  |- README --> THIS FILE
-|
-|- platformio.ini
-|--src
-   |- main.c
+## Usage
 
-Example contents of `src/main.c` using Foo and Bar:
-```
-#include <Foo.h>
-#include <Bar.h>
+### Arduino IDE
 
-int main (void)
-{
-  ...
-}
+Copy the desired library folder(s) to your Arduino libraries directory:
 
-```
+    cp -r lib/at_client ~/Documents/Arduino/libraries/
+    cp -r lib/NoPorts   ~/Documents/Arduino/libraries/
 
-The PlatformIO Library Dependency Finder will find automatically dependent
-libraries by scanning project source files.
+### PlatformIO
 
-More information about PlatformIO Library Dependency Finder
-- https://docs.platformio.org/page/librarymanager/ldf.html
+Reference the libraries from your project's `platformio.ini`:
+
+    [env:esp32dev]
+    platform = espressif32
+    board = esp32dev
+    framework = arduino
+    lib_extra_dirs = ../../lib
+    lib_deps = NoPorts
+
+NoPorts depends on at_client, so PlatformIO will pull in both automatically.
+
+See `packages/NoPorts/` for a complete reference project.

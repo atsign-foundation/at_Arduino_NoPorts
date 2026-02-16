@@ -52,3 +52,4 @@ void atsdk_arduino_setup();
 #include "atclient/socket_shared.h" // IWYU pragma: export
 #include "atclient/string_utils.h" // IWYU pragma: export
 #include "atclient/version.h" // IWYU pragma: export
+#include "atauth.h" // IWYU pragma: export
