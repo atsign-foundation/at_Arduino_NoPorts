@@ -160,6 +160,12 @@ static void _relay_task(void *pvParameters) {
   unsigned long total_local_to_rvd = 0;
   unsigned long last_stats_time = 0;
 
+  // Raw bytes consumed from each socket during Phase 2 polling.
+  // The data socket may receive encrypted data before we know which socket
+  // is which. We save raw bytes so we can replay them through data_dec later.
+  uint8_t earlyA[256], earlyB[256];
+  int earlyLenA = 0, earlyLenB = 0;
+
   // ======================================================================
   // PHASE 1: Open 2 connections to SRVD, authenticate both
   // ======================================================================
@@ -240,6 +246,7 @@ static void _relay_task(void *pvParameters) {
         if (ctrl_dec_A) {
           uint8_t raw, dec;
           if (sockA.read(&raw, 1) == 1) {
+            if (earlyLenA < (int)sizeof(earlyA)) earlyA[earlyLenA++] = raw;
             _aes_ctr_crypt(ctrl_dec_A, 1, &raw, &dec);
             cmsgA[posA++] = (char)dec;
             if (dec == '\n') {
@@ -253,6 +260,7 @@ static void _relay_task(void *pvParameters) {
         } else {
           uint8_t b;
           if (sockA.read(&b, 1) == 1) {
+            if (earlyLenA < (int)sizeof(earlyA)) earlyA[earlyLenA++] = b;
             cmsgA[posA++] = (char)b;
             if (b == '\n') {
               got_connect = true;
@@ -271,6 +279,7 @@ static void _relay_task(void *pvParameters) {
         if (ctrl_dec_B) {
           uint8_t raw, dec;
           if (relay->rvd_client.read(&raw, 1) == 1) {
+            if (earlyLenB < (int)sizeof(earlyB)) earlyB[earlyLenB++] = raw;
             _aes_ctr_crypt(ctrl_dec_B, 1, &raw, &dec);
             cmsgB[posB++] = (char)dec;
             if (dec == '\n') {
@@ -284,6 +293,7 @@ static void _relay_task(void *pvParameters) {
         } else {
           uint8_t b;
           if (relay->rvd_client.read(&b, 1) == 1) {
+            if (earlyLenB < (int)sizeof(earlyB)) earlyB[earlyLenB++] = b;
             cmsgB[posB++] = (char)b;
             if (b == '\n') {
               got_connect = true;
@@ -412,6 +422,28 @@ static void _relay_task(void *pvParameters) {
   }
   NOPORTS_LOGI(TAG, "Connected to local service");
   relay->local_client.setNoDelay(true);
+
+  // Replay any early bytes consumed from the data socket during Phase 2.
+  // During polling, we read from both sockets not knowing which is data.
+  // Those raw bytes were encrypted with the DATA CHANNEL key but we consumed
+  // them from the TCP buffer. We must replay them through data_dec so the
+  // AES-CTR counter stays in sync with the client.
+  {
+    uint8_t *early_raw = (data == &relay->rvd_client) ? earlyB : earlyA;
+    int early_len = (data == &relay->rvd_client) ? earlyLenB : earlyLenA;
+    if (early_len > 0) {
+      NOPORTS_LOGI(TAG, "Replaying %d early bytes from data socket", early_len);
+      if (data_encrypted && data_dec) {
+        _aes_ctr_crypt(data_dec, early_len, early_raw, crypt_buf);
+        relay->local_client.write(crypt_buf, early_len);
+        relay->local_client.flush();
+      } else {
+        relay->local_client.write(early_raw, early_len);
+        relay->local_client.flush();
+      }
+      total_rvd_to_local += early_len;
+    }
+  }
 
   relay->state = RELAY_RUNNING;
   NOPORTS_LOGI(TAG, "Relay running for session %s (e2ee=%d) data=%s",
