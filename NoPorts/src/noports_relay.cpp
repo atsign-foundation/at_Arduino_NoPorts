@@ -21,10 +21,15 @@
 #define TAG "noports_relay"
 
 // Buffer size for relay forwarding
-#define RELAY_BUF_SIZE 2048
+#define RELAY_BUF_SIZE 1024
+
+// Buffer size for early data captured during Phase 2 polling
+#define EARLY_BUF_SIZE 256
 
 // Stack size for relay FreeRTOS task
-#define RELAY_TASK_STACK_SIZE 10240
+// With all large buffers (earlyA/B, cmsgA/B, buf, crypt_buf) on the heap,
+// actual stack usage is ~1200 bytes. 6KB provides comfortable headroom.
+#define RELAY_TASK_STACK_SIZE 6144
 
 // AES-CTR encryption state
 struct aes_ctr_state {
@@ -143,15 +148,15 @@ static int _aes_ctr_crypt(aes_ctr_state *state, size_t len,
 // so we poll BOTH for the connect: message. Whichever receives it is the
 // control channel; the other becomes the data channel for relay traffic.
 // We keep the control channel alive (closing it causes SRVD port teardown).
-static void _relay_task(void *pvParameters) {
-  NoPortsRelay *relay = (NoPortsRelay *)pvParameters;
+// Inner function: runs the relay logic. Returns normally so C++ destructors
+// (sockA) run. The outer wrapper calls vTaskDelete(NULL) after this returns.
+static void _relay_task_inner(NoPortsRelay *relay) {
   uint8_t *buf = (uint8_t *)malloc(RELAY_BUF_SIZE);
   uint8_t *crypt_buf = NULL;
 
   if (!buf) {
     NOPORTS_LOGE(TAG, "Failed to allocate relay buffer");
     relay->state = RELAY_ERROR;
-    vTaskDelete(NULL);
     return;
   }
 
@@ -160,13 +165,13 @@ static void _relay_task(void *pvParameters) {
     NOPORTS_LOGE(TAG, "Failed to allocate crypto buffer");
     free(buf);
     relay->state = RELAY_ERROR;
-    vTaskDelete(NULL);
     return;
   }
 
-  NOPORTS_LOGI(TAG, "Relay task started: %s:%d <-> %s:%d",
+  NOPORTS_LOGI(TAG, "Relay task started: %s:%d <-> %s:%d (free heap: %u)",
                relay->config.rvd_host, relay->config.rvd_port,
-               relay->config.local_host, relay->config.local_port);
+               relay->config.local_host, relay->config.local_port,
+               (unsigned)esp_get_free_heap_size());
 
   // Declare ALL variables before any goto (C++ requirement)
   WiFiClient sockA;           // first connection to SRVD
@@ -189,8 +194,20 @@ static void _relay_task(void *pvParameters) {
   // Raw bytes consumed from each socket during Phase 2 polling.
   // The data socket may receive encrypted data before we know which socket
   // is which. We save raw bytes so we can replay them through data_dec later.
-  uint8_t earlyA[256], earlyB[256];
+  // Heap-allocated to reduce stack pressure (prevents stack overflow).
+  uint8_t *earlyA = (uint8_t *)calloc(EARLY_BUF_SIZE, 1);
+  uint8_t *earlyB = (uint8_t *)calloc(EARLY_BUF_SIZE, 1);
   int earlyLenA = 0, earlyLenB = 0;
+
+  if (!earlyA || !earlyB) {
+    NOPORTS_LOGE(TAG, "Failed to allocate early buffers");
+    free(buf);
+    free(crypt_buf);
+    if (earlyA) free(earlyA);
+    if (earlyB) free(earlyB);
+    relay->state = RELAY_ERROR;
+    return;
+  }
 
   // ======================================================================
   // PHASE 1: Open 2 connections to SRVD, authenticate both
@@ -252,13 +269,20 @@ static void _relay_task(void *pvParameters) {
   // PHASE 2: Poll BOTH sockets for the connect: message
   // SRVD FIFO pairing means we don't know which socket pairs with the
   // client's control socket. Read from whichever gets data first.
-  // Use separate stack buffers so we don't disturb the relay buffers.
+  // Use separate heap buffers so we don't disturb the relay buffers.
   // ======================================================================
   {
     unsigned long connect_wait_start = millis();
     const unsigned long CONNECT_TIMEOUT_MS = 30000;
-    char cmsgA[256] = {0};  // connect: msg buffer for sockA
-    char cmsgB[256] = {0};  // connect: msg buffer for sockB
+    char *cmsgA = (char *)calloc(256, 1);  // connect: msg buffer for sockA
+    char *cmsgB = (char *)calloc(256, 1);  // connect: msg buffer for sockB
+    if (!cmsgA || !cmsgB) {
+      NOPORTS_LOGE(TAG, "Failed to allocate cmsg buffers");
+      if (cmsgA) free(cmsgA);
+      if (cmsgB) free(cmsgB);
+      relay->state = RELAY_ERROR;
+      goto cleanup;
+    }
     int posA = 0, posB = 0;
     bool got_connect = false;
     char *connect_msg = NULL;
@@ -272,7 +296,7 @@ static void _relay_task(void *pvParameters) {
         if (ctrl_dec_A) {
           uint8_t raw, dec;
           if (sockA.read(&raw, 1) == 1) {
-            if (earlyLenA < (int)sizeof(earlyA)) earlyA[earlyLenA++] = raw;
+            if (earlyLenA < EARLY_BUF_SIZE) earlyA[earlyLenA++] = raw;
             _aes_ctr_crypt(ctrl_dec_A, 1, &raw, &dec);
             cmsgA[posA++] = (char)dec;
             if (dec == '\n') {
@@ -286,7 +310,7 @@ static void _relay_task(void *pvParameters) {
         } else {
           uint8_t b;
           if (sockA.read(&b, 1) == 1) {
-            if (earlyLenA < (int)sizeof(earlyA)) earlyA[earlyLenA++] = b;
+            if (earlyLenA < EARLY_BUF_SIZE) earlyA[earlyLenA++] = b;
             cmsgA[posA++] = (char)b;
             if (b == '\n') {
               got_connect = true;
@@ -305,7 +329,7 @@ static void _relay_task(void *pvParameters) {
         if (ctrl_dec_B) {
           uint8_t raw, dec;
           if (relay->rvd_client.read(&raw, 1) == 1) {
-            if (earlyLenB < (int)sizeof(earlyB)) earlyB[earlyLenB++] = raw;
+            if (earlyLenB < EARLY_BUF_SIZE) earlyB[earlyLenB++] = raw;
             _aes_ctr_crypt(ctrl_dec_B, 1, &raw, &dec);
             cmsgB[posB++] = (char)dec;
             if (dec == '\n') {
@@ -319,7 +343,7 @@ static void _relay_task(void *pvParameters) {
         } else {
           uint8_t b;
           if (relay->rvd_client.read(&b, 1) == 1) {
-            if (earlyLenB < (int)sizeof(earlyB)) earlyB[earlyLenB++] = b;
+            if (earlyLenB < EARLY_BUF_SIZE) earlyB[earlyLenB++] = b;
             cmsgB[posB++] = (char)b;
             if (b == '\n') {
               got_connect = true;
@@ -410,6 +434,8 @@ static void _relay_task(void *pvParameters) {
       }
       data_encrypted = true;
     }
+    free(cmsgA);
+    free(cmsgB);
   }
 
   // ======================================================================
@@ -615,6 +641,8 @@ cleanup:
 
   free(buf);
   if (crypt_buf) free(crypt_buf);
+  if (earlyA) free(earlyA);
+  if (earlyB) free(earlyB);
 
   if (relay->config.rvd_auth_string) {
     free(relay->config.rvd_auth_string);
@@ -645,8 +673,23 @@ cleanup:
     relay->config.session_iv_d2c = NULL;
   }
 
+  // Log stack high-water mark for diagnostics
+  UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+  NOPORTS_LOGI(TAG, "Relay task stack HWM: %u words (%u bytes free)",
+               (unsigned)hwm, (unsigned)(hwm * sizeof(StackType_t)));
+
   relay->state = RELAY_STOPPED;
   relay->task_handle = NULL;
+  // Return from inner function — C++ destructors (sockA) run here.
+  // Wrapper function calls vTaskDelete(NULL) after this.
+}
+
+// FreeRTOS task entry point: calls inner function then deletes task.
+// Split so that C++ stack objects (WiFiClient sockA) get their destructors
+// called when the inner function returns, before the task stack is freed.
+static void _relay_task(void *pvParameters) {
+  NoPortsRelay *relay = (NoPortsRelay *)pvParameters;
+  _relay_task_inner(relay);
   vTaskDelete(NULL);
 }
 
@@ -661,6 +704,10 @@ void noports_relay_config_init(NoPortsRelayConfig *cfg) {
 
 int noports_relay_start(NoPortsRelay *relay, const NoPortsRelayConfig *config) {
   if (!relay || !config) return -1;
+
+  // Reset WiFiClient objects to clean state (important when reusing a relay slot)
+  relay->rvd_client = WiFiClient();
+  relay->local_client = WiFiClient();
 
   memcpy(&relay->config, config, sizeof(NoPortsRelayConfig));
 
@@ -700,7 +747,8 @@ int noports_relay_start(NoPortsRelay *relay, const NoPortsRelayConfig *config) {
   );
 
   if (ret != pdPASS) {
-    NOPORTS_LOGE(TAG, "Failed to create relay task");
+    NOPORTS_LOGE(TAG, "Failed to create relay task (stack=%d, free heap=%u)",
+                 RELAY_TASK_STACK_SIZE, (unsigned)esp_get_free_heap_size());
     if (relay->encrypter) {
       mbedtls_aes_free(&((aes_ctr_state *)relay->encrypter)->ctx);
       free(relay->encrypter);

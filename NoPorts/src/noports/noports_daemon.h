@@ -131,6 +131,7 @@ private:
 
   // Timeout tracking
   uint32_t _timeout_counter;
+  uint8_t  _reconnect_failures;   // consecutive monitor reconnect failures (for backoff)
 
   // Internal methods (mirror the C sshnpd functions)
   bool _authenticate();

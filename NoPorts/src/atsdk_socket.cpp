@@ -135,7 +135,7 @@ int atclient_tls_socket_write(struct atclient_tls_socket *socket,
     size_t w = client->write(value + written, value_len - written);
     if (w == 0) {
       atlogger_log(TAG, ATLOGGER_LOGGING_LEVEL_ERROR,
-                   "Write failed after %zu/%zu bytes\n", written, value_len);
+                   "Write failed after %u/%u bytes\n", (unsigned)written, (unsigned)value_len);
       return 1;
     }
     written += w;

@@ -75,7 +75,8 @@ NoPortsDaemon::NoPortsDaemon()
   , _monitor_regex(nullptr)
   , _root_port(0)
   , _relay_count(0)
-  , _timeout_counter(0) {
+  , _timeout_counter(0)
+  , _reconnect_failures(0) {
   memset(_last_error, 0, sizeof(_last_error));
   memset(_root_host, 0, sizeof(_root_host));
   // Don't memset _relays — it contains WiFiClient C++ objects whose
@@ -324,9 +325,20 @@ void NoPortsDaemon::loop() {
 
   int ret = atclient_monitor_read(monitor, worker, &message, NULL);
   if (ret != 0) {
-    NOPORTS_LOGW(TAG, "Monitor read failed (ret: %d), will reconnect", ret);
-    // Don't reconnect immediately — increment counter so we retry a few times
-    _timeout_counter++;
+    // The monitor uses the worker to fetch shared encryption keys for
+    // decrypting notifications. If the worker's TLS connection dropped
+    // (common while a relay is active), decrypt fails and we get ret=-1.
+    // Try reconnecting the worker first — it's cheaper than a full
+    // monitor reconnect and usually fixes the issue.
+    NOPORTS_LOGW(TAG, "Monitor read failed (ret: %d), reconnecting worker first", ret);
+    if (_reconnectWorker()) {
+      NOPORTS_LOGI(TAG, "Worker reconnected, will retry monitor read");
+      // Don't bump timeout — let the next loop() iteration retry with
+      // the fresh worker connection.
+    } else {
+      NOPORTS_LOGW(TAG, "Worker reconnect also failed, will reconnect monitor");
+      _timeout_counter = NOPORTS_MONITOR_NOOP_TIMEOUT_MS / NOPORTS_MONITOR_READ_TIMEOUT_MS + 1;
+    }
     atclient_monitor_message_free(&message);
     return;
   }
@@ -362,8 +374,10 @@ void NoPortsDaemon::loop() {
       break;
 
     case ATCLIENT_MONITOR_ERROR_DECRYPT_NOTIFICATION:
-      _timeout_counter = NOPORTS_MONITOR_NOOP_TIMEOUT_MS / NOPORTS_MONITOR_READ_TIMEOUT_MS + 1;
-      NOPORTS_LOGE(TAG, "Failed to decrypt notification");
+      NOPORTS_LOGE(TAG, "Failed to decrypt notification, reconnecting worker");
+      _reconnectWorker();
+      // Don't force monitor reconnect — the monitor stream is fine,
+      // only the worker (used for key lookup) was stale.
       break;
 
     default:
@@ -994,20 +1008,12 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
     }
   }
 
-  // Start the relay (replaces fork() + run_srv_process)
-  res = noports_relay_start(&_relays[slot], &relay_cfg);
-  if (res != 0) {
-    NOPORTS_LOGE(TAG, "NPT: failed to start relay");
-    cJSON_Delete(envelope);
-    if (session_aes_key_b64) free(session_aes_key_b64);
-    if (session_iv_b64) free(session_iv_b64);
-    if (session_aes_key_d2c_b64) free(session_aes_key_d2c_b64);
-    if (session_iv_d2c_b64) free(session_iv_d2c_b64);
-    return;
-  }
-
-  // Send success response back to the requesting atSign
-  // (from handler_commons.c send_success_payload)
+  // Send success response BEFORE starting relay.
+  // The relay task allocates ~8KB (6KB stack + buffers), and the TLS send
+  // also needs ~16KB for its buffers. On ESP32 with limited heap, doing
+  // both concurrently causes malloc failures. Send first, then start relay.
+  // The client connects to SRVD after receiving this, so the relay will
+  // be ready in time.
   {
     char *identifier = cJSON_GetStringValue(session_id);
     cJSON *res_payload = cJSON_CreateObject();
@@ -1090,6 +1096,20 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
     }
 
     cJSON_Delete(res_envelope);
+  }
+
+  // Start the relay AFTER sending the success response.
+  // This ensures TLS buffers from the notification send are freed before
+  // the relay allocates its task stack and buffers.
+  res = noports_relay_start(&_relays[slot], &relay_cfg);
+  if (res != 0) {
+    NOPORTS_LOGE(TAG, "NPT: failed to start relay");
+    cJSON_Delete(envelope);
+    if (session_aes_key_b64) free(session_aes_key_b64);
+    if (session_iv_b64) free(session_iv_b64);
+    if (session_aes_key_d2c_b64) free(session_aes_key_d2c_b64);
+    if (session_iv_d2c_b64) free(session_iv_d2c_b64);
+    return;
   }
 
   if (_config.on_tunnel_open) {
@@ -1256,6 +1276,16 @@ void NoPortsDaemon::_cleanupFinishedRelays() {
 // ============================================================================
 
 bool NoPortsDaemon::_reconnectMonitor() {
+  // Exponential backoff: 5s, 10s, 20s, 30s, 30s, ...
+  if (_reconnect_failures > 0) {
+    unsigned long backoff_ms = 5000UL << (_reconnect_failures - 1);
+    if (backoff_ms > 30000) backoff_ms = 30000;
+    NOPORTS_LOGI(TAG, "Reconnect backoff: %lu ms (attempt %d, free heap: %u)",
+                 backoff_ms, _reconnect_failures + 1,
+                 (unsigned)esp_get_free_heap_size());
+    delay(backoff_ms);
+  }
+
   NOPORTS_LOGI(TAG, "Reconnecting monitor...");
 
   atclient *monitor = (atclient *)_monitor_ctx;
@@ -1271,15 +1301,18 @@ bool NoPortsDaemon::_reconnectMonitor() {
 
   if (res != 0) {
     NOPORTS_LOGE(TAG, "Monitor reconnect auth failed: %d", res);
+    if (_reconnect_failures < 255) _reconnect_failures++;
     return false;
   }
 
   res = atclient_monitor_start(monitor, _monitor_regex);
   if (res != 0) {
     NOPORTS_LOGE(TAG, "Monitor reconnect start failed: %d", res);
+    if (_reconnect_failures < 255) _reconnect_failures++;
     return false;
   }
 
+  _reconnect_failures = 0;
   NOPORTS_LOGI(TAG, "Monitor reconnected");
   return true;
 }
