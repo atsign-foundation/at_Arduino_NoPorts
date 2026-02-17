@@ -1,3 +1,0 @@
-[submodule "packages/NoPorts_CYD/boards"]
-	path = packages/NoPorts_CYD/boards
-	url = https://github.com/rzeldent/platformio-espressif32-sunton.git
