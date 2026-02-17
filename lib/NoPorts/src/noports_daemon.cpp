@@ -1288,13 +1288,28 @@ void NoPortsDaemon::_cleanupFinishedRelays() {
 // Private: Reconnection
 // ============================================================================
 
+// Maximum consecutive reconnect failures before daemon gives up.
+// At that point the sketch's loop() should detect DAEMON_ERROR and
+// restart the device (ESP.restart()) so we get a clean slate.
+#define NOPORTS_MAX_RECONNECT_FAILURES 10
+
 bool NoPortsDaemon::_reconnectMonitor() {
+  // Check if we've exceeded the max reconnect attempts
+  if (_reconnect_failures >= NOPORTS_MAX_RECONNECT_FAILURES) {
+    NOPORTS_LOGE(TAG, "Monitor reconnect failed %d times — giving up (free heap: %u)",
+                 _reconnect_failures, (unsigned)esp_get_free_heap_size());
+    _setError("Monitor reconnect failed %d consecutive times", _reconnect_failures);
+    _state = DAEMON_ERROR;
+    _should_run = false;
+    return false;
+  }
+
   // Exponential backoff: 5s, 10s, 20s, 30s, 30s, ...
   if (_reconnect_failures > 0) {
     unsigned long backoff_ms = 5000UL << (_reconnect_failures - 1);
     if (backoff_ms > 30000) backoff_ms = 30000;
-    NOPORTS_LOGI(TAG, "Reconnect backoff: %lu ms (attempt %d, free heap: %u)",
-                 backoff_ms, _reconnect_failures + 1,
+    NOPORTS_LOGI(TAG, "Reconnect backoff: %lu ms (attempt %d/%d, free heap: %u)",
+                 backoff_ms, _reconnect_failures + 1, NOPORTS_MAX_RECONNECT_FAILURES,
                  (unsigned)esp_get_free_heap_size());
     delay(backoff_ms);
   }
