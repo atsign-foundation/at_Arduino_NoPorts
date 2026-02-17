@@ -233,12 +233,13 @@ static void _enroll_task(void *param) {
 
   // Make sure LittleFS is mounted
   if (!LittleFS.begin(true)) {
-    _set_status("LittleFS mount failed", COLOR_ERROR);
-    _show_busy(false);
+    ui_event_push(UI_EVT_ENROLL_FAIL, "LittleFS mount failed");
     free(args);
     vTaskDelete(nullptr);
     return;
   }
+
+  ui_event_push(UI_EVT_ENROLL_STATUS, "Connecting to root server...");
 
   // Call the high-level enroll command
   // Signature: atauth_enroll_command(atsign, root_domain, keys_path,
@@ -263,19 +264,12 @@ static void _enroll_task(void *param) {
     ui_save_string(NVS_KEY_MANAGER, args->manager);
     ui_set_configured(true);
 
-    _set_status(LV_SYMBOL_OK " Enrolled!", COLOR_SUCCESS);
-    _show_busy(false);
-
-    // Brief pause so user sees the success message
-    vTaskDelay(pdMS_TO_TICKS(1500));
-
-    if (_on_enrolled_cb) _on_enrolled_cb();
+    ui_event_push(UI_EVT_ENROLL_OK, LV_SYMBOL_OK " Enrolled!");
   } else {
     Serial.printf("[Enroll] FAILED with code %d\n", ret);
     char buf[80];
     snprintf(buf, sizeof(buf), LV_SYMBOL_WARNING " Enrollment failed (%d)", ret);
-    _set_status(buf, COLOR_ERROR);
-    _show_busy(false);
+    ui_event_push(UI_EVT_ENROLL_FAIL, buf);
   }
 
   free(args);
@@ -323,6 +317,44 @@ static void _enroll_btn_cb(lv_event_t *e) {
   args->manager[sizeof(args->manager) - 1] = '\0';
 
   // Run enrollment on a separate task (crypto is CPU intensive + blocks on
-  // network I/O). Stack size 32768 matches the loop task.
+  // network I/O). Stack size 32768 matches the loop task — needed for
+  // 4096-bit RSA signature verification during TLS handshake.
+  Serial.printf("[Enroll] Free heap: %u bytes, largest block: %u bytes\n",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   xTaskCreatePinnedToCore(_enroll_task, "enroll", 32768, args, 5, nullptr, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Event processing (called from main LVGL loop)
+// ---------------------------------------------------------------------------
+
+void ui_enroll_process_events() {
+  UiEvent evt;
+  while (ui_event_pop(&evt)) {
+    switch (evt.type) {
+      case UI_EVT_ENROLL_STATUS:
+        _set_status(evt.text, COLOR_ACCENT);
+        break;
+      case UI_EVT_ENROLL_OK:
+        _set_status(evt.text, COLOR_SUCCESS);
+        _show_busy(false);
+        // Brief pause handled via LVGL timer so we don't block the loop
+        if (_on_enrolled_cb) {
+          // Schedule callback via a one-shot LVGL timer (1.5s delay)
+          lv_timer_t *t = lv_timer_create([](lv_timer_t *tmr) {
+            void (*cb)() = (void(*)())lv_timer_get_user_data(tmr);
+            if (cb) cb();
+            lv_timer_del(tmr);
+          }, 1500, (void *)_on_enrolled_cb);
+          lv_timer_set_repeat_count(t, 1);
+        }
+        break;
+      case UI_EVT_ENROLL_FAIL:
+        _set_status(evt.text, COLOR_ERROR);
+        _show_busy(false);
+        break;
+      default:
+        break;
+    }
+  }
 }

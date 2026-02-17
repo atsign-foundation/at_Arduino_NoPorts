@@ -41,6 +41,9 @@ enum UiEventType {
   UI_EVT_PING,
   UI_EVT_DAEMON_STATE,
   UI_EVT_ERROR,
+  UI_EVT_ENROLL_STATUS,   // enrollment status text (info)
+  UI_EVT_ENROLL_OK,       // enrollment succeeded
+  UI_EVT_ENROLL_FAIL,     // enrollment failed
 };
 
 struct UiEvent {

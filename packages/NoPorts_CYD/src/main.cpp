@@ -137,8 +137,29 @@ static bool start_daemon() {
 // Screen transition callbacks
 // ---------------------------------------------------------------------------
 
+// Sync system time via NTP (required for TLS certificate validation)
+static void sync_ntp_time() {
+  Serial.println("[NTP] Syncing time...");
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+  struct tm timeinfo;
+  int retries = 0;
+  while (!getLocalTime(&timeinfo, 1000) && retries < 10) {
+    retries++;
+    Serial.printf("[NTP] Waiting for time... (%d/10)\n", retries);
+  }
+  if (retries < 10) {
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &timeinfo);
+    Serial.printf("[NTP] Time set: %s\n", buf);
+  } else {
+    Serial.println("[NTP] WARNING: Failed to get time – TLS may fail");
+  }
+}
+
 // Called when WiFi connects (both fresh setup and re-setup paths)
 static void on_wifi_connected() {
+  sync_ntp_time();
   if (ui_is_configured()) {
     // Already enrolled – go straight to daemon + dashboard
     if (start_daemon()) {
@@ -158,6 +179,113 @@ static void on_wifi_connected() {
         ui_dashboard_create();
       }
     });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Continue boot after calibration (or if calibration was already loaded)
+// ---------------------------------------------------------------------------
+
+static void continue_boot();  // forward declaration
+
+// Show a splash with saved SSID and a "Change WiFi" button.
+// If the button isn't tapped within 5 seconds, auto-connect.
+static lv_timer_t *_wifi_countdown_timer = nullptr;
+
+static void _cancel_countdown_cb(lv_event_t *e) {
+  (void)e;
+  if (_wifi_countdown_timer) {
+    // Free the countdown context
+    free(_wifi_countdown_timer->user_data);
+    lv_timer_del(_wifi_countdown_timer);
+    _wifi_countdown_timer = nullptr;
+  }
+  Serial.println("[main] User chose to change WiFi");
+  ui_wifi_create(on_wifi_connected);
+}
+
+static void show_wifi_splash() {
+  String ssid = ui_load_string(NVS_KEY_SSID);
+
+  lv_obj_t *splash = lv_obj_create(nullptr);
+  lv_obj_set_style_bg_color(splash, COLOR_BG_DARK, 0);
+
+  char msg[80];
+  snprintf(msg, sizeof(msg), LV_SYMBOL_WIFI "  Connecting to: %s", ssid.c_str());
+  lv_obj_t *lbl = ui_create_label(splash, msg, &lv_font_montserrat_16);
+  lv_obj_align(lbl, LV_ALIGN_CENTER, 0, -30);
+
+  // Countdown label
+  lv_obj_t *countdown = ui_create_label(splash, "Auto-connect in 5s...",
+                                        &lv_font_montserrat_12);
+  lv_obj_set_style_text_color(countdown, COLOR_TEXT_GREY, 0);
+  lv_obj_align(countdown, LV_ALIGN_CENTER, 0, 0);
+
+  // "Change WiFi" button
+  lv_obj_t *btn = ui_create_btn(splash, LV_SYMBOL_REFRESH " Change WiFi",
+                                _cancel_countdown_cb);
+  lv_obj_align(btn, LV_ALIGN_CENTER, 0, 40);
+
+  lv_scr_load(splash);
+  lv_timer_handler();
+
+  // Create countdown timer (ticks every 1s, 5 times)
+  struct CountdownCtx {
+    lv_obj_t *label;
+    int remaining;
+  };
+  CountdownCtx *ctx = (CountdownCtx *)malloc(sizeof(CountdownCtx));
+  ctx->label = countdown;
+  ctx->remaining = 5;
+
+  _wifi_countdown_timer = lv_timer_create([](lv_timer_t *t) {
+    CountdownCtx *c = (CountdownCtx *)t->user_data;
+    c->remaining--;
+    if (c->remaining > 0) {
+      char buf[32];
+      snprintf(buf, sizeof(buf), "Auto-connect in %ds...", c->remaining);
+      lv_label_set_text(c->label, buf);
+    } else {
+      free(c);
+      lv_timer_del(t);
+      _wifi_countdown_timer = nullptr;
+
+      // Auto-connect with saved creds
+      Serial.println("[main] Auto-connect timeout – connecting with saved WiFi");
+      if (ui_wifi_auto_connect(10000)) {
+        smartdisplay_led_set_rgb(false, false, true);
+        sync_ntp_time();
+        if (ui_is_configured()) {
+          if (start_daemon()) {
+            ui_dashboard_create();
+          } else {
+            ui_enroll_create([]() {
+              if (start_daemon()) ui_dashboard_create();
+            });
+          }
+        } else {
+          ui_enroll_create([]() {
+            if (start_daemon()) ui_dashboard_create();
+          });
+        }
+      } else {
+        Serial.println("[main] Auto-connect failed – showing WiFi setup");
+        ui_wifi_create(on_wifi_connected);
+      }
+    }
+  }, 1000, ctx);
+}
+
+static void continue_boot() {
+  String ssid = ui_load_string(NVS_KEY_SSID);
+
+  if (ssid.length() > 0) {
+    // We have saved WiFi – show splash with change option
+    show_wifi_splash();
+  } else {
+    // No saved WiFi – go straight to WiFi setup
+    Serial.println("[main] No saved WiFi – showing WiFi setup");
+    ui_wifi_create(on_wifi_connected);
   }
 }
 
@@ -194,73 +322,13 @@ void setup() {
   if (!ui_calibrate_load()) {
     Serial.println("[main] No calibration found – running calibration");
     ui_calibrate_create([]() {
-      // After calibration, continue with normal boot
-      if (ui_is_configured()) {
-        Serial.println("[main] Previously configured – attempting auto-connect");
-        lv_obj_t *splash = lv_obj_create(nullptr);
-        lv_obj_set_style_bg_color(splash, COLOR_BG_DARK, 0);
-        lv_obj_t *lbl = ui_create_label(splash, LV_SYMBOL_WIFI " Connecting...",
-                                        &lv_font_montserrat_20);
-        lv_obj_center(lbl);
-        lv_scr_load(splash);
-        lv_timer_handler();
-
-        if (ui_wifi_auto_connect(10000)) {
-          smartdisplay_led_set_rgb(false, false, true);
-          if (start_daemon()) {
-            ui_dashboard_create();
-          } else {
-            ui_enroll_create([]() {
-              if (start_daemon()) ui_dashboard_create();
-            });
-          }
-        } else {
-          ui_wifi_create(on_wifi_connected);
-        }
-      } else {
-        ui_wifi_create(on_wifi_connected);
-      }
+      continue_boot();
     });
     return;  // setup() done – calibration screen is active
   }
 
   // Calibration loaded – proceed with normal boot
-
-  // Try auto-connect if previously configured
-  if (ui_is_configured()) {
-    Serial.println("[main] Previously configured – attempting auto-connect");
-
-    // Show a brief splash while connecting
-    lv_obj_t *splash = lv_obj_create(nullptr);
-    lv_obj_set_style_bg_color(splash, COLOR_BG_DARK, 0);
-    lv_obj_t *lbl = ui_create_label(splash, LV_SYMBOL_WIFI " Connecting...",
-                                    &lv_font_montserrat_20);
-    lv_obj_center(lbl);
-    lv_scr_load(splash);
-    lv_timer_handler();
-
-    if (ui_wifi_auto_connect(10000)) {
-      smartdisplay_led_set_rgb(false, false, true);  // blue while starting daemon
-      if (start_daemon()) {
-        ui_dashboard_create();
-      } else {
-        // Keys may be invalid – re-enroll
-        ui_enroll_create([]() {
-          if (start_daemon()) {
-            ui_dashboard_create();
-          }
-        });
-      }
-    } else {
-      // WiFi failed – show WiFi setup screen
-      Serial.println("[main] Auto-connect failed – showing WiFi setup");
-      ui_wifi_create(on_wifi_connected);
-    }
-  } else {
-    // First run – show WiFi setup screen
-    Serial.println("[main] First run – showing WiFi setup");
-    ui_wifi_create(on_wifi_connected);
-  }
+  continue_boot();
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +338,9 @@ void setup() {
 void loop() {
   // Drive LVGL
   lv_timer_handler();
+
+  // Process enrollment events (thread-safe LVGL updates)
+  ui_enroll_process_events();
 
   // Drive NoPorts daemon
   if (daemon_running && npDaemon.isRunning()) {

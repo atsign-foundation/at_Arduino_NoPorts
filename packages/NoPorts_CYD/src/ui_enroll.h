@@ -20,4 +20,10 @@
  */
 void ui_enroll_create(void (*on_enrolled)());
 
+/**
+ * @brief Process enrollment events from the FreeRTOS task.
+ *        Must be called from the main LVGL loop.
+ */
+void ui_enroll_process_events();
+
 #endif // UI_ENROLL_H

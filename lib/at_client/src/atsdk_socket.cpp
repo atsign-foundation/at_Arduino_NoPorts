@@ -12,7 +12,13 @@
 #include "atclient/cacerts.h"
 #include "atlogger/atlogger.h"
 
-// Concatenate the bundled CA certificates into a single PEM string
+// Concatenate the bundled CA certificates into a single PEM string.
+// Define ATSDK_TLS_MINIMAL_CERTS on memory-constrained devices (e.g. ESP32 with
+// display) to use only the Let's Encrypt root, saving ~10KB heap.
+#ifdef ATSDK_TLS_MINIMAL_CERTS
+static const char atclient_cacerts_pem[] =
+  LETS_ENCRYPT_ROOT;
+#else
 static const char atclient_cacerts_pem[] =
   LETS_ENCRYPT_ROOT
   GOOGLE_GLOBAL_SIGN
@@ -21,6 +27,7 @@ static const char atclient_cacerts_pem[] =
   GOOGLE_GTS_ROOT_R3
   GOOGLE_GTS_ROOT_R4
   ZEROSSL_INTERMEDIATE;
+#endif
 
 #include <WiFiClientSecure.h>
 #include <cstring>
@@ -58,12 +65,22 @@ int atclient_tls_socket_configure(struct atclient_tls_socket *socket,
     return 1;
   }
 
-  // Use provided CA or the built-in atclient certs
+  // Certificate verification setup.
+  // On memory-constrained devices (ESP32 with display/DMA), PEM cert parsing
+  // fragments the heap and causes mbedtls_ssl_setup() to fail.
+  // Define ATSDK_USE_CERT_BUNDLE to use the ESP-IDF built-in cert bundle
+  // which verifies from flash without heap allocation.
+#ifdef ATSDK_USE_CERT_BUNDLE
+  extern const uint8_t x509_crt_bundle_start[] asm("_binary_x509_crt_bundle_start");
+  client->setCACertBundle(x509_crt_bundle_start);
+#else
+  // Use provided CA or the built-in atclient PEM certs
   if (ca_pem != NULL && ca_pem_len > 0) {
     client->setCACert((const char *)ca_pem);
   } else {
     client->setCACert((const char *)atclient_cacerts_pem);
   }
+#endif
 
   client->setTimeout(socket->read_timeout_ms / 1000);
 
