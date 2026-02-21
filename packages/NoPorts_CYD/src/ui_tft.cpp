@@ -1,0 +1,452 @@
+/**
+ * @file ui_tft.cpp
+ * @brief Lightweight TFT_eSPI-based UI framework implementation
+ */
+
+#include "ui_tft.h"
+#include <Arduino.h>
+#include <SPI.h>
+
+// ---------------------------------------------------------------------------
+// Global instances
+// ---------------------------------------------------------------------------
+static TFT_eSPI tft = TFT_eSPI();
+
+// CYD2USB: Touch uses a separate SPI bus (HSPI) with its own pins
+// MOSI=32, MISO=39, SCLK=25, CS=33, IRQ=36
+static XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
+
+static Preferences prefs;
+static bool prefs_opened = false;
+
+// Event queue
+static UiEvent _event_buf[EVENT_QUEUE_SIZE];
+static uint8_t _evt_head = 0;
+static uint8_t _evt_tail = 0;
+static uint8_t _evt_count = 0;
+static SemaphoreHandle_t _evt_mutex = nullptr;
+
+// Touch state for debouncing
+static bool _was_touched = false;
+static unsigned long _last_touch_time = 0;
+#define TOUCH_DEBOUNCE_MS 200
+
+// Runtime touch calibration values (loaded from NVS or defaults)
+static int16_t _cal_x_min = TOUCH_MIN_X;
+static int16_t _cal_x_max = TOUCH_MAX_X;
+static int16_t _cal_y_min = TOUCH_MIN_Y;
+static int16_t _cal_y_max = TOUCH_MAX_Y;
+
+// ---------------------------------------------------------------------------
+// Touch calibration
+// ---------------------------------------------------------------------------
+
+// Draw a crosshair target at screen position
+static void _draw_crosshair(int16_t sx, int16_t sy, uint16_t color) {
+  tft.drawLine(sx - 10, sy, sx + 10, sy, color);
+  tft.drawLine(sx, sy - 10, sx, sy + 10, color);
+  tft.drawCircle(sx, sy, 6, color);
+}
+
+// Wait for touch and return raw XPT2046 coordinates
+static TS_Point _wait_for_touch_raw() {
+  // Wait for release first
+  while (touch.touched()) { delay(10); }
+  delay(100);
+  
+  // Wait for press
+  while (!touch.touched()) { delay(10); }
+  delay(50);  // Settle
+  
+  // Average multiple samples for accuracy
+  int32_t ax = 0, ay = 0;
+  int samples = 0;
+  uint32_t start = millis();
+  while (touch.touched() && (millis() - start < 1000)) {
+    TS_Point p = touch.getPoint();
+    if (p.z > 300) {
+      ax += p.x;
+      ay += p.y;
+      samples++;
+    }
+    delay(20);
+  }
+  
+  if (samples > 0) {
+    return TS_Point(ax / samples, ay / samples, 1);
+  }
+  return TS_Point(0, 0, 0);
+}
+
+/**
+ * @brief Run touch calibration (3-point)
+ * Asks user to touch crosshairs at known screen positions.
+ * Saves calibration to NVS.
+ */
+void ui_touch_calibrate() {
+  tft.fillScreen(COLOR_BG_DARK);
+  tft.setTextColor(COLOR_TEXT_WHITE);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(1);
+  tft.drawString("Touch Calibration", TFT_WIDTH / 2, TFT_HEIGHT / 2 - 20, 4);
+  tft.drawString("Touch each crosshair", TFT_WIDTH / 2, TFT_HEIGHT / 2 + 15, 2);
+  delay(2000);
+  
+  // Calibration points at 10% and 90% of screen
+  const int16_t margin_x = TFT_WIDTH / 10;   // 32px
+  const int16_t margin_y = TFT_HEIGHT / 10;   // 24px
+  
+  struct { int16_t sx, sy; } targets[3] = {
+    { margin_x,              margin_y },               // Top-left
+    { TFT_WIDTH - margin_x,  margin_y },               // Top-right
+    { TFT_WIDTH / 2,         TFT_HEIGHT - margin_y }   // Bottom-center
+  };
+  
+  TS_Point raw[3];
+  
+  for (int i = 0; i < 3; i++) {
+    tft.fillScreen(COLOR_BG_DARK);
+    tft.setTextColor(COLOR_TEXT_GREY);
+    tft.setTextDatum(MC_DATUM);
+    char msg[32];
+    snprintf(msg, sizeof(msg), "Point %d of 3", i + 1);
+    tft.drawString(msg, TFT_WIDTH / 2, TFT_HEIGHT / 2, 2);
+    
+    _draw_crosshair(targets[i].sx, targets[i].sy, COLOR_PRIMARY);
+    
+    raw[i] = _wait_for_touch_raw();
+    
+    // Brief feedback
+    _draw_crosshair(targets[i].sx, targets[i].sy, COLOR_SUCCESS);
+    delay(300);
+    
+    Serial.printf("[cal] Point %d: screen(%d,%d) -> raw(%d,%d)\n",
+                  i, targets[i].sx, targets[i].sy, raw[i].x, raw[i].y);
+  }
+  
+  // Calculate calibration from the 3 points
+  // Use linear interpolation from the calibration points
+  // X: raw[0] maps to margin_x, raw[1] maps to (TFT_WIDTH - margin_x)
+  // Y: raw[0] maps to margin_y, raw[2] maps to (TFT_HEIGHT - margin_y)
+  
+  float x_scale = (float)(targets[1].sx - targets[0].sx) / (float)(raw[1].x - raw[0].x);
+  float y_scale = (float)(targets[2].sy - targets[0].sy) / (float)(raw[2].y - raw[0].y);
+  
+  // Extrapolate to 0 and max
+  _cal_x_min = raw[0].x - (int16_t)(targets[0].sx / x_scale);
+  _cal_x_max = raw[0].x + (int16_t)((TFT_WIDTH - targets[0].sx) / x_scale);
+  _cal_y_min = raw[0].y - (int16_t)(targets[0].sy / y_scale);
+  _cal_y_max = raw[0].y + (int16_t)((TFT_HEIGHT - targets[0].sy) / y_scale);
+  
+  Serial.printf("[cal] Result: X[%d..%d] Y[%d..%d]\n",
+                _cal_x_min, _cal_x_max, _cal_y_min, _cal_y_max);
+  
+  // Save to NVS
+  prefs.putShort("cal_x_min", _cal_x_min);
+  prefs.putShort("cal_x_max", _cal_x_max);
+  prefs.putShort("cal_y_min", _cal_y_min);
+  prefs.putShort("cal_y_max", _cal_y_max);
+  prefs.putBool("cal_done", true);
+  
+  tft.fillScreen(COLOR_BG_DARK);
+  tft.setTextColor(COLOR_SUCCESS);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("Calibration Complete!", TFT_WIDTH / 2, TFT_HEIGHT / 2, 4);
+  delay(1000);
+}
+
+static void _load_calibration() {
+  if (prefs.getBool("cal_done", false)) {
+    _cal_x_min = prefs.getShort("cal_x_min", TOUCH_MIN_X);
+    _cal_x_max = prefs.getShort("cal_x_max", TOUCH_MAX_X);
+    _cal_y_min = prefs.getShort("cal_y_min", TOUCH_MIN_Y);
+    _cal_y_max = prefs.getShort("cal_y_max", TOUCH_MAX_Y);
+    Serial.printf("[cal] Loaded: X[%d..%d] Y[%d..%d]\n",
+                  _cal_x_min, _cal_x_max, _cal_y_min, _cal_y_max);
+  } else {
+    Serial.println("[cal] No saved calibration, using defaults");
+  }
+}
+
+bool ui_touch_is_calibrated() {
+  return prefs.getBool("cal_done", false);
+}
+
+// ---------------------------------------------------------------------------
+// Initialization
+// ---------------------------------------------------------------------------
+
+void ui_tft_init() {
+  // Turn on backlight (GPIO 21 on CYD)
+  pinMode(21, OUTPUT);
+  digitalWrite(21, HIGH);
+
+  // Initialize TFT
+  tft.init();
+  tft.setRotation(1);  // Landscape mode
+  tft.fillScreen(COLOR_BG_DARK);
+  
+  // Initialize touch on dedicated SPI pins
+  // CYD2USB touch pins: SCLK=25, MISO=39, MOSI=32
+  // The XPT2046 library uses the global SPI object internally.
+  // TFT_eSPI uses its own SPIClass(VSPI) instance, so redirecting
+  // the global SPI to touch pins does not affect display.
+  SPI.begin(25, 39, 32, TOUCH_CS);
+  touch.begin();
+  touch.setRotation(1);
+  
+  // Initialize RGB LED pins
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
+  
+  // Load saved LED color or default to off
+  ui_load_led_color();
+  
+  // Create event queue mutex
+  _evt_mutex = xSemaphoreCreateMutex();
+  
+  // Open NVS
+  if (!prefs_opened) {
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs_opened = true;
+  }
+  
+  // Load touch calibration from NVS (or use defaults)
+  _load_calibration();
+  
+  Serial.println("[ui_tft] Initialized - TFT_eSPI mode");
+}
+
+TFT_eSPI& ui_get_tft() {
+  return tft;
+}
+
+XPT2046_Touchscreen& ui_get_touch() {
+  return touch;
+}
+
+// ---------------------------------------------------------------------------
+// Touch handling
+// ---------------------------------------------------------------------------
+
+bool ui_touch_read(int16_t *x, int16_t *y) {
+  if (!touch.touched()) {
+    _was_touched = false;
+    return false;
+  }
+  
+  TS_Point p = touch.getPoint();
+  
+  // Filter by pressure threshold (board recommends z >= 600)
+  // z == 0 or very low z means noise / no real touch
+  if (p.z < 400) {
+    _was_touched = false;
+    return false;
+  }
+  
+  // Debouncing: only register new touch after debounce period
+  unsigned long now = millis();
+  if (_was_touched && (now - _last_touch_time < TOUCH_DEBOUNCE_MS)) {
+    return false;
+  }
+  
+  // Map raw touch coordinates to screen coordinates using calibration
+  *x = map(p.x, _cal_x_min, _cal_x_max, 0, TFT_WIDTH);
+  *y = map(p.y, _cal_y_min, _cal_y_max, 0, TFT_HEIGHT);
+  
+  // Constrain to screen bounds
+  *x = constrain(*x, 0, TFT_WIDTH - 1);
+  *y = constrain(*y, 0, TFT_HEIGHT - 1);
+  
+  _was_touched = true;
+  _last_touch_time = now;
+  
+  return true;
+}
+
+bool ui_touch_in_rect(int16_t tx, int16_t ty, int16_t x, int16_t y, int16_t w, int16_t h) {
+  return (tx >= x && tx < x + w && ty >= y && ty < y + h);
+}
+
+// ---------------------------------------------------------------------------
+// Drawing primitives
+// ---------------------------------------------------------------------------
+
+void ui_draw_rounded_rect(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r, uint16_t color) {
+  tft.fillRoundRect(x, y, w, h, r, color);
+}
+
+void ui_draw_button(const Button &btn) {
+  if (!btn.visible) return;
+  
+  // Draw button background
+  ui_draw_rounded_rect(btn.x, btn.y, btn.w, btn.h, 6, btn.bg_color);
+  
+  // Draw button text centered
+  tft.setTextColor(btn.text_color);
+  tft.setTextDatum(MC_DATUM);  // Middle center
+  tft.setTextSize(1);
+  tft.drawString(btn.label, btn.x + btn.w / 2, btn.y + btn.h / 2, 2);
+}
+
+bool ui_check_button_press(Button &btn, int16_t tx, int16_t ty) {
+  if (!btn.visible) return false;
+  
+  if (ui_touch_in_rect(tx, ty, btn.x, btn.y, btn.w, btn.h)) {
+    if (btn.callback) {
+      btn.callback();
+    }
+    return true;
+  }
+  return false;
+}
+
+void ui_draw_textfield(const TextField &field) {
+  // Draw field background
+  ui_draw_rounded_rect(field.x, field.y, field.w, field.h, 4, 
+                       field.is_active ? COLOR_BG_CARD : 0x2104);
+  
+  // Draw text or placeholder
+  tft.setTextColor(field.buffer[0] ? COLOR_TEXT_WHITE : COLOR_TEXT_GREY);
+  tft.setTextDatum(ML_DATUM);  // Middle left
+  tft.setTextSize(1);
+  
+  const char *display_text = field.buffer[0] ? field.buffer : field.placeholder;
+  
+  // Handle password masking
+  if (field.is_password && field.buffer[0]) {
+    String masked(strlen(field.buffer), '*');
+    tft.drawString(masked.c_str(), field.x + 8, field.y + field.h / 2, 2);
+  } else {
+    tft.drawString(display_text, field.x + 8, field.y + field.h / 2, 2);
+  }
+  
+  // Draw cursor if active
+  if (field.is_active) {
+    int16_t cursor_x = field.x + 8 + tft.textWidth(field.buffer, 2);
+    tft.drawLine(cursor_x, field.y + 6, cursor_x, field.y + field.h - 6, COLOR_PRIMARY);
+  }
+}
+
+void ui_draw_text_centered(const char *text, int16_t y, uint16_t color, uint8_t font_size) {
+  tft.setTextColor(color);
+  tft.setTextDatum(TC_DATUM);  // Top center
+  tft.setTextSize(font_size);
+  tft.drawString(text, TFT_WIDTH / 2, y, 2);
+}
+
+// ---------------------------------------------------------------------------
+// LED control
+// ---------------------------------------------------------------------------
+
+void ui_set_led(bool r, bool g, bool b) {
+  // CYD RGB LED is active LOW
+  digitalWrite(LED_R, !r);
+  digitalWrite(LED_G, !g);
+  digitalWrite(LED_B, !b);
+}
+
+void ui_load_led_color() {
+  uint32_t color = ui_prefs().getUInt(NVS_KEY_LED_COLOR, 0);
+  bool r = (color >> 16) & 1;
+  bool g = (color >> 8) & 1;
+  bool b = color & 1;
+  ui_set_led(r, g, b);
+}
+
+void ui_save_led_color(bool r, bool g, bool b) {
+  uint32_t color = ((r ? 1 : 0) << 16) | ((g ? 1 : 0) << 8) | (b ? 1 : 0);
+  ui_prefs().putUInt(NVS_KEY_LED_COLOR, color);
+  ui_set_led(r, g, b);
+}
+
+// ---------------------------------------------------------------------------
+// Event queue
+// ---------------------------------------------------------------------------
+
+void ui_event_push(UiEventType type, const char *text) {
+  if (!_evt_mutex) return;
+  
+  if (xSemaphoreTake(_evt_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (_evt_count < EVENT_QUEUE_SIZE) {
+      UiEvent &e = _event_buf[_evt_head];
+      e.type = type;
+      e.timestamp = millis();
+      
+      if (text) {
+        strncpy(e.text, text, EVENT_TEXT_LEN - 1);
+        e.text[EVENT_TEXT_LEN - 1] = '\0';
+      } else {
+        e.text[0] = '\0';
+      }
+      
+      _evt_head = (_evt_head + 1) % EVENT_QUEUE_SIZE;
+      _evt_count++;
+    }
+    xSemaphoreGive(_evt_mutex);
+  }
+}
+
+bool ui_event_pop(UiEvent *evt) {
+  if (!_evt_mutex || !evt) return false;
+  
+  bool got = false;
+  if (xSemaphoreTake(_evt_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    if (_evt_count > 0) {
+      *evt = _event_buf[_evt_tail];
+      _evt_tail = (_evt_tail + 1) % EVENT_QUEUE_SIZE;
+      _evt_count--;
+      got = true;
+    }
+    xSemaphoreGive(_evt_mutex);
+  }
+  
+  return got;
+}
+
+// ---------------------------------------------------------------------------
+// NVS helpers
+// ---------------------------------------------------------------------------
+
+Preferences& ui_prefs() {
+  if (!prefs_opened) {
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs_opened = true;
+  }
+  return prefs;
+}
+
+bool ui_is_configured() {
+  return ui_prefs().getBool(NVS_KEY_CONFIGURED, false);
+}
+
+void ui_set_configured(bool val) {
+  ui_prefs().putBool(NVS_KEY_CONFIGURED, val);
+}
+
+String ui_load_string(const char *key) {
+  return ui_prefs().getString(key, "");
+}
+
+void ui_save_string(const char *key, const char *value) {
+  ui_prefs().putString(key, value);
+}
+
+// ---------------------------------------------------------------------------
+// Utility functions
+// ---------------------------------------------------------------------------
+
+void ui_format_uptime(unsigned long ms, char *buf, size_t buflen) {
+  unsigned long seconds = ms / 1000;
+  unsigned long minutes = seconds / 60;
+  unsigned long hours = minutes / 60;
+  
+  if (hours > 0) {
+    snprintf(buf, buflen, "%luh %lum", hours, minutes % 60);
+  } else if (minutes > 0) {
+    snprintf(buf, buflen, "%lum", minutes);
+  } else {
+    snprintf(buf, buflen, "%lus", seconds);
+  }
+}

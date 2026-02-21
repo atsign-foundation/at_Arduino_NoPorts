@@ -86,6 +86,7 @@ struct NoPortsConfig {
   const char *encrypt_private_key_base64;
   const char *encrypt_public_key_base64;
   const char *self_encryption_key_base64;
+  const char *enrollment_id;              // APKAM enrollment ID (required for APKAM auth)
 
   // Callbacks (optional)
   // Called when a tunnel is established – host:port that is being relayed

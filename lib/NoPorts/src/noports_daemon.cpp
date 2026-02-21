@@ -255,6 +255,18 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
     }
   }
 
+  // Set enrollment ID (required for APKAM-enrolled keys)
+  if (_config.enrollment_id) {
+    res = atclient_atkeys_set_enrollment_id(keys,
+                                  _config.enrollment_id,
+                                  strlen(_config.enrollment_id));
+    if (res != 0) {
+      NOPORTS_LOGW(TAG, "Failed to set enrollment_id: %d (non-fatal)", res);
+    } else {
+      NOPORTS_LOGI(TAG, "Enrollment ID set: %s", _config.enrollment_id);
+    }
+  }
+
   // ---- Create signing key copy (from encrypt private key, same as C sshnpd) ----
   _signing_key = calloc(1, sizeof(atchops_rsa_key_private_key));
   if (!_signing_key) {
@@ -617,12 +629,23 @@ void NoPortsDaemon::_handleNotification(void *msg) {
   bool is_init = atclient_atnotification_is_decrypted_value_initialized(message->notification);
   bool has_key = atclient_atnotification_is_key_initialized(message->notification);
 
+  NOPORTS_LOGI(TAG, "Notification received: key_init=%d val_init=%d id=%s",
+               has_key, is_init,
+               message->notification->id ? message->notification->id : "null");
+  if (has_key) {
+    NOPORTS_LOGI(TAG, "  key=%s from=%s to=%s",
+                 message->notification->key ? message->notification->key : "null",
+                 message->notification->from ? message->notification->from : "null",
+                 message->notification->to ? message->notification->to : "null");
+  }
+
   if (!is_init) {
-    NOPORTS_LOGD(TAG, "Skipping notification (no decrypted value)");
+    NOPORTS_LOGI(TAG, "Skipping notification (no decrypted value)");
     return;
   }
 
   if (!has_key || strcmp(message->notification->id, "-1") == 0) {
+    NOPORTS_LOGI(TAG, "Skipping notification (no key or id=-1)");
     return;
   }
 
@@ -639,7 +662,7 @@ void NoPortsDaemon::_handleNotification(void *msg) {
   free(tail);
 
   if (tailstart == NULL) {
-    NOPORTS_LOGD(TAG, "Skipping message: couldn't find tail");
+    NOPORTS_LOGI(TAG, "Skipping: couldn't find tail in key");
     return;
   }
   *tailstart = '\0'; // reterminate
@@ -649,16 +672,18 @@ void NoPortsDaemon::_handleNotification(void *msg) {
   size_t head_len = strlen(head);
 
   if (strlen(key) < head_len) {
-    NOPORTS_LOGD(TAG, "Skipping message: key too short");
+    NOPORTS_LOGI(TAG, "Skipping: key too short for head strip");
     return;
   }
 
   if (strncmp(key, head, head_len) != 0) {
-    NOPORTS_LOGD(TAG, "Skipping message: head mismatch");
+    NOPORTS_LOGI(TAG, "Skipping: head mismatch");
     return;
   }
 
   key += head_len + 1; // +1 for ":"
+
+  NOPORTS_LOGI(TAG, "Parsed notification key: '%s'", key);
 
   // Identify notification type
   NoPortsNotificationKey nk = NK_NONE;

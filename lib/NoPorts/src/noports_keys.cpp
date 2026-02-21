@@ -182,6 +182,12 @@ int noports_keys_load_from_file(NoPortsConfig *config, const char *filepath) {
     else { NOPORTS_LOGE(TAG, "Failed to decrypt encryption private key"); }
   }
 
+  // Extract enrollment ID (not encrypted, plain string)
+  cJSON *enroll_id = cJSON_GetObjectItem(root, "enrollmentId");
+  if (enroll_id && cJSON_IsString(enroll_id)) {
+    config->enrollment_id = strdup(cJSON_GetStringValue(enroll_id));
+  }
+
   cJSON_Delete(root);
 
   if (res != 0) {
@@ -217,5 +223,9 @@ void noports_keys_free(NoPortsConfig *config) {
   if (config->self_encryption_key_base64) {
     free((void*)config->self_encryption_key_base64);
     config->self_encryption_key_base64 = NULL;
+  }
+  if (config->enrollment_id) {
+    free((void*)config->enrollment_id);
+    config->enrollment_id = NULL;
   }
 }

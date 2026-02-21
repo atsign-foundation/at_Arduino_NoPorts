@@ -1,40 +1,51 @@
 /**
- * @file main.cpp
- * @brief NoPorts CYD – main entry point
+ * @file main_tft.cpp
+ * @brief NoPorts CYD main entry point - TFT_eSPI version (memory-efficient)
  *
  * Boot flow:
- *   1. Init smart display (ILI9341 + XPT2046 + RGB LED)
- *   2. Init LVGL common resources
- *   3. If previously configured → auto-connect WiFi → load keys → daemon →
- *      dashboard
- *   4. If not configured → WiFi screen → enroll screen → dashboard
+ *   1. Init TFT display + touch + LED
+ *   2. If previously configured → auto-connect WiFi → load keys → daemon → dashboard
+ *   3. If not configured → WiFi screen → enroll screen → dashboard
  *
  * loop():
- *   - lv_timer_handler()   (drives LVGL)
+ *   - Handle touch input
  *   - npDaemon.loop()      (drives NoPorts monitor/relay)
  *   - ui_dashboard_update() (refreshes stats from event queue)
  */
 
 #include <Arduino.h>
 #include <LittleFS.h>
-#include <esp32_smartdisplay.h>
 #include <NoPorts.h>
+#include "esp_bt.h"
 
 extern "C" {
   #include "atlogger/atlogger.h"
 }
 
-#include "ui_common.h"
-#include "ui_calibrate.h"
-#include "ui_wifi.h"
-#include "ui_enroll.h"
-#include "ui_dashboard.h"
+#include "ui_tft.h"
+#include "ui_wifi_tft.h"
+#include "ui_enroll_tft.h"
+#include "ui_dashboard_tft.h"
 
 // ---------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------
 static NoPortsDaemon npDaemon;
-static bool          daemon_running = false;
+static bool daemon_running = false;
+
+// Session tracking
+static uint32_t _total_tunnels = 0;
+static uint32_t _total_pings = 0;
+
+enum AppScreen {
+  SCREEN_NONE,
+  SCREEN_SPLASH,
+  SCREEN_WIFI,
+  SCREEN_ENROLL,
+  SCREEN_DASHBOARD
+};
+
+static AppScreen current_screen = SCREEN_NONE;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -56,39 +67,41 @@ static const char *daemon_state_str(NoPortsDaemonState s) {
 // NoPorts callbacks → event queue
 // ---------------------------------------------------------------------------
 
-static void on_tunnel_open(const char *host, uint16_t port,
-                           const char *session_id) {
+static void on_tunnel_open(const char *host, uint16_t port, const char *session_id) {
+  _total_tunnels++;
   char buf[EVENT_TEXT_LEN];
-  snprintf(buf, sizeof(buf), "Tunnel %s:%u [%s]", host, port,
-           session_id ? session_id : "");
+  snprintf(buf, sizeof(buf), "Tunnel %s:%u", host, port);
   ui_event_push(UI_EVT_TUNNEL_OPEN, buf);
 }
 
 static void on_tunnel_close(const char *session_id) {
   char buf[EVENT_TEXT_LEN];
-  snprintf(buf, sizeof(buf), "Closed [%s]",
-           session_id ? session_id : "");
+  snprintf(buf, sizeof(buf), "Closed [%.8s]", session_id ? session_id : "?");
   ui_event_push(UI_EVT_TUNNEL_CLOSE, buf);
 }
 
 static void on_ping(const char *from_atsign) {
+  _total_pings++;
   char buf[EVENT_TEXT_LEN];
-  snprintf(buf, sizeof(buf), "Ping from %s",
-           from_atsign ? from_atsign : "?");
+  snprintf(buf, sizeof(buf), "Ping from %s", from_atsign ? from_atsign : "?");
   ui_event_push(UI_EVT_PING, buf);
 }
 
 // ---------------------------------------------------------------------------
-// Start the NoPorts daemon (called after WiFi + enrollment are done)
+// Start the NoPorts daemon
 // ---------------------------------------------------------------------------
 
+static void _do_reset();
+
 static bool start_daemon() {
-  String atsign  = ui_load_string(NVS_KEY_ATSIGN);
-  String device  = ui_load_string(NVS_KEY_DEVICE);
-  String manager = ui_load_string(NVS_KEY_MANAGER);
+  // These MUST be static — NoPortsDaemon::begin() stores pointers to them
+  // via memcpy, so they must outlive the function call.
+  static String atsign  = ui_load_string(NVS_KEY_ATSIGN);
+  static String device  = ui_load_string(NVS_KEY_DEVICE);
+  static String manager = ui_load_string(NVS_KEY_MANAGER);
 
   if (atsign.length() == 0 || device.length() == 0) {
-    Serial.println("[main] Missing atSign/device in NVS – cannot start daemon");
+    Serial.println("[main] Missing atSign/device in NVS");
     return false;
   }
 
@@ -112,14 +125,10 @@ static bool start_daemon() {
 
   int res = noports_keys_load_from_file(&config, ATKEYS_PATH);
   if (res != 0) {
-    Serial.printf("[main] Failed to load keys from %s (err=%d)\n",
-                  ATKEYS_PATH, res);
+    Serial.printf("[main] Failed to load keys from %s (err=%d)\n", ATKEYS_PATH, res);
     return false;
   }
   Serial.println("[main] Keys loaded from LittleFS");
-
-  // Load permitopen from LittleFS if present
-  // (future: parse /permitopen.json and populate config.permitopen[])
 
   if (!npDaemon.begin(config)) {
     Serial.printf("[main] Daemon begin failed: %s\n", npDaemon.getLastError());
@@ -130,14 +139,60 @@ static bool start_daemon() {
   noports_keys_free(&config);
   daemon_running = true;
   Serial.println("[main] NoPorts daemon running!");
+  
+  // Set LED to cyan (running)
+  ui_load_led_color();
+  
   return true;
 }
 
 // ---------------------------------------------------------------------------
-// Screen transition callbacks
+// Reset device: delete atKeys, clear NVS config, reboot
 // ---------------------------------------------------------------------------
 
-// Sync system time via NTP (required for TLS certificate validation)
+static void _do_reset() {
+  Serial.println("[main] RESET requested — wiping credentials");
+  
+  // Stop daemon if running
+  if (daemon_running) {
+    npDaemon.stop();
+    daemon_running = false;
+  }
+  
+  // Delete atKeys from LittleFS
+  if (LittleFS.begin(true)) {
+    if (LittleFS.exists(ATKEYS_PATH)) {
+      LittleFS.remove(ATKEYS_PATH);
+      Serial.println("[main] Deleted atKeys file");
+    }
+  }
+  
+  // Clear enrollment config from NVS
+  ui_save_string(NVS_KEY_ATSIGN, "");
+  ui_save_string(NVS_KEY_DEVICE, "");
+  ui_save_string(NVS_KEY_MANAGER, "");
+  ui_set_configured(false);
+  
+  Serial.println("[main] NVS cleared — rebooting...");
+  
+  // Show reset message
+  TFT_eSPI &tft = ui_get_tft();
+  tft.fillScreen(COLOR_BG_DARK);
+  tft.setTextColor(COLOR_ERROR);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(1);
+  tft.drawString("Device Reset", TFT_WIDTH / 2, TFT_HEIGHT / 2 - 20, 4);
+  tft.setTextColor(COLOR_TEXT_GREY);
+  tft.drawString("Rebooting...", TFT_WIDTH / 2, TFT_HEIGHT / 2 + 20, 2);
+  
+  delay(2000);
+  ESP.restart();
+}
+
+// ---------------------------------------------------------------------------
+// Screen transitions
+// ---------------------------------------------------------------------------
+
 static void sync_ntp_time() {
   Serial.println("[NTP] Syncing time...");
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
@@ -148,145 +203,76 @@ static void sync_ntp_time() {
     retries++;
     Serial.printf("[NTP] Waiting for time... (%d/10)\n", retries);
   }
+  
   if (retries < 10) {
     char buf[64];
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &timeinfo);
     Serial.printf("[NTP] Time set: %s\n", buf);
   } else {
-    Serial.println("[NTP] WARNING: Failed to get time – TLS may fail");
+    Serial.println("[NTP] WARNING: Failed to get time");
   }
 }
 
-// Called when WiFi connects (both fresh setup and re-setup paths)
+static void _show_daemon_error() {
+  // Show error screen with retry/reset options
+  TFT_eSPI &tft = ui_get_tft();
+  tft.fillScreen(COLOR_BG_DARK);
+  tft.setTextColor(COLOR_ERROR);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(1);
+  tft.drawString("Daemon Start Failed", TFT_WIDTH / 2, TFT_HEIGHT / 2 - 40, 4);
+  
+  tft.setTextColor(COLOR_TEXT_GREY);
+  tft.drawString("PKAM auth failed - keys may be invalid", TFT_WIDTH / 2, TFT_HEIGHT / 2, 2);
+  tft.drawString("Tap screen to reset and re-enroll", TFT_WIDTH / 2, TFT_HEIGHT / 2 + 25, 2);
+  
+  current_screen = SCREEN_NONE;  // Special state: any touch triggers reset
+  Serial.println("[main] Daemon failed - waiting for touch to reset");
+}
+
+static void _on_enrolled() {
+  if (start_daemon()) {
+    current_screen = SCREEN_DASHBOARD;
+    ui_dashboard_create(_do_reset);
+  } else {
+    _show_daemon_error();
+  }
+}
+
 static void on_wifi_connected() {
   sync_ntp_time();
+  
   if (ui_is_configured()) {
-    // Already enrolled – go straight to daemon + dashboard
+    // Already enrolled – start daemon and go to dashboard
     if (start_daemon()) {
-      ui_dashboard_create();
+      current_screen = SCREEN_DASHBOARD;
+      ui_dashboard_create(_do_reset);
     } else {
-      // Failed to start daemon – show enrollment again
-      ui_enroll_create([]() {
-        if (start_daemon()) {
-          ui_dashboard_create();
-        }
-      });
+      // Keys exist but auth failed – show error with reset option
+      _show_daemon_error();
     }
   } else {
-    // First run – show enrollment screen
-    ui_enroll_create([]() {
-      if (start_daemon()) {
-        ui_dashboard_create();
-      }
-    });
+    // First run – show enrollment
+    current_screen = SCREEN_ENROLL;
+    ui_enroll_create(_on_enrolled);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Continue boot after calibration (or if calibration was already loaded)
-// ---------------------------------------------------------------------------
-
-static void continue_boot();  // forward declaration
-
-// Show a splash with saved SSID and a "Change WiFi" button.
-// If the button isn't tapped within 5 seconds, auto-connect.
-static lv_timer_t *_wifi_countdown_timer = nullptr;
-
-static void _cancel_countdown_cb(lv_event_t *e) {
-  (void)e;
-  if (_wifi_countdown_timer) {
-    // Free the countdown context
-    free(_wifi_countdown_timer->user_data);
-    lv_timer_del(_wifi_countdown_timer);
-    _wifi_countdown_timer = nullptr;
-  }
-  Serial.println("[main] User chose to change WiFi");
-  ui_wifi_create(on_wifi_connected);
-}
-
-static void show_wifi_splash() {
-  String ssid = ui_load_string(NVS_KEY_SSID);
-
-  lv_obj_t *splash = lv_obj_create(nullptr);
-  lv_obj_set_style_bg_color(splash, COLOR_BG_DARK, 0);
-
-  char msg[80];
-  snprintf(msg, sizeof(msg), LV_SYMBOL_WIFI "  Connecting to: %s", ssid.c_str());
-  lv_obj_t *lbl = ui_create_label(splash, msg, &lv_font_montserrat_16);
-  lv_obj_align(lbl, LV_ALIGN_CENTER, 0, -30);
-
-  // Countdown label
-  lv_obj_t *countdown = ui_create_label(splash, "Auto-connect in 5s...",
-                                        &lv_font_montserrat_12);
-  lv_obj_set_style_text_color(countdown, COLOR_TEXT_GREY, 0);
-  lv_obj_align(countdown, LV_ALIGN_CENTER, 0, 0);
-
-  // "Change WiFi" button
-  lv_obj_t *btn = ui_create_btn(splash, LV_SYMBOL_REFRESH " Change WiFi",
-                                _cancel_countdown_cb);
-  lv_obj_align(btn, LV_ALIGN_CENTER, 0, 40);
-
-  lv_scr_load(splash);
-  lv_timer_handler();
-
-  // Create countdown timer (ticks every 1s, 5 times)
-  struct CountdownCtx {
-    lv_obj_t *label;
-    int remaining;
-  };
-  CountdownCtx *ctx = (CountdownCtx *)malloc(sizeof(CountdownCtx));
-  ctx->label = countdown;
-  ctx->remaining = 5;
-
-  _wifi_countdown_timer = lv_timer_create([](lv_timer_t *t) {
-    CountdownCtx *c = (CountdownCtx *)t->user_data;
-    c->remaining--;
-    if (c->remaining > 0) {
-      char buf[32];
-      snprintf(buf, sizeof(buf), "Auto-connect in %ds...", c->remaining);
-      lv_label_set_text(c->label, buf);
-    } else {
-      free(c);
-      lv_timer_del(t);
-      _wifi_countdown_timer = nullptr;
-
-      // Auto-connect with saved creds
-      Serial.println("[main] Auto-connect timeout – connecting with saved WiFi");
-      if (ui_wifi_auto_connect(10000)) {
-        smartdisplay_led_set_rgb(false, false, true);
-        sync_ntp_time();
-        if (ui_is_configured()) {
-          if (start_daemon()) {
-            ui_dashboard_create();
-          } else {
-            ui_enroll_create([]() {
-              if (start_daemon()) ui_dashboard_create();
-            });
-          }
-        } else {
-          ui_enroll_create([]() {
-            if (start_daemon()) ui_dashboard_create();
-          });
-        }
-      } else {
-        Serial.println("[main] Auto-connect failed – showing WiFi setup");
-        ui_wifi_create(on_wifi_connected);
-      }
-    }
-  }, 1000, ctx);
-}
-
-static void continue_boot() {
-  String ssid = ui_load_string(NVS_KEY_SSID);
-
-  if (ssid.length() > 0) {
-    // We have saved WiFi – show splash with change option
-    show_wifi_splash();
-  } else {
-    // No saved WiFi – go straight to WiFi setup
-    Serial.println("[main] No saved WiFi – showing WiFi setup");
-    ui_wifi_create(on_wifi_connected);
-  }
+static void show_splash() {
+  TFT_eSPI &tft = ui_get_tft();
+  tft.fillScreen(COLOR_BG_DARK);
+  
+  // Show NoPorts logo/title
+  tft.setTextColor(COLOR_PRIMARY);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(1);
+  tft.drawString("NoPorts CYD", TFT_WIDTH / 2, TFT_HEIGHT / 2 - 30, 4);
+  
+  tft.setTextColor(COLOR_TEXT_GREY);
+  tft.setTextSize(1);
+  tft.drawString("Initializing...", TFT_WIDTH / 2, TFT_HEIGHT / 2 + 20, 2);
+  
+  delay(1500);
 }
 
 // ---------------------------------------------------------------------------
@@ -297,38 +283,61 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\n==============================");
-  Serial.println("  NoPorts CYD – Starting up");
+  Serial.println("  NoPorts CYD - TFT_eSPI Mode");
+  Serial.println("  Memory-Optimized Version");
   Serial.println("==============================\n");
+
+  // Release Bluetooth controller memory — we never use BT (~30KB heap savings)
+  esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+  Serial.printf("[main] Heap after BT release: %u bytes\n", ESP.getFreeHeap());
 
   // Enable at_client logging
   atlogger_set_logging_level(ATLOGGER_LOGGING_LEVEL_INFO);
 
-  // Initialise the smart display (configures ILI9341, XPT2046, RGB LED)
-  smartdisplay_init();
-
-  // LVGL 9.x requires a tick source – tell it to use Arduino millis()
-  lv_tick_set_cb([]() -> uint32_t { return (uint32_t)millis(); });
-
-  // Set backlight to full brightness
-  smartdisplay_lcd_set_backlight(1.0f);
-
-  // Green LED during boot (API takes bool: on/off per channel)
-  smartdisplay_led_set_rgb(false, true, false);
-
-  // Init LVGL common styles and event queue
-  ui_common_init();
-
-  // Load or run touch calibration
-  if (!ui_calibrate_load()) {
-    Serial.println("[main] No calibration found – running calibration");
-    ui_calibrate_create([]() {
-      continue_boot();
-    });
-    return;  // setup() done – calibration screen is active
+  // Initialize TFT display and touch
+  ui_tft_init();
+  
+  // Run touch calibration on first boot
+  if (!ui_touch_is_calibrated()) {
+    ui_touch_calibrate();
   }
+  
+  // Show splash screen
+  current_screen = SCREEN_SPLASH;
+  show_splash();
 
-  // Calibration loaded – proceed with normal boot
-  continue_boot();
+  // Check for saved WiFi credentials
+  String ssid = ui_load_string(NVS_KEY_SSID);
+  
+  if (ssid.length() > 0) {
+    // Try auto-connect
+    TFT_eSPI &tft = ui_get_tft();
+    tft.fillScreen(COLOR_BG_DARK);
+    tft.setTextColor(COLOR_ACCENT);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextSize(1);
+    tft.drawString("Connecting to WiFi...", TFT_WIDTH / 2, TFT_HEIGHT / 2 - 10, 2);
+    tft.setTextColor(COLOR_TEXT_GREY);
+    tft.drawString(ssid.c_str(), TFT_WIDTH / 2, TFT_HEIGHT / 2 + 15, 2);
+    
+    if (ui_wifi_auto_connect(10000)) {
+      Serial.println("[main] Auto-connected to WiFi");
+      ui_set_led(false, false, true);  // Blue = connected
+      delay(500);
+      on_wifi_connected();
+    } else {
+      Serial.println("[main] Auto-connect failed - showing WiFi setup");
+      current_screen = SCREEN_WIFI;
+      ui_wifi_create(on_wifi_connected);
+    }
+  } else {
+    // No saved WiFi - show setup
+    Serial.println("[main] No saved WiFi - showing setup");
+    current_screen = SCREEN_WIFI;
+    ui_wifi_create(on_wifi_connected);
+  }
+  
+  Serial.printf("[main] Free heap: %u bytes\n", ESP.getFreeHeap());
 }
 
 // ---------------------------------------------------------------------------
@@ -336,24 +345,62 @@ void setup() {
 // ---------------------------------------------------------------------------
 
 void loop() {
-  // Drive LVGL
-  lv_timer_handler();
-
-  // Process enrollment events (thread-safe LVGL updates)
-  ui_enroll_process_events();
-
-  // Drive NoPorts daemon
-  if (daemon_running && npDaemon.isRunning()) {
-    npDaemon.loop();
-
-    // Update dashboard every ~500ms
-    static uint32_t last_update = 0;
-    if (millis() - last_update > 500) {
-      last_update = millis();
-      ui_dashboard_update(npDaemon.getActiveRelayCount(),
-                          daemon_state_str(npDaemon.getState()));
+  // Handle touch input
+  int16_t tx, ty;
+  if (ui_touch_read(&tx, &ty)) {
+    switch (current_screen) {
+      case SCREEN_WIFI:
+        ui_wifi_handle_touch(tx, ty);
+        break;
+        
+      case SCREEN_ENROLL:
+        ui_enroll_handle_touch(tx, ty);
+        break;
+        
+      case SCREEN_DASHBOARD:
+        ui_dashboard_handle_touch(tx, ty);
+        break;
+        
+      case SCREEN_NONE:
+        // Error screen – any touch triggers reset
+        _do_reset();
+        break;
+        
+      default:
+        break;
     }
   }
-
-  delay(5);
+  
+  // Update current screen
+  switch (current_screen) {
+    case SCREEN_WIFI:
+      ui_wifi_update();
+      break;
+      
+    case SCREEN_ENROLL:
+      ui_enroll_update();
+      ui_enroll_process_events();
+      break;
+      
+    case SCREEN_DASHBOARD:
+      // Drive NoPorts daemon
+      if (daemon_running && npDaemon.isRunning()) {
+        npDaemon.loop();
+        
+        // Update dashboard periodically
+        static uint32_t last_update = 0;
+        if (millis() - last_update > 500) {
+          last_update = millis();
+          ui_dashboard_update(npDaemon.getActiveRelayCount(),
+                            daemon_state_str(npDaemon.getState()),
+                            _total_tunnels, _total_pings);
+        }
+      }
+      break;
+      
+    default:
+      break;
+  }
+  
+  delay(10);  // Reduced from 5ms to save CPU
 }
