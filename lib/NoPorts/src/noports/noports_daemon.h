@@ -94,6 +94,13 @@ public:
   uint8_t getActiveRelayCount() const;
 
   /**
+   * @brief Get aggregate throughput across all active relays
+   * @param bytes_in  Total bytes RVD->local (downloaded)
+   * @param bytes_out Total bytes local->RVD (uploaded)
+   */
+  void getThroughput(uint32_t &bytes_in, uint32_t &bytes_out) const;
+
+  /**
    * @brief Get the last error message
    */
   const char* getLastError() const;

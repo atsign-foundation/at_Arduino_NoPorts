@@ -81,6 +81,11 @@ struct NoPortsRelay {
   WiFiClient         local_client;  // connection to local service
   volatile bool      should_run;
 
+  // Live byte counters (updated from relay task, read from main loop)
+  volatile uint32_t  bytes_in;      // RVD → local
+  volatile uint32_t  bytes_out;     // local → RVD
+  volatile uint32_t  start_ms;      // millis() when relay entered RUNNING
+
   // AES-CTR state for encryption (if enabled)
   // Uses mbedtls_aes_context from ESP-IDF's built-in mbedTLS
   void *encrypter; // opaque, cast to internal aes_ctr_state*

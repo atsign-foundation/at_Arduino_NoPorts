@@ -86,6 +86,9 @@ NoPortsDaemon::NoPortsDaemon()
     _relays[i].state = RELAY_IDLE;
     _relays[i].task_handle = NULL;
     _relays[i].should_run = false;
+    _relays[i].bytes_in = 0;
+    _relays[i].bytes_out = 0;
+    _relays[i].start_ms = 0;
     _relays[i].encrypter = NULL;
     _relays[i].decrypter = NULL;
   }
@@ -433,6 +436,15 @@ uint8_t NoPortsDaemon::getActiveRelayCount() const {
 
 const char* NoPortsDaemon::getLastError() const {
   return _last_error;
+}
+
+void NoPortsDaemon::getThroughput(uint32_t &bytes_in, uint32_t &bytes_out) const {
+  bytes_in = 0;
+  bytes_out = 0;
+  for (int i = 0; i < NOPORTS_MAX_RELAYS; i++) {
+    bytes_in  += _relays[i].bytes_in;
+    bytes_out += _relays[i].bytes_out;
+  }
 }
 
 // ============================================================================
@@ -1303,6 +1315,9 @@ void NoPortsDaemon::_cleanupFinishedRelays() {
           _config.on_tunnel_close(_relays[i].config.session_id);
         }
         _relays[i].state = RELAY_IDLE;
+        _relays[i].bytes_in = 0;
+        _relays[i].bytes_out = 0;
+        _relays[i].start_ms = 0;
         memset(&_relays[i].config, 0, sizeof(NoPortsRelayConfig));
       }
     }

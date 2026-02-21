@@ -497,6 +497,7 @@ static void _relay_task_inner(NoPortsRelay *relay) {
   }
 
   relay->state = RELAY_RUNNING;
+  relay->start_ms = millis();
   NOPORTS_LOGI(TAG, "Relay running for session %s (e2ee=%d) data=%s",
                relay->config.session_id, data_encrypted,
                (data == &sockA) ? "sockA" : "sockB");
@@ -520,6 +521,7 @@ static void _relay_task_inner(NoPortsRelay *relay) {
         activity = true;
         idle_since = millis();
         total_rvd_to_local += n;
+        relay->bytes_in = (uint32_t)total_rvd_to_local;
         if (total_rvd_to_local == (unsigned long)n) {
           NOPORTS_LOGI(TAG, "First RVD->Local: %d bytes", n);
         }
@@ -548,6 +550,7 @@ static void _relay_task_inner(NoPortsRelay *relay) {
         activity = true;
         idle_since = millis();
         total_local_to_rvd += n;
+        relay->bytes_out = (uint32_t)total_local_to_rvd;
         if (total_local_to_rvd == (unsigned long)n) {
           NOPORTS_LOGI(TAG, "First Local->RVD: %d bytes", n);
         }
@@ -732,6 +735,9 @@ int noports_relay_start(NoPortsRelay *relay, const NoPortsRelayConfig *config) {
 
   relay->state = RELAY_IDLE;
   relay->should_run = true;
+  relay->bytes_in = 0;
+  relay->bytes_out = 0;
+  relay->start_ms = 0;
   relay->encrypter = NULL;
   relay->decrypter = NULL;
 
@@ -787,6 +793,16 @@ void noports_relay_stop(NoPortsRelay *relay) {
 
 bool noports_relay_is_running(const NoPortsRelay *relay) {
   if (!relay) return false;
+  // If the task handle exists, verify the FreeRTOS task is actually alive
+  if (relay->task_handle != NULL) {
+    eTaskState ts = eTaskGetState(relay->task_handle);
+    if (ts == eDeleted || ts == eInvalid) {
+      // Task is gone but state wasn't updated — force cleanup
+      ((NoPortsRelay *)relay)->state = RELAY_STOPPED;
+      ((NoPortsRelay *)relay)->task_handle = NULL;
+      return false;
+    }
+  }
   return relay->state == RELAY_RUNNING ||
          relay->state == RELAY_CONNECTING ||
          relay->state == RELAY_AUTHENTICATING;

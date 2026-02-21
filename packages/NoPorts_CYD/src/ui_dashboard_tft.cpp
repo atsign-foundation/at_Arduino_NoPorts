@@ -16,12 +16,21 @@
 #define STATS_ROW1_Y      (HEADER_PADDING + HEADER_HEIGHT + 3)
 #define STATS_ROW2_Y      (STATS_ROW1_Y + 26)
 #define LOG_TOP_Y         (STATS_ROW2_Y + 26)
-#define LOG_HEIGHT        82
+#define LOG_HEIGHT        48
+#define GRAPH_TOP_Y       (LOG_TOP_Y + LOG_HEIGHT + 3)
+#define GRAPH_HEIGHT      54
 #define BOTTOM_ROW_Y      (TFT_HEIGHT - 30)
 #define SPACING           3
 
-#define LOG_MAX_ENTRIES   5
+#define LOG_MAX_ENTRIES   3
 #define LOG_ENTRY_HEIGHT  14
+
+// Throughput graph
+#define GRAPH_SAMPLES     40
+#define GRAPH_PAD_L       38   // left padding for axis labels
+#define GRAPH_PAD_R       4
+#define GRAPH_PAD_T       12   // top padding for title
+#define GRAPH_PAD_B       2
 
 // ---------------------------------------------------------------------------
 // State
@@ -42,6 +51,13 @@ struct LogEntry {
 
 static LogEntry _log_entries[LOG_MAX_ENTRIES];
 static int _log_head = 0;
+
+// Throughput graph ring buffer
+static uint32_t _tp_in[GRAPH_SAMPLES];   // bytes received per sample period
+static uint32_t _tp_out[GRAPH_SAMPLES];  // bytes sent per sample period
+static int _tp_head = 0;
+static uint32_t _prev_bytes_in = 0;
+static uint32_t _prev_bytes_out = 0;
 
 // LED color presets
 struct LedPreset {
@@ -207,6 +223,108 @@ static void _draw_log() {
   }
 }
 
+static void _format_bytes(uint32_t bytes, char *buf, size_t len) {
+  if (bytes >= 1048576)
+    snprintf(buf, len, "%.1fM", bytes / 1048576.0f);
+  else if (bytes >= 1024)
+    snprintf(buf, len, "%.1fK", bytes / 1024.0f);
+  else
+    snprintf(buf, len, "%luB", (unsigned long)bytes);
+}
+
+static void _draw_graph() {
+  TFT_eSPI &tft = ui_get_tft();
+  int x0 = HEADER_PADDING;
+  int y0 = GRAPH_TOP_Y;
+  int w  = TFT_WIDTH - 6;
+  int h  = GRAPH_HEIGHT;
+
+  // Background card
+  ui_draw_rounded_rect(x0, y0, w, h, 5, COLOR_BG_CARD);
+
+  // Graph plotting area (inside card, below title)
+  int gx = x0 + GRAPH_PAD_L;
+  int gy = y0 + GRAPH_PAD_T;
+  int gw = w - GRAPH_PAD_L - GRAPH_PAD_R;
+  int gh = h - GRAPH_PAD_T - GRAPH_PAD_B;
+
+  if (gw <= 0 || gh <= 0) return;
+
+  // Explicitly clear the plotting area so stale bars are wiped
+  tft.fillRect(gx, gy, gw, gh, COLOR_BG_CARD);
+
+  // Also clear the label column so old axis text is wiped
+  tft.fillRect(x0 + 1, gy, GRAPH_PAD_L - 1, gh, COLOR_BG_CARD);
+
+  // Find max value for scaling
+  uint32_t max_val = 1;  // avoid /0
+  for (int i = 0; i < GRAPH_SAMPLES; i++) {
+    uint32_t combined = _tp_in[i] + _tp_out[i];
+    if (combined > max_val) max_val = combined;
+  }
+
+  // Current rate text (top-right, drawn first so bars don't obscure)
+  int last_idx = (_tp_head - 1 + GRAPH_SAMPLES) % GRAPH_SAMPLES;
+  char tot_in[12], tot_out[12];
+  _format_bytes(_tp_in[last_idx] * 2, tot_in, sizeof(tot_in));   // *2 for per-second (500ms sample)
+  _format_bytes(_tp_out[last_idx] * 2, tot_out, sizeof(tot_out));
+
+  char rate_str[32];
+  snprintf(rate_str, sizeof(rate_str), "in:%s/s out:%s/s", tot_in, tot_out);
+  tft.setTextColor(COLOR_TEXT_WHITE);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextSize(1);
+  tft.drawString(rate_str, x0 + w - 6, y0 + 2, 1);
+
+  // Title (top-left)
+  tft.setTextColor(COLOR_TEXT_GREY);
+  tft.setTextDatum(TL_DATUM);
+  tft.drawString("Throughput", x0 + 6, y0 + 2, 1);
+
+  // Y-axis labels (top = max, bottom = 0)
+  char label[12];
+  _format_bytes(max_val, label, sizeof(label));
+  tft.setTextColor(COLOR_TEXT_GREY);
+  tft.setTextDatum(MR_DATUM);
+  tft.drawString(label, gx - 3, gy + 4, 1);
+  tft.drawString("0", gx - 3, gy + gh - 2, 1);
+
+  // Draw stacked bars (in = teal, out = orange)
+  int bar_w = gw / GRAPH_SAMPLES;
+  if (bar_w < 1) bar_w = 1;
+  int bar_gap = (bar_w > 2) ? 1 : 0;
+
+  for (int i = 0; i < GRAPH_SAMPLES; i++) {
+    int idx = (_tp_head + i) % GRAPH_SAMPLES;
+    uint32_t val_in  = _tp_in[idx];
+    uint32_t val_out = _tp_out[idx];
+    if (val_in == 0 && val_out == 0) continue;  // skip empty bars
+
+    int bx = gx + i * bar_w;
+    if (bx + bar_w > gx + gw) break;  // don't draw past right edge
+
+    // Use uint64_t to prevent overflow on large throughput values
+    int h_in  = (int)((uint64_t)val_in  * gh / max_val);
+    int h_out = (int)((uint64_t)val_out * gh / max_val);
+
+    // Clamp each individually, then combined
+    if (h_in  > gh) h_in  = gh;
+    if (h_out > gh) h_out = gh;
+    if (h_in + h_out > gh) h_out = gh - h_in;
+    if (h_in  < 0) h_in  = 0;
+    if (h_out < 0) h_out = 0;
+
+    // Draw "in" bar (teal) from bottom
+    if (h_in > 0) {
+      tft.fillRect(bx, gy + gh - h_in, bar_w - bar_gap, h_in, COLOR_ACCENT);
+    }
+    // Draw "out" bar (orange) stacked above
+    if (h_out > 0) {
+      tft.fillRect(bx, gy + gh - h_in - h_out, bar_w - bar_gap, h_out, COLOR_PRIMARY);
+    }
+  }
+}
+
 static void _draw_bottom_row() {
   TFT_eSPI &tft = ui_get_tft();
   int y = BOTTOM_ROW_Y;
@@ -256,7 +374,14 @@ void ui_dashboard_create(void (*on_reset)()) {
   // Clear log
   memset(_log_entries, 0, sizeof(_log_entries));
   _log_head = 0;
-  
+
+  // Clear throughput history
+  memset(_tp_in, 0, sizeof(_tp_in));
+  memset(_tp_out, 0, sizeof(_tp_out));
+  _tp_head = 0;
+  _prev_bytes_in = 0;
+  _prev_bytes_out = 0;
+
   // Initial log entry
   _add_log_entry("Dashboard started", COLOR_SUCCESS);
   
@@ -268,13 +393,15 @@ void ui_dashboard_create(void (*on_reset)()) {
   _draw_stats_row1();
   _draw_stats_row2();
   _draw_log();
+  _draw_graph();
   _draw_bottom_row();
   
   Serial.println("[ui_dashboard] Created");
 }
 
 void ui_dashboard_update(int active_relays, const char *daemon_state,
-                         uint32_t total_tunnels, uint32_t total_pings) {
+                         uint32_t total_tunnels, uint32_t total_pings,
+                         uint32_t bytes_in, uint32_t bytes_out) {
   // Update state (only redraw if changed)
   bool stats_changed = false;
   
@@ -294,6 +421,16 @@ void ui_dashboard_update(int active_relays, const char *daemon_state,
     _total_pings = total_pings;
     stats_changed = true;
   }
+
+  // Record throughput sample (delta since last update)
+  uint32_t delta_in  = bytes_in  - _prev_bytes_in;
+  uint32_t delta_out = bytes_out - _prev_bytes_out;
+  _prev_bytes_in  = bytes_in;
+  _prev_bytes_out = bytes_out;
+
+  _tp_in[_tp_head]  = delta_in;
+  _tp_out[_tp_head] = delta_out;
+  _tp_head = (_tp_head + 1) % GRAPH_SAMPLES;
   
   // Check reset confirmation timeout
   if (_reset_confirming && (millis() - _reset_confirm_ms > RESET_CONFIRM_TIMEOUT)) {
@@ -340,6 +477,7 @@ void ui_dashboard_update(int active_relays, const char *daemon_state,
   // Always redraw stats (uptime/heap change constantly)
   _draw_stats_row1();
   _draw_stats_row2();
+  _draw_graph();
   
   if (log_changed) {
     _draw_log();

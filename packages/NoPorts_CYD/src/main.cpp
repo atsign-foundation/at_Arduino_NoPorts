@@ -391,9 +391,12 @@ void loop() {
         static uint32_t last_update = 0;
         if (millis() - last_update > 500) {
           last_update = millis();
+          uint32_t tp_in = 0, tp_out = 0;
+          npDaemon.getThroughput(tp_in, tp_out);
           ui_dashboard_update(npDaemon.getActiveRelayCount(),
                             daemon_state_str(npDaemon.getState()),
-                            _total_tunnels, _total_pings);
+                            _total_tunnels, _total_pings,
+                            tp_in, tp_out);
         }
       }
       break;
