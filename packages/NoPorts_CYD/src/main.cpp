@@ -58,7 +58,7 @@ static uint32_t _last_wifi_check_ms = 0;
 
 // CPU usage tracking
 static uint32_t _cpu_loop_start_us = 0;
-static uint32_t _cpu_work_us = 0;       // accumulated work time in current window
+static int32_t  _cpu_work_us = 0;       // accumulated work time in current window
 static uint32_t _cpu_window_start = 0;  // millis() when current 1s window began
 static uint8_t  _cpu_pct = 0;           // computed CPU %
 
@@ -936,8 +936,10 @@ void loop() {
   // CPU usage: compute rolling 1-second average
   // -----------------------------------------------------------------------
   if (millis() - _cpu_window_start >= 1000) {
-    _cpu_pct = (uint8_t)(_cpu_work_us / 10000);  // us -> % of 1s
-    if (_cpu_pct > 100) _cpu_pct = 100;
+    int pct = _cpu_work_us / 10000;  // us -> % of 1s
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    _cpu_pct = (uint8_t)pct;
     _cpu_work_us = 0;
     _cpu_window_start = millis();
   }
@@ -1023,7 +1025,11 @@ void loop() {
     case SCREEN_DASHBOARD:
       // Drive NoPorts daemon
       if (daemon_running && npDaemon.isRunning()) {
+        // Exclude daemon loop from CPU measurement — it blocks on
+        // socket read (up to 100ms idle wait, not real CPU work)
+        uint32_t daemon_start = micros();
         npDaemon.loop();
+        _cpu_work_us -= (micros() - daemon_start);  // subtract blocking I/O time
         
         // Update dashboard periodically
         static uint32_t last_update = 0;

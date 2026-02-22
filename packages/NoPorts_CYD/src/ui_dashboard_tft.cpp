@@ -222,13 +222,14 @@ static void _draw_log() {
   }
 }
 
-static void _format_bytes(uint32_t bytes, char *buf, size_t len) {
-  if (bytes >= 1048576)
-    snprintf(buf, len, "%.1fM", bytes / 1048576.0f);
-  else if (bytes >= 1024)
-    snprintf(buf, len, "%.1fK", bytes / 1024.0f);
+// Format bits per second with appropriate unit suffix
+static void _format_bps(uint32_t bits, char *buf, size_t len) {
+  if (bits >= 1000000)
+    snprintf(buf, len, "%.1fM", bits / 1000000.0f);
+  else if (bits >= 1000)
+    snprintf(buf, len, "%.0fK", bits / 1000.0f);
   else
-    snprintf(buf, len, "%luB", (unsigned long)bytes);
+    snprintf(buf, len, "%lu", (unsigned long)bits);
 }
 
 static void _draw_graph() {
@@ -255,27 +256,39 @@ static void _draw_graph() {
 
   // --- Title / rate text (opaque text overwrites old, no fillRect needed) ---
   int last_idx = (_tp_head - 1 + GRAPH_SAMPLES) % GRAPH_SAMPLES;
-  char tot_in[12], tot_out[12];
-  _format_bytes(_tp_in[last_idx] * 2, tot_in, sizeof(tot_in));   // *2 for per-second (500ms sample)
-  _format_bytes(_tp_out[last_idx] * 2, tot_out, sizeof(tot_out));
+  char tot_rx[10], tot_tx[10];
+  // *2 for per-second (500ms sample), *8 for bits
+  _format_bps(_tp_in[last_idx] * 2 * 8, tot_rx, sizeof(tot_rx));
+  _format_bps(_tp_out[last_idx] * 2 * 8, tot_tx, sizeof(tot_tx));
 
-  // Fixed-width rate string so opaque bg covers old chars
-  char rate_str[32];
-  snprintf(rate_str, sizeof(rate_str), "in:%-6s out:%-6s", tot_in, tot_out);
-  tft.setTextColor(COLOR_TEXT_WHITE, COLOR_BG_CARD);
-  tft.setTextDatum(TR_DATUM);
+  // Draw rx/tx labels in matching bar colors
+  // Title (top-left)
   tft.setTextSize(1);
-  tft.drawString(rate_str, x0 + w - 6, y0 + 2, 1);
-
-  // Title (top-left, static — opaque bg keeps it clean)
-  tft.setTextColor(COLOR_TEXT_GREY, COLOR_BG_CARD);
   tft.setTextDatum(TL_DATUM);
-  tft.drawString("Throughput", x0 + 6, y0 + 2, 1);
+  tft.setTextColor(COLOR_TEXT_GREY, COLOR_BG_CARD);
+  tft.drawString("bps", x0 + 6, y0 + 2, 1);
+
+  // Rate values (right-aligned) — color-coded to match graph bars
+  tft.setTextDatum(TR_DATUM);
+  // Build string piece by piece to color each part
+  int rx = x0 + w - 4;
+  char tx_str[14], rx_str[14];
+  snprintf(tx_str, sizeof(tx_str), "tx:%-5s", tot_tx);
+  snprintf(rx_str, sizeof(rx_str), "rx:%-5s ", tot_rx);
+
+  // Draw tx (orange = COLOR_PRIMARY) right-aligned
+  tft.setTextColor(COLOR_PRIMARY, COLOR_BG_CARD);
+  tft.drawString(tx_str, rx, y0 + 2, 1);
+  int tx_w = tft.textWidth(tx_str, 1);
+
+  // Draw rx (teal = COLOR_ACCENT) to the left of tx
+  tft.setTextColor(COLOR_ACCENT, COLOR_BG_CARD);
+  tft.drawString(rx_str, rx - tx_w, y0 + 2, 1);
 
   // --- Y-axis labels (clear only label column) ---
   tft.fillRect(x0 + 1, gy, GRAPH_PAD_L - 1, gh, COLOR_BG_CARD);
   char label[12];
-  _format_bytes(max_val, label, sizeof(label));
+  _format_bps(max_val * 8, label, sizeof(label));  // Y-axis in bits
   tft.setTextColor(COLOR_TEXT_GREY, COLOR_BG_CARD);
   tft.setTextDatum(MR_DATUM);
   tft.drawString(label, gx - 3, gy + 4, 1);
@@ -463,7 +476,7 @@ void ui_dashboard_update(int active_relays, const char *daemon_state,
     if (delta_in + delta_out > 0) {
       ui_set_led(false, true, false);   // green — data flowing
     } else if (active_relays > 0) {
-      ui_set_led(false, false, true);   // blue — relay connected, idle
+      ui_set_led(true, true, false);    // amber — relay connected, idle
     } else {
       // Daemon running but no relays — blink cyan slowly (on for even seconds)
       bool blink = ((millis() / 1000) % 2) == 0;

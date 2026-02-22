@@ -23,7 +23,7 @@
 // Buffer size for relay forwarding
 // 4 KB lets us read multiple full TCP segments per iteration (MSS ~1436).
 // Both buf and crypt_buf are heap-allocated so this doesn't affect stack.
-#define RELAY_BUF_SIZE 4096
+#define RELAY_BUF_SIZE 8192
 
 // Buffer size for early data captured during Phase 2 polling
 #define EARLY_BUF_SIZE 256
@@ -31,7 +31,7 @@
 // Stack size for relay FreeRTOS task
 // With all large buffers (earlyA/B, cmsgA/B, buf, crypt_buf) on the heap,
 // actual stack usage is ~1200 bytes. 6KB provides comfortable headroom.
-#define RELAY_TASK_STACK_SIZE 6144
+#define RELAY_TASK_STACK_SIZE 8192
 
 // AES-CTR encryption state
 struct aes_ctr_state {
@@ -765,7 +765,7 @@ int noports_relay_start(NoPortsRelay *relay, const NoPortsRelayConfig *config) {
     "np_relay",
     RELAY_TASK_STACK_SIZE,
     relay,
-    1,                    // priority
+    5,                    // priority (higher = less starvation from other tasks)
     &relay->task_handle,
     1                     // core 1 (keep core 0 for WiFi)
   );
