@@ -102,6 +102,26 @@ static void on_ping(const char *from_atsign) {
 static void _do_reset();
 static void _show_settings();
 static void _show_wifi();
+static void _on_settings_saved();
+
+// Check if managers and permitopen rules are configured
+static bool _rules_valid() {
+  String managers = ui_load_string(NVS_KEY_MANAGERS);
+  if (managers.length() == 0) {
+    managers = ui_load_string(NVS_KEY_MANAGER);
+  }
+  String permitopen = ui_load_string(NVS_KEY_PERMITOPEN);
+
+  if (managers.length() == 0) {
+    Serial.println("[main] Rules invalid: no managers configured");
+    return false;
+  }
+  if (permitopen.length() == 0) {
+    Serial.println("[main] Rules invalid: no permitopen rules configured");
+    return false;
+  }
+  return true;
+}
 
 // Parse a comma-separated string into an array of static String objects.
 // Returns count of items parsed (up to max_items).
@@ -323,6 +343,19 @@ static void on_wifi_connected() {
   sync_ntp_time();
   
   if (ui_is_configured()) {
+    // Check rules are valid before trying to start daemon
+    if (!_rules_valid()) {
+      Serial.println("[main] Rules missing — opening Rules screen");
+      tft.fillRect(0, TFT_HEIGHT / 2 + 15, TFT_WIDTH, 20, COLOR_BG_DARK);
+      tft.setTextColor(COLOR_ERROR);
+      tft.setTextDatum(MC_DATUM);
+      tft.drawString("Rules not configured!", TFT_WIDTH / 2, TFT_HEIGHT / 2 + 20, 2);
+      delay(1500);
+      current_screen = SCREEN_SETTINGS;
+      ui_settings_create(_on_settings_saved);
+      return;
+    }
+
     // Show PKAM auth status
     tft.fillRect(0, TFT_HEIGHT / 2 + 15, TFT_WIDTH, 20, COLOR_BG_DARK);
     tft.setTextColor(COLOR_ACCENT);
