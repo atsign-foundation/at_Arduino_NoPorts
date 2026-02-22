@@ -45,7 +45,8 @@ enum AppScreen {
   SCREEN_WIFI,
   SCREEN_ENROLL,
   SCREEN_DASHBOARD,
-  SCREEN_SETTINGS
+  SCREEN_SETTINGS,
+  SCREEN_AUTH
 };
 
 static AppScreen current_screen = SCREEN_NONE;
@@ -54,6 +55,28 @@ static AppScreen current_screen = SCREEN_NONE;
 static uint32_t _last_wifi_check_ms = 0;
 #define WIFI_CHECK_INTERVAL_MS 5000
 #define WIFI_RECONNECT_TIMEOUT_MS 15000
+
+// CPU usage tracking
+static uint32_t _cpu_loop_start_us = 0;
+static uint32_t _cpu_work_us = 0;       // accumulated work time in current window
+static uint32_t _cpu_window_start = 0;  // millis() when current 1s window began
+static uint8_t  _cpu_pct = 0;           // computed CPU %
+
+// Auth retry screen state
+static int _auth_attempt = 0;
+static uint32_t _auth_countdown_start = 0;  // millis() when countdown began
+static bool _auth_attempting = false;
+static char _auth_error[80] = "";
+static int _auth_prev_fill_w = 0;
+#define AUTH_COUNTDOWN_MS 5000
+#define AUTH_BAR_X  30
+#define AUTH_BAR_Y  100
+#define AUTH_BAR_W  (TFT_WIDTH - 60)
+#define AUTH_BAR_H  14
+#define AUTH_BTN_X  (TFT_WIDTH / 2 - 60)
+#define AUTH_BTN_Y  (TFT_HEIGHT - 45)
+#define AUTH_BTN_W  120
+#define AUTH_BTN_H  30
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -305,21 +328,224 @@ static void sync_ntp_time() {
   }
 }
 
-static void _show_daemon_error() {
-  // Show error screen with retry/reset options
+// ---------------------------------------------------------------------------
+// Auth retry screen — keeps trying PKAM with progress bar and Reset button
+// ---------------------------------------------------------------------------
+
+static void _auth_update_status(const char *msg, uint16_t color) {
+  TFT_eSPI &tft = ui_get_tft();
+  tft.fillRect(0, 73, TFT_WIDTH, 18, COLOR_BG_DARK);
+  tft.setTextColor(color);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(msg, TFT_WIDTH / 2, 82, 2);
+}
+
+static void _auth_update_error() {
+  TFT_eSPI &tft = ui_get_tft();
+  // Error text area (two lines)
+  tft.fillRect(0, 120, TFT_WIDTH, 50, COLOR_BG_DARK);
+  if (_auth_error[0] != '\0') {
+    // Error in RED
+    tft.setTextColor(COLOR_ERROR);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString(_auth_error, TFT_WIDTH / 2, 130, 2);
+
+    char count_buf[32];
+    snprintf(count_buf, sizeof(count_buf), "Attempt %d failed", _auth_attempt);
+    tft.setTextColor(COLOR_TEXT_GREY);
+    tft.drawString(count_buf, TFT_WIDTH / 2, 150, 2);
+  }
+}
+
+// Clean first-attempt screen: title + atSign + "Authenticating..."
+static void _show_auth_screen() {
   TFT_eSPI &tft = ui_get_tft();
   tft.fillScreen(COLOR_BG_DARK);
-  tft.setTextColor(COLOR_ERROR);
-  tft.setTextDatum(MC_DATUM);
+
+  // Title
+  tft.setTextColor(COLOR_PRIMARY);
+  tft.setTextDatum(TC_DATUM);
   tft.setTextSize(1);
-  tft.drawString("Daemon Start Failed", TFT_WIDTH / 2, TFT_HEIGHT / 2 - 40, 4);
-  
+  tft.drawString("NoPorts CYD", TFT_WIDTH / 2, 15, 4);
+
+  // atSign
+  String atsign = ui_load_string(NVS_KEY_ATSIGN);
+  tft.setTextColor(COLOR_TEXT_WHITE);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(atsign.c_str(), TFT_WIDTH / 2, 60, 2);
+
+  // Status — friendly message for first attempt
+  tft.setTextColor(COLOR_ACCENT);
+  tft.drawString("Authenticating...", TFT_WIDTH / 2, 90, 2);
   tft.setTextColor(COLOR_TEXT_GREY);
-  tft.drawString("PKAM auth failed - keys may be invalid", TFT_WIDTH / 2, TFT_HEIGHT / 2, 2);
-  tft.drawString("Tap screen to reset and re-enroll", TFT_WIDTH / 2, TFT_HEIGHT / 2 + 25, 2);
-  
-  current_screen = SCREEN_NONE;  // Special state: any touch triggers reset
-  Serial.println("[main] Daemon failed - waiting for touch to reset");
+  tft.drawString("This takes 5-10 seconds", TFT_WIDTH / 2, 115, 2);
+
+  _auth_prev_fill_w = 0;
+}
+
+// Retry screen: adds progress bar + Reset button (shown after first failure)
+static void _show_auth_retry_screen() {
+  TFT_eSPI &tft = ui_get_tft();
+  tft.fillScreen(COLOR_BG_DARK);
+
+  // Title
+  tft.setTextColor(COLOR_PRIMARY);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextSize(1);
+  tft.drawString("NoPorts CYD", TFT_WIDTH / 2, 15, 4);
+
+  // atSign
+  String atsign = ui_load_string(NVS_KEY_ATSIGN);
+  tft.setTextColor(COLOR_TEXT_WHITE);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(atsign.c_str(), TFT_WIDTH / 2, 60, 2);
+
+  // Status placeholder
+  tft.setTextColor(COLOR_ERROR);
+  tft.drawString("PKAM Failed!", TFT_WIDTH / 2, 82, 2);
+
+  // Progress bar outline
+  tft.drawRect(AUTH_BAR_X, AUTH_BAR_Y, AUTH_BAR_W, AUTH_BAR_H, COLOR_TEXT_GREY);
+
+  // Error info
+  _auth_update_error();
+
+  // Reset atSign button
+  ui_draw_rounded_rect(AUTH_BTN_X, AUTH_BTN_Y, AUTH_BTN_W, AUTH_BTN_H, 6, COLOR_ERROR);
+  tft.setTextColor(COLOR_TEXT_WHITE);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("Reset atSign", AUTH_BTN_X + AUTH_BTN_W / 2, AUTH_BTN_Y + AUTH_BTN_H / 2, 2);
+
+  _auth_prev_fill_w = 0;
+}
+
+static void _enter_auth_screen() {
+  _auth_attempt = 0;
+  _auth_countdown_start = millis() - AUTH_COUNTDOWN_MS;  // attempt immediately
+  _auth_attempting = false;
+  _auth_error[0] = '\0';
+  _auth_prev_fill_w = 0;
+  current_screen = SCREEN_AUTH;
+  _show_auth_screen();
+  Serial.println("[main] Entering auth retry screen");
+}
+
+static void _auth_update_progress_bar() {
+  if (_auth_attempt < 1) return;  // No bar on first-attempt screen
+
+  TFT_eSPI &tft = ui_get_tft();
+  int inner_w = AUTH_BAR_W - 2;
+
+  if (_auth_attempting) return;  // Bar stays fully orange during attempt
+
+  // Countdown phase: fill bar incrementally over 5 seconds
+  unsigned long elapsed = millis() - _auth_countdown_start;
+  int fill = (int)((unsigned long)inner_w * elapsed / AUTH_COUNTDOWN_MS);
+  if (fill < 0) fill = 0;
+  if (fill > inner_w) fill = inner_w;
+
+  if (fill > 0 && fill > _auth_prev_fill_w) {
+    tft.fillRect(AUTH_BAR_X + 1 + _auth_prev_fill_w, AUTH_BAR_Y + 1,
+                 fill - _auth_prev_fill_w, AUTH_BAR_H - 2, COLOR_ACCENT);
+    _auth_prev_fill_w = fill;
+  }
+}
+
+// Called from loop() when current_screen == SCREEN_AUTH
+static void _auth_loop() {
+  _auth_update_progress_bar();
+
+  unsigned long elapsed = millis() - _auth_countdown_start;
+
+  // Update countdown text (only during retries, not first attempt)
+  if (!_auth_attempting && _auth_attempt >= 1 && elapsed < AUTH_COUNTDOWN_MS) {
+    int secs_left = (int)((AUTH_COUNTDOWN_MS - elapsed + 999) / 1000);
+    if (secs_left < 0) secs_left = 0;
+    char msg[48];
+    snprintf(msg, sizeof(msg), "Retrying in %ds...", secs_left);
+    _auth_update_status(msg, COLOR_ACCENT);
+  }
+
+  // Countdown complete (or immediate on first attempt)? Start attempt
+  if (!_auth_attempting && elapsed >= AUTH_COUNTDOWN_MS) {
+    _auth_attempting = true;
+    _auth_attempt++;
+
+    // Check WiFi first
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[auth] WiFi not connected - skipping attempt");
+      strncpy(_auth_error, "WiFi not connected", sizeof(_auth_error));
+      _auth_attempting = false;
+      if (_auth_attempt == 1) {
+        // Switch to retry screen
+        _show_auth_retry_screen();
+      } else {
+        _auth_update_status("WiFi disconnected!", COLOR_ERROR);
+        _auth_update_error();
+        TFT_eSPI &tft = ui_get_tft();
+        tft.fillRect(AUTH_BAR_X + 1, AUTH_BAR_Y + 1, AUTH_BAR_W - 2, AUTH_BAR_H - 2, COLOR_BG_DARK);
+      }
+      _auth_countdown_start = millis();
+      _auth_prev_fill_w = 0;
+      return;
+    }
+
+    Serial.printf("[auth] Daemon start attempt %d (heap: %u)\n", _auth_attempt, ESP.getFreeHeap());
+
+    // Fill bar orange during attempt (only if retry screen is showing)
+    if (_auth_attempt > 1) {
+      char msg[40];
+      snprintf(msg, sizeof(msg), "Attempt %d...", _auth_attempt);
+      _auth_update_status(msg, COLOR_PRIMARY);
+      TFT_eSPI &tft = ui_get_tft();
+      tft.fillRect(AUTH_BAR_X + 1, AUTH_BAR_Y + 1, AUTH_BAR_W - 2, AUTH_BAR_H - 2, COLOR_PRIMARY);
+    }
+
+    if (start_daemon()) {
+      Serial.printf("[auth] PKAM succeeded on attempt %d\n", _auth_attempt);
+      current_screen = SCREEN_DASHBOARD;
+      ui_dashboard_create(_do_reset, _show_settings, _show_wifi);
+
+      if (_auth_attempt > 1) {
+        char evt_buf[EVENT_TEXT_LEN];
+        snprintf(evt_buf, sizeof(evt_buf), "PKAM OK after %d attempts", _auth_attempt);
+        ui_event_push(UI_EVT_ERROR, evt_buf);
+      }
+      return;
+    }
+
+    // Failed
+    const char *err = npDaemon.getLastError();
+    snprintf(_auth_error, sizeof(_auth_error), "%s", err ? err : "Unknown error");
+    Serial.printf("[auth] Attempt %d failed: %s\n", _auth_attempt, _auth_error);
+
+    _auth_attempting = false;
+
+    if (_auth_attempt == 1) {
+      // First failure — switch to retry screen with bar + Reset button
+      _show_auth_retry_screen();
+    } else {
+      _auth_update_status("PKAM Failed!", COLOR_ERROR);
+      _auth_update_error();
+      TFT_eSPI &tft = ui_get_tft();
+      tft.fillRect(AUTH_BAR_X + 1, AUTH_BAR_Y + 1, AUTH_BAR_W - 2, AUTH_BAR_H - 2, COLOR_BG_DARK);
+    }
+
+    // Start countdown for next attempt
+    _auth_countdown_start = millis();
+    _auth_prev_fill_w = 0;
+  }
+}
+
+static bool _auth_handle_touch(int16_t tx, int16_t ty) {
+  // Reset button only exists on retry screen (after first failure)
+  if (_auth_attempt < 1) return false;
+  if (ui_touch_in_rect(tx, ty, AUTH_BTN_X, AUTH_BTN_Y, AUTH_BTN_W, AUTH_BTN_H)) {
+    Serial.println("[auth] Reset atSign pressed");
+    _do_reset();
+    return true;
+  }
+  return false;
 }
 
 static void _on_enrolled() {
@@ -327,7 +553,7 @@ static void _on_enrolled() {
     current_screen = SCREEN_DASHBOARD;
     ui_dashboard_create(_do_reset, _show_settings, _show_wifi);
   } else {
-    _show_daemon_error();
+    _enter_auth_screen();
   }
 }
 
@@ -356,20 +582,9 @@ static void on_wifi_connected() {
       return;
     }
 
-    // Show PKAM auth status
-    tft.fillRect(0, TFT_HEIGHT / 2 + 15, TFT_WIDTH, 20, COLOR_BG_DARK);
-    tft.setTextColor(COLOR_ACCENT);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString("Authenticating atSign...", TFT_WIDTH / 2, TFT_HEIGHT / 2 + 20, 2);
-
-    // Already enrolled – start daemon and go to dashboard
-    if (start_daemon()) {
-      current_screen = SCREEN_DASHBOARD;
-      ui_dashboard_create(_do_reset, _show_settings, _show_wifi);
-    } else {
-      // Keys exist but auth failed – show error with reset option
-      _show_daemon_error();
-    }
+    // Show auth retry screen — handles all PKAM attempts with
+    // progress bar, status, and "Reset atSign" button
+    _enter_auth_screen();
   } else {
     // First run – show enrollment
     tft.fillRect(0, TFT_HEIGHT / 2 + 15, TFT_WIDTH, 20, COLOR_BG_DARK);
@@ -422,6 +637,8 @@ static void _on_wifi_reconnected() {
     current_screen = SCREEN_DASHBOARD;
     ui_dashboard_create(_do_reset, _show_settings, _show_wifi);
     if (!started) {
+      // Log the failure on the dashboard in RED
+      ui_event_push(UI_EVT_ERROR, "PKAM auth failed after reconnect");
       Serial.println("[main] WARNING: Daemon failed after WiFi reconnect");
     }
   } else {
@@ -466,6 +683,8 @@ static void _on_settings_saved() {
   current_screen = SCREEN_DASHBOARD;
   ui_dashboard_create(_do_reset, _show_settings, _show_wifi);
   if (!started) {
+    // Log the failure on the dashboard in RED
+    ui_event_push(UI_EVT_ERROR, "PKAM auth failed after settings save");
     Serial.println("[main] WARNING: Daemon failed to restart after settings save");
   }
 }
@@ -614,7 +833,7 @@ void setup() {
       // Update countdown bar (incremental fill only — no flicker)
       unsigned long elapsed = millis() - boot_wifi_start;
       int fill_w = (int)((unsigned long)(bar_w - 2) * elapsed / COUNTDOWN_MS);
-      if (fill_w > prev_fill_w && fill_w <= bar_w - 2) {
+      if (fill_w > 0 && fill_w > prev_fill_w && fill_w <= bar_w - 2) {
         uint16_t bar_color = wifi_connected ? COLOR_SUCCESS : COLOR_ACCENT;
         tft.fillRect(bar_x + 1 + prev_fill_w, bar_y + 1,
                      fill_w - prev_fill_w, bar_h - 2, bar_color);
@@ -711,6 +930,18 @@ void setup() {
 // ---------------------------------------------------------------------------
 
 void loop() {
+  _cpu_loop_start_us = micros();
+
+  // -----------------------------------------------------------------------
+  // CPU usage: compute rolling 1-second average
+  // -----------------------------------------------------------------------
+  if (millis() - _cpu_window_start >= 1000) {
+    _cpu_pct = (uint8_t)(_cpu_work_us / 10000);  // us -> % of 1s
+    if (_cpu_pct > 100) _cpu_pct = 100;
+    _cpu_work_us = 0;
+    _cpu_window_start = millis();
+  }
+
   // -----------------------------------------------------------------------
   // WiFi disconnect watchdog (only when we expect WiFi to be up)
   // -----------------------------------------------------------------------
@@ -756,6 +987,10 @@ void loop() {
         ui_settings_handle_touch(tx, ty);
         break;
         
+      case SCREEN_AUTH:
+        _auth_handle_touch(tx, ty);
+        break;
+
       case SCREEN_NONE:
         // Error screen – any touch triggers reset
         _do_reset();
@@ -781,6 +1016,10 @@ void loop() {
       ui_settings_update();
       break;
       
+    case SCREEN_AUTH:
+      _auth_loop();
+      break;
+
     case SCREEN_DASHBOARD:
       // Drive NoPorts daemon
       if (daemon_running && npDaemon.isRunning()) {
@@ -795,7 +1034,7 @@ void loop() {
           ui_dashboard_update(npDaemon.getActiveRelayCount(),
                             daemon_state_str(npDaemon.getState()),
                             _total_tunnels, _total_pings,
-                            tp_in, tp_out);
+                            tp_in, tp_out, _cpu_pct);
         }
       }
       break;
@@ -804,5 +1043,8 @@ void loop() {
       break;
   }
   
-  delay(10);  // Reduced from 5ms to save CPU
+  // Record work time before yielding
+  _cpu_work_us += (micros() - _cpu_loop_start_us);
+
+  delay(10);  // yield to FreeRTOS
 }

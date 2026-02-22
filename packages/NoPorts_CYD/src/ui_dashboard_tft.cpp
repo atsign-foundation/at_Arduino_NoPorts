@@ -40,6 +40,7 @@ static int _active_relays = 0;
 static uint32_t _total_tunnels = 0;
 static uint32_t _total_pings = 0;
 static char _daemon_state[32] = "init";
+static uint8_t _cpu_pct = 0;
 static void (*_on_reset_cb)() = nullptr;
 static void (*_on_settings_cb)() = nullptr;
 static void (*_on_wifi_cb)() = nullptr;
@@ -128,35 +129,34 @@ static void _draw_stats_row1() {
   TFT_eSPI &tft = ui_get_tft();
   int y = STATS_ROW1_Y;
   
-  // Background card
-  ui_draw_rounded_rect(HEADER_PADDING, y, TFT_WIDTH - 6, 22, 4, COLOR_BG_CARD);
-  
+  // Card background drawn once in ui_dashboard_create() — clear only text zones
   char buf[40];
   
-  // State indicator (colored dot + text)
+  // --- State indicator (left zone) ---
+  tft.fillRect(HEADER_PADDING + 4, y + 2, 110, 18, COLOR_BG_CARD);
   uint16_t state_color = COLOR_TEXT_GREY;
   if (strcmp(_daemon_state, "running") == 0) state_color = COLOR_SUCCESS;
   else if (strcmp(_daemon_state, "auth") == 0) state_color = COLOR_ACCENT;
   else if (strcmp(_daemon_state, "error") == 0) state_color = COLOR_ERROR;
-  
   tft.fillCircle(HEADER_PADDING + 12, y + 11, 4, state_color);
-  
   snprintf(buf, sizeof(buf), "%s", _daemon_state);
-  tft.setTextColor(COLOR_TEXT_WHITE);
+  tft.setTextColor(COLOR_TEXT_WHITE, COLOR_BG_CARD);
   tft.setTextDatum(ML_DATUM);
   tft.setTextSize(1);
   tft.drawString(buf, HEADER_PADDING + 22, y + 11, 2);
   
-  // Active relays (center)
+  // --- Active relays (center zone) ---
+  tft.fillRect(TFT_WIDTH / 2 - 45, y + 2, 90, 18, COLOR_BG_CARD);
   snprintf(buf, sizeof(buf), "Active: %d", _active_relays);
-  tft.setTextColor(_active_relays > 0 ? COLOR_SUCCESS : COLOR_TEXT_GREY);
+  tft.setTextColor(_active_relays > 0 ? COLOR_SUCCESS : COLOR_TEXT_GREY, COLOR_BG_CARD);
   tft.setTextDatum(MC_DATUM);
   tft.drawString(buf, TFT_WIDTH / 2, y + 11, 2);
   
-  // Uptime (right)
+  // --- Uptime (right zone) ---
+  tft.fillRect(TFT_WIDTH - HEADER_PADDING - 80, y + 2, 76, 18, COLOR_BG_CARD);
   char uptime_str[20];
   ui_format_uptime(millis() - _boot_ms, uptime_str, sizeof(uptime_str));
-  tft.setTextColor(COLOR_TEXT_GREY);
+  tft.setTextColor(COLOR_TEXT_GREY, COLOR_BG_CARD);
   tft.setTextDatum(MR_DATUM);
   tft.drawString(uptime_str, TFT_WIDTH - HEADER_PADDING - 6, y + 11, 2);
 }
@@ -165,27 +165,31 @@ static void _draw_stats_row2() {
   TFT_eSPI &tft = ui_get_tft();
   int y = STATS_ROW2_Y;
   
-  // Background card
-  ui_draw_rounded_rect(HEADER_PADDING, y, TFT_WIDTH - 6, 22, 4, COLOR_BG_CARD);
-  
+  // Card background drawn once in ui_dashboard_create() — clear only text zones
   char buf[40];
   
-  // Total tunnels (left)
+  // --- Tunnels (left zone) ---
+  tft.fillRect(HEADER_PADDING + 4, y + 2, 105, 18, COLOR_BG_CARD);
   snprintf(buf, sizeof(buf), "Tunnels: %lu", (unsigned long)_total_tunnels);
-  tft.setTextColor(COLOR_ACCENT);
+  tft.setTextColor(COLOR_ACCENT, COLOR_BG_CARD);
   tft.setTextDatum(ML_DATUM);
   tft.setTextSize(1);
   tft.drawString(buf, HEADER_PADDING + 8, y + 11, 2);
   
-  // Total pings (center)
-  snprintf(buf, sizeof(buf), "Pings: %lu", (unsigned long)_total_pings);
-  tft.setTextColor(COLOR_TEXT_GREY);
+  // --- CPU % (center zone) ---
+  tft.fillRect(TFT_WIDTH / 2 - 45, y + 2, 90, 18, COLOR_BG_CARD);
+  uint16_t cpu_color = COLOR_SUCCESS;  // green < 50%
+  if (_cpu_pct >= 80) cpu_color = COLOR_ERROR;       // red >= 80%
+  else if (_cpu_pct >= 50) cpu_color = COLOR_ACCENT;  // orange >= 50%
+  snprintf(buf, sizeof(buf), "CPU: %d%%", _cpu_pct);
+  tft.setTextColor(cpu_color, COLOR_BG_CARD);
   tft.setTextDatum(MC_DATUM);
   tft.drawString(buf, TFT_WIDTH / 2, y + 11, 2);
   
-  // Free heap (right)
+  // --- Heap (right zone) ---
+  tft.fillRect(TFT_WIDTH - HEADER_PADDING - 80, y + 2, 76, 18, COLOR_BG_CARD);
   snprintf(buf, sizeof(buf), "Heap: %uK", ESP.getFreeHeap() / 1024);
-  tft.setTextColor(COLOR_TEXT_GREY);
+  tft.setTextColor(COLOR_TEXT_GREY, COLOR_BG_CARD);
   tft.setTextDatum(MR_DATUM);
   tft.drawString(buf, TFT_WIDTH - HEADER_PADDING - 6, y + 11, 2);
 }
@@ -194,8 +198,8 @@ static void _draw_log() {
   TFT_eSPI &tft = ui_get_tft();
   int y = LOG_TOP_Y;
   
-  // Background card
-  ui_draw_rounded_rect(HEADER_PADDING, y, TFT_WIDTH - 6, LOG_HEIGHT, 5, COLOR_BG_CARD);
+  // Card background drawn once in create() — clear only the text content area
+  tft.fillRect(HEADER_PADDING + 4, y + 3, TFT_WIDTH - 14, LOG_HEIGHT - 6, COLOR_BG_CARD);
   
   // Draw log entries (most recent first)
   tft.setTextDatum(TL_DATUM);
@@ -208,7 +212,7 @@ static void _draw_log() {
     int idx = (_log_head - 1 - i + LOG_MAX_ENTRIES) % LOG_MAX_ENTRIES;
     
     if (_log_entries[idx].used) {
-      tft.setTextColor(_log_entries[idx].color);
+      tft.setTextColor(_log_entries[idx].color, COLOR_BG_CARD);
       tft.drawString(_log_entries[idx].text, HEADER_PADDING + 8, entry_y, 2);
       entry_y += LOG_ENTRY_HEIGHT;
       displayed++;
@@ -234,9 +238,6 @@ static void _draw_graph() {
   int w  = TFT_WIDTH - 6;
   int h  = GRAPH_HEIGHT;
 
-  // Background card
-  ui_draw_rounded_rect(x0, y0, w, h, 5, COLOR_BG_CARD);
-
   // Graph plotting area (inside card, below title)
   int gx = x0 + GRAPH_PAD_L;
   int gy = y0 + GRAPH_PAD_T;
@@ -245,12 +246,6 @@ static void _draw_graph() {
 
   if (gw <= 0 || gh <= 0) return;
 
-  // Explicitly clear the plotting area so stale bars are wiped
-  tft.fillRect(gx, gy, gw, gh, COLOR_BG_CARD);
-
-  // Also clear the label column so old axis text is wiped
-  tft.fillRect(x0 + 1, gy, GRAPH_PAD_L - 1, gh, COLOR_BG_CARD);
-
   // Find max value for scaling
   uint32_t max_val = 1;  // avoid /0
   for (int i = 0; i < GRAPH_SAMPLES; i++) {
@@ -258,45 +253,54 @@ static void _draw_graph() {
     if (combined > max_val) max_val = combined;
   }
 
-  // Current rate text (top-right, drawn first so bars don't obscure)
+  // --- Title / rate text (opaque text overwrites old, no fillRect needed) ---
   int last_idx = (_tp_head - 1 + GRAPH_SAMPLES) % GRAPH_SAMPLES;
   char tot_in[12], tot_out[12];
   _format_bytes(_tp_in[last_idx] * 2, tot_in, sizeof(tot_in));   // *2 for per-second (500ms sample)
   _format_bytes(_tp_out[last_idx] * 2, tot_out, sizeof(tot_out));
 
+  // Fixed-width rate string so opaque bg covers old chars
   char rate_str[32];
-  snprintf(rate_str, sizeof(rate_str), "in:%s/s out:%s/s", tot_in, tot_out);
-  tft.setTextColor(COLOR_TEXT_WHITE);
+  snprintf(rate_str, sizeof(rate_str), "in:%-6s out:%-6s", tot_in, tot_out);
+  tft.setTextColor(COLOR_TEXT_WHITE, COLOR_BG_CARD);
   tft.setTextDatum(TR_DATUM);
   tft.setTextSize(1);
   tft.drawString(rate_str, x0 + w - 6, y0 + 2, 1);
 
-  // Title (top-left)
-  tft.setTextColor(COLOR_TEXT_GREY);
+  // Title (top-left, static — opaque bg keeps it clean)
+  tft.setTextColor(COLOR_TEXT_GREY, COLOR_BG_CARD);
   tft.setTextDatum(TL_DATUM);
   tft.drawString("Throughput", x0 + 6, y0 + 2, 1);
 
-  // Y-axis labels (top = max, bottom = 0)
+  // --- Y-axis labels (clear only label column) ---
+  tft.fillRect(x0 + 1, gy, GRAPH_PAD_L - 1, gh, COLOR_BG_CARD);
   char label[12];
   _format_bytes(max_val, label, sizeof(label));
-  tft.setTextColor(COLOR_TEXT_GREY);
+  tft.setTextColor(COLOR_TEXT_GREY, COLOR_BG_CARD);
   tft.setTextDatum(MR_DATUM);
   tft.drawString(label, gx - 3, gy + 4, 1);
   tft.drawString("0", gx - 3, gy + gh - 2, 1);
 
-  // Draw stacked bars (in = teal, out = orange)
+  // --- Draw bars column-by-column (no bulk clear — each column is
+  //     drawn atomically: background first, then bar, so no blank flash) ---
   int bar_w = gw / GRAPH_SAMPLES;
   if (bar_w < 1) bar_w = 1;
   int bar_gap = (bar_w > 2) ? 1 : 0;
+  int draw_w = bar_w - bar_gap;  // pixel width of each drawn bar
 
   for (int i = 0; i < GRAPH_SAMPLES; i++) {
     int idx = (_tp_head + i) % GRAPH_SAMPLES;
     uint32_t val_in  = _tp_in[idx];
     uint32_t val_out = _tp_out[idx];
-    if (val_in == 0 && val_out == 0) continue;  // skip empty bars
 
     int bx = gx + i * bar_w;
     if (bx + bar_w > gx + gw) break;  // don't draw past right edge
+
+    if (val_in == 0 && val_out == 0) {
+      // Empty column — paint background
+      tft.fillRect(bx, gy, draw_w, gh, COLOR_BG_CARD);
+      continue;
+    }
 
     // Use uint64_t to prevent overflow on large throughput values
     int h_in  = (int)((uint64_t)val_in  * gh / max_val);
@@ -309,14 +313,27 @@ static void _draw_graph() {
     if (h_in  < 0) h_in  = 0;
     if (h_out < 0) h_out = 0;
 
-    // Draw "in" bar (teal) from bottom
-    if (h_in > 0) {
-      tft.fillRect(bx, gy + gh - h_in, bar_w - bar_gap, h_in, COLOR_ACCENT);
+    int bar_total = h_in + h_out;
+    int empty_h = gh - bar_total;
+
+    // 1) Background above bars (clears any stale pixels)
+    if (empty_h > 0) {
+      tft.fillRect(bx, gy, draw_w, empty_h, COLOR_BG_CARD);
     }
-    // Draw "out" bar (orange) stacked above
+    // 2) "out" bar (orange) stacked on top
     if (h_out > 0) {
-      tft.fillRect(bx, gy + gh - h_in - h_out, bar_w - bar_gap, h_out, COLOR_PRIMARY);
+      tft.fillRect(bx, gy + empty_h, draw_w, h_out, COLOR_PRIMARY);
     }
+    // 3) "in" bar (teal) at bottom
+    if (h_in > 0) {
+      tft.fillRect(bx, gy + empty_h + h_out, draw_w, h_in, COLOR_ACCENT);
+    }
+  }
+
+  // Fill any remaining pixels to the right of the last bar column
+  int used_w = GRAPH_SAMPLES * bar_w;
+  if (used_w < gw) {
+    tft.fillRect(gx + used_w, gy, gw - used_w, gh, COLOR_BG_CARD);
   }
 }
 
@@ -389,6 +406,14 @@ void ui_dashboard_create(void (*on_reset)(), void (*on_settings)(), void (*on_wi
   tft.fillScreen(COLOR_BG_DARK);
   
   _draw_header();
+  
+  // Pre-draw card backgrounds for dynamic sections (only done once;
+  // update functions clear only small text zones to avoid flicker)
+  ui_draw_rounded_rect(HEADER_PADDING, STATS_ROW1_Y, TFT_WIDTH - 6, 22, 4, COLOR_BG_CARD);
+  ui_draw_rounded_rect(HEADER_PADDING, STATS_ROW2_Y, TFT_WIDTH - 6, 22, 4, COLOR_BG_CARD);
+  ui_draw_rounded_rect(HEADER_PADDING, LOG_TOP_Y, TFT_WIDTH - 6, LOG_HEIGHT, 5, COLOR_BG_CARD);
+  ui_draw_rounded_rect(HEADER_PADDING, GRAPH_TOP_Y, TFT_WIDTH - 6, GRAPH_HEIGHT, 5, COLOR_BG_CARD);
+  
   _draw_stats_row1();
   _draw_stats_row2();
   _draw_log();
@@ -400,7 +425,9 @@ void ui_dashboard_create(void (*on_reset)(), void (*on_settings)(), void (*on_wi
 
 void ui_dashboard_update(int active_relays, const char *daemon_state,
                          uint32_t total_tunnels, uint32_t total_pings,
-                         uint32_t bytes_in, uint32_t bytes_out) {
+                         uint32_t bytes_in, uint32_t bytes_out,
+                         uint8_t cpu_pct) {
+  _cpu_pct = cpu_pct;
   // Update state (only redraw if changed)
   bool stats_changed = false;
   
