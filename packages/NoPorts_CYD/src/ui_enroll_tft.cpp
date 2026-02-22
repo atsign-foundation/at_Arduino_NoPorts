@@ -303,6 +303,7 @@ static void _start_enrollment() {
   ui_save_string(NVS_KEY_ATSIGN, _atsign);
   ui_save_string(NVS_KEY_DEVICE, _device_name);
   ui_save_string(NVS_KEY_MANAGER, _manager);
+  ui_save_string(NVS_KEY_MANAGERS, _manager);  // also save to new multi-manager key
   
   Serial.printf("[ui_enroll] Starting enrollment for %s\n", _atsign);
   Serial.printf("[ui_enroll] Free heap: %u bytes, largest block: %u bytes\n",

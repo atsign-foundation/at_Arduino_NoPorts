@@ -23,8 +23,9 @@
 #define NOPORTS_NS       "sshnp"   // atProtocol namespace (must match client)
 #define NOPORTS_NS_LEN   5
 
-// Monitor read timeout in milliseconds
-#define NOPORTS_MONITOR_READ_TIMEOUT_MS  5000
+// Monitor read timeout in milliseconds — keep short so the Arduino loop()
+// remains responsive to touch input (the UI runs on the same core).
+#define NOPORTS_MONITOR_READ_TIMEOUT_MS  100
 // Noop timeout – after this many ms without data we send a noop/reconnect
 #define NOPORTS_MONITOR_NOOP_TIMEOUT_MS  40000
 

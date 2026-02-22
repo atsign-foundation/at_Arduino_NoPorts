@@ -21,7 +21,9 @@
 #define TAG "noports_relay"
 
 // Buffer size for relay forwarding
-#define RELAY_BUF_SIZE 1024
+// 4 KB lets us read multiple full TCP segments per iteration (MSS ~1436).
+// Both buf and crypt_buf are heap-allocated so this doesn't affect stack.
+#define RELAY_BUF_SIZE 4096
 
 // Buffer size for early data captured during Phase 2 polling
 #define EARLY_BUF_SIZE 256
@@ -614,7 +616,9 @@ static void _relay_task_inner(NoPortsRelay *relay) {
     }
 
     if (!activity) {
-      vTaskDelay(pdMS_TO_TICKS(10));
+      vTaskDelay(pdMS_TO_TICKS(1));
+    } else {
+      taskYIELD();  // let WiFi/TCP stack process ACKs
     }
   }
 

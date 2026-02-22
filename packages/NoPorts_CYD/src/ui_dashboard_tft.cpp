@@ -41,6 +41,8 @@ static uint32_t _total_tunnels = 0;
 static uint32_t _total_pings = 0;
 static char _daemon_state[32] = "init";
 static void (*_on_reset_cb)() = nullptr;
+static void (*_on_settings_cb)() = nullptr;
+static void (*_on_wifi_cb)() = nullptr;
 
 // Log entries (ring buffer)
 struct LogEntry {
@@ -59,37 +61,30 @@ static int _tp_head = 0;
 static uint32_t _prev_bytes_in = 0;
 static uint32_t _prev_bytes_out = 0;
 
-// LED color presets
-struct LedPreset {
-  const char *label;
-  bool r, g, b;
-  uint16_t hex;
-  int16_t x, y;
-};
-
-static LedPreset _led_presets[] = {
-  {"Off",   false, false, false, 0x4208, 0, 0},
-  {"Grn",   false, true,  false, 0x07E0, 0, 0},
-  {"Blu",   false, false, true,  0x001F, 0, 0},
-  {"Cyan",  false, true,  true,  0x07FF, 0, 0},
-  {"Wht",   true,  true,  true,  0xFFFF, 0, 0},
-};
-static const int _led_preset_count = sizeof(_led_presets) / sizeof(_led_presets[0]);
-
 // WiFi / identity info
 static String _atsign;
 static String _device;
 
-// Reset button area
-static const int RESET_BTN_X = TFT_WIDTH - 55;
-static const int RESET_BTN_Y = BOTTOM_ROW_Y;
-static const int RESET_BTN_W = 50;
-static const int RESET_BTN_H = 24;
+// Bottom row button layout — explicit pixel positions
+// LED(36) gap(4) WiFi(50) gap(4) Rules(50) ---- big gap ---- Reset(50)
+#define BTN_H         26
+#define BTN_Y         (TFT_HEIGHT - BTN_H - 2)
+#define LED_BTN_X2     3
+#define LED_BTN_W2     36
+#define WIFI_BTN_X    (LED_BTN_X2 + LED_BTN_W2 + 4)
+#define WIFI_BTN_W    50
+#define RULES_BTN_X   (WIFI_BTN_X + WIFI_BTN_W + 4)
+#define RULES_BTN_W   50
+#define RESET_BTN_X2  (TFT_WIDTH - 53)
+#define RESET_BTN_W2  50
 
 // Confirm-reset state
 static bool _reset_confirming = false;
 static uint32_t _reset_confirm_ms = 0;
 #define RESET_CONFIRM_TIMEOUT 3000  // 3 seconds to confirm
+
+// LED toggle state
+static bool _led_enabled = true;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -327,44 +322,48 @@ static void _draw_graph() {
 
 static void _draw_bottom_row() {
   TFT_eSPI &tft = ui_get_tft();
-  int y = BOTTOM_ROW_Y;
-  
-  // LED color buttons (left side)
-  const int btn_width = 42;
-  const int btn_height = 24;
-  int x = HEADER_PADDING;
-  
-  for (int i = 0; i < _led_preset_count; i++) {
-    _led_presets[i].x = x;
-    _led_presets[i].y = y;
-    
-    ui_draw_rounded_rect(x, y, btn_width, btn_height, 4, _led_presets[i].hex);
-    
-    bool bright = _led_presets[i].hex > 0x7BEF;
-    tft.setTextColor(bright ? 0x0000 : COLOR_TEXT_WHITE);
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextSize(1);
-    tft.drawString(_led_presets[i].label, x + btn_width / 2, y + btn_height / 2, 2);
-    
-    x += btn_width + 2;
-  }
-  
-  // Reset button (right side, red)
-  uint16_t reset_color = _reset_confirming ? COLOR_ERROR : 0x8000;  // bright red if confirming
-  ui_draw_rounded_rect(RESET_BTN_X, RESET_BTN_Y, RESET_BTN_W, RESET_BTN_H, 4, reset_color);
+
+  // Clear bottom row area
+  tft.fillRect(0, BTN_Y - 1, TFT_WIDTH, BTN_H + 3, COLOR_BG_DARK);
+
+  // LED on/off toggle (left)
+  uint16_t led_bg = _led_enabled ? COLOR_SUCCESS : COLOR_BG_CARD;
+  ui_draw_rounded_rect(LED_BTN_X2, BTN_Y, LED_BTN_W2, BTN_H, 4, led_bg);
+  tft.setTextColor(_led_enabled ? 0x0000 : COLOR_TEXT_GREY);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(1);
+  tft.drawString("LED", LED_BTN_X2 + LED_BTN_W2 / 2, BTN_Y + BTN_H / 2, 2);
+
+  // WiFi button (blue)
+  ui_draw_rounded_rect(WIFI_BTN_X, BTN_Y, WIFI_BTN_W, BTN_H, 4, COLOR_ACCENT);
+  tft.setTextColor(COLOR_TEXT_WHITE);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("WiFi", WIFI_BTN_X + WIFI_BTN_W / 2, BTN_Y + BTN_H / 2, 2);
+
+  // Rules button
+  ui_draw_rounded_rect(RULES_BTN_X, BTN_Y, RULES_BTN_W, BTN_H, 4, COLOR_BUTTON_BG);
+  tft.setTextColor(COLOR_TEXT_WHITE);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("Rules", RULES_BTN_X + RULES_BTN_W / 2, BTN_Y + BTN_H / 2, 2);
+
+  // Reset button (far right, dark red — bright red when confirming)
+  uint16_t reset_color = _reset_confirming ? COLOR_ERROR : 0x8000;
+  ui_draw_rounded_rect(RESET_BTN_X2, BTN_Y, RESET_BTN_W2, BTN_H, 4, reset_color);
   tft.setTextColor(COLOR_TEXT_WHITE);
   tft.setTextDatum(MC_DATUM);
   tft.drawString(_reset_confirming ? "Sure?" : "Reset",
-                 RESET_BTN_X + RESET_BTN_W / 2, RESET_BTN_Y + RESET_BTN_H / 2, 2);
+                 RESET_BTN_X2 + RESET_BTN_W2 / 2, BTN_Y + BTN_H / 2, 2);
 }
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-void ui_dashboard_create(void (*on_reset)()) {
+void ui_dashboard_create(void (*on_reset)(), void (*on_settings)(), void (*on_wifi)()) {
   _boot_ms = millis();
   _on_reset_cb = on_reset;
+  _on_settings_cb = on_settings;
+  _on_wifi_cb = on_wifi;
   _reset_confirming = false;
   
   // Load atSign and device info
@@ -431,6 +430,19 @@ void ui_dashboard_update(int active_relays, const char *daemon_state,
   _tp_in[_tp_head]  = delta_in;
   _tp_out[_tp_head] = delta_out;
   _tp_head = (_tp_head + 1) % GRAPH_SAMPLES;
+
+  // LED activity: green = data flowing, blue = relay connected, cyan = daemon ready, off = stopped
+  if (_led_enabled) {
+    if (delta_in + delta_out > 0) {
+      ui_set_led(false, true, false);   // green — data flowing
+    } else if (active_relays > 0) {
+      ui_set_led(false, false, true);   // blue — relay connected, idle
+    } else {
+      // Daemon running but no relays — blink cyan slowly (on for even seconds)
+      bool blink = ((millis() / 1000) % 2) == 0;
+      ui_set_led(false, blink, blink);  // cyan blink — ready/waiting
+    }
+  }
   
   // Check reset confirmation timeout
   if (_reset_confirming && (millis() - _reset_confirm_ms > RESET_CONFIRM_TIMEOUT)) {
@@ -485,38 +497,63 @@ void ui_dashboard_update(int active_relays, const char *daemon_state,
 }
 
 bool ui_dashboard_handle_touch(int16_t tx, int16_t ty) {
-  // Check Reset button
-  if (ui_touch_in_rect(tx, ty, RESET_BTN_X, RESET_BTN_Y, RESET_BTN_W, RESET_BTN_H)) {
-    if (_reset_confirming) {
-      // Second tap = confirmed
-      Serial.println("[ui_dashboard] Reset confirmed!");
-      if (_on_reset_cb) {
-        _on_reset_cb();
+  // Extend touch targets upward by BTN_PAD so buttons at screen edge are easier to hit
+  #define BTN_PAD 10
+  int touch_top = BTN_Y - BTN_PAD;
+
+  // Only process bottom row if touch is roughly in the button strip
+  if (ty >= touch_top) {
+    // Check LED toggle button
+    if (ui_touch_in_rect(tx, ty, LED_BTN_X2, touch_top, LED_BTN_W2, BTN_H + BTN_PAD)) {
+      _led_enabled = !_led_enabled;
+      if (!_led_enabled) {
+        ui_set_led(false, false, false);  // turn off immediately
       }
-    } else {
-      // First tap = ask for confirmation
-      _reset_confirming = true;
-      _reset_confirm_ms = millis();
       _draw_bottom_row();
-      Serial.println("[ui_dashboard] Reset requested - tap again to confirm");
+      Serial.printf("[ui_dashboard] LED %s\n", _led_enabled ? "ON" : "OFF");
+      return true;
     }
-    return true;
+
+    // Check WiFi button
+    if (ui_touch_in_rect(tx, ty, WIFI_BTN_X, touch_top, WIFI_BTN_W, BTN_H + BTN_PAD)) {
+      Serial.println("[ui_dashboard] WiFi pressed");
+      if (_on_wifi_cb) {
+        _on_wifi_cb();
+      }
+      return true;
+    }
+
+    // Check Rules button
+    if (ui_touch_in_rect(tx, ty, RULES_BTN_X, touch_top, RULES_BTN_W, BTN_H + BTN_PAD)) {
+      Serial.println("[ui_dashboard] Rules pressed");
+      if (_on_settings_cb) {
+        _on_settings_cb();
+      }
+      return true;
+    }
+
+    // Check Reset button
+    if (ui_touch_in_rect(tx, ty, RESET_BTN_X2, touch_top, RESET_BTN_W2, BTN_H + BTN_PAD)) {
+      if (_reset_confirming) {
+        Serial.println("[ui_dashboard] Reset confirmed!");
+        if (_on_reset_cb) {
+          _on_reset_cb();
+        }
+      } else {
+        _reset_confirming = true;
+        _reset_confirm_ms = millis();
+        _draw_bottom_row();
+        Serial.println("[ui_dashboard] Reset requested - tap again to confirm");
+      }
+      return true;
+    }
   }
-  
+
   // If tapping elsewhere while confirming, cancel the confirmation
   if (_reset_confirming) {
     _reset_confirming = false;
     _draw_bottom_row();
     return true;
-  }
-  
-  // Check LED button presses
-  for (int i = 0; i < _led_preset_count; i++) {
-    if (ui_touch_in_rect(tx, ty, _led_presets[i].x, _led_presets[i].y, 42, 24)) {
-      ui_save_led_color(_led_presets[i].r, _led_presets[i].g, _led_presets[i].b);
-      Serial.printf("[ui_dashboard] LED color: %s\\n", _led_presets[i].label);
-      return true;
-    }
   }
   
   return false;

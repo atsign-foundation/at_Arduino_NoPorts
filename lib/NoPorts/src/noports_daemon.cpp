@@ -94,40 +94,50 @@ NoPortsDaemon::NoPortsDaemon()
   }
 }
 
-NoPortsDaemon::~NoPortsDaemon() {
-  stop();
-
-  // Free allocated atSDK objects
+void NoPortsDaemon::_freeResources() {
   if (_monitor_ctx) {
     atclient_monitor_free((atclient *)_monitor_ctx);
     free(_monitor_ctx);
+    _monitor_ctx = nullptr;
   }
   if (_worker_ctx) {
     atclient_free((atclient *)_worker_ctx);
     free(_worker_ctx);
+    _worker_ctx = nullptr;
   }
   if (_atkeys) {
     atclient_atkeys_free((atclient_atkeys *)_atkeys);
     free(_atkeys);
+    _atkeys = nullptr;
   }
   if (_signing_key) {
     atchops_rsa_key_private_key_free((atchops_rsa_key_private_key *)_signing_key);
     free(_signing_key);
+    _signing_key = nullptr;
   }
   if (_monitor_options) {
     atclient_authenticate_options_free((atclient_authenticate_options *)_monitor_options);
     free(_monitor_options);
+    _monitor_options = nullptr;
   }
   if (_worker_options) {
     atclient_authenticate_options_free((atclient_authenticate_options *)_worker_options);
     free(_worker_options);
+    _worker_options = nullptr;
   }
   if (_ping_response) {
     free(_ping_response);
+    _ping_response = nullptr;
   }
   if (_monitor_regex) {
     free(_monitor_regex);
+    _monitor_regex = nullptr;
   }
+}
+
+NoPortsDaemon::~NoPortsDaemon() {
+  stop();
+  _freeResources();
 }
 
 // ============================================================================
@@ -135,6 +145,10 @@ NoPortsDaemon::~NoPortsDaemon() {
 // ============================================================================
 
 bool NoPortsDaemon::begin(const NoPortsConfig &config) {
+  // Free any resources from a previous begin() call to avoid memory leaks
+  // when restarting the daemon (e.g. after settings change).
+  _freeResources();
+
   _state = DAEMON_INITIALIZING;
   memcpy(&_config, &config, sizeof(NoPortsConfig));
 
@@ -474,8 +488,6 @@ bool NoPortsDaemon::_authenticate() {
   atclient_authenticate_options_set_atdirectory_port(
     (atclient_authenticate_options *)_monitor_options, _root_port);
 
-  atclient_monitor_set_read_timeout((atclient *)_monitor_ctx, NOPORTS_MONITOR_READ_TIMEOUT_MS);
-
   NOPORTS_LOGI(TAG, "Authenticating monitor client for %s...", _config.atsign);
   res = atclient_monitor_pkam_authenticate(
     (atclient *)_monitor_ctx, _config.atsign, keys,
@@ -486,6 +498,11 @@ bool NoPortsDaemon::_authenticate() {
     return false;
   }
   NOPORTS_LOGI(TAG, "Monitor client authenticated");
+
+  // Set the monitor read timeout AFTER authentication, because
+  // atclient_tls_socket_configure (called during pkam_authenticate) 
+  // resets the mbedTLS read timeout to ATCLIENT_CLIENT_READ_TIMEOUT_MS (3s).
+  atclient_monitor_set_read_timeout((atclient *)_monitor_ctx, NOPORTS_MONITOR_READ_TIMEOUT_MS);
 
   // ---- Worker client ----
   _worker_ctx = calloc(1, sizeof(atclient));
@@ -1364,6 +1381,9 @@ bool NoPortsDaemon::_reconnectMonitor() {
     if (_reconnect_failures < 255) _reconnect_failures++;
     return false;
   }
+
+  // Re-apply monitor read timeout (pkam_authenticate resets it to 3s)
+  atclient_monitor_set_read_timeout(monitor, NOPORTS_MONITOR_READ_TIMEOUT_MS);
 
   _reconnect_failures = 0;
   NOPORTS_LOGI(TAG, "Monitor reconnected");

@@ -26,10 +26,13 @@ static uint8_t _evt_tail = 0;
 static uint8_t _evt_count = 0;
 static SemaphoreHandle_t _evt_mutex = nullptr;
 
-// Touch state for debouncing
-static bool _was_touched = false;
+// Touch state for edge detection (fire once per press-release cycle)
+static bool _touch_down = false;       // true while finger is on screen
+static bool _touch_fired = false;      // true after we reported this press
 static unsigned long _last_touch_time = 0;
-#define TOUCH_DEBOUNCE_MS 200
+static unsigned long _release_start = 0; // when we first saw "not touched"
+#define TOUCH_DEBOUNCE_MS 150
+#define TOUCH_RELEASE_MS  60   // finger must be off for 60ms to count as released
 
 // Runtime touch calibration values (loaded from NVS or defaults)
 static int16_t _cal_x_min = TOUCH_MIN_X;
@@ -231,23 +234,42 @@ XPT2046_Touchscreen& ui_get_touch() {
 // ---------------------------------------------------------------------------
 
 bool ui_touch_read(int16_t *x, int16_t *y) {
+  unsigned long now = millis();
+
   if (!touch.touched()) {
-    _was_touched = false;
+    // Finger appears to be off — but require sustained release to avoid
+    // XPT2046 single-poll glitches resetting the edge trigger.
+    if (_touch_down || _touch_fired) {
+      if (_release_start == 0) {
+        _release_start = now;          // start the release timer
+      } else if (now - _release_start >= TOUCH_RELEASE_MS) {
+        // Sustained release — actually reset edge state
+        _touch_down = false;
+        _touch_fired = false;
+        _release_start = 0;
+      }
+    }
     return false;
   }
+
+  // Finger is on screen — cancel any pending release
+  _release_start = 0;
   
   TS_Point p = touch.getPoint();
   
-  // Filter by pressure threshold (board recommends z >= 600)
-  // z == 0 or very low z means noise / no real touch
+  // Filter by pressure threshold
+  // Low z means noise — DON'T reset edge state, just ignore this sample
   if (p.z < 400) {
-    _was_touched = false;
     return false;
   }
   
-  // Debouncing: only register new touch after debounce period
-  unsigned long now = millis();
-  if (_was_touched && (now - _last_touch_time < TOUCH_DEBOUNCE_MS)) {
+  // Edge-triggered: only fire once per press-release cycle
+  if (_touch_fired) {
+    return false;  // already reported this press, wait for release
+  }
+  
+  // Debounce: ignore rapid sequential presses
+  if (_touch_down && (now - _last_touch_time < TOUCH_DEBOUNCE_MS)) {
     return false;
   }
   
@@ -259,7 +281,8 @@ bool ui_touch_read(int16_t *x, int16_t *y) {
   *x = constrain(*x, 0, TFT_WIDTH - 1);
   *y = constrain(*y, 0, TFT_HEIGHT - 1);
   
-  _was_touched = true;
+  _touch_down = true;
+  _touch_fired = true;   // won't fire again until finger lifts
   _last_touch_time = now;
   
   return true;

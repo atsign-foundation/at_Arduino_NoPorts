@@ -11,8 +11,10 @@
 /**
  * @brief Initialize and display the dashboard screen
  * @param on_reset Callback when user presses the Reset button
+ * @param on_settings Callback when user presses the Rules button
+ * @param on_wifi Callback when user presses the WiFi button
  */
-void ui_dashboard_create(void (*on_reset)() = nullptr);
+void ui_dashboard_create(void (*on_reset)() = nullptr, void (*on_settings)() = nullptr, void (*on_wifi)() = nullptr);
 
 /**
  * @brief Update dashboard with current status

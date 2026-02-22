@@ -141,6 +141,7 @@ private:
   uint8_t  _reconnect_failures;   // consecutive monitor reconnect failures (for backoff)
 
   // Internal methods (mirror the C sshnpd functions)
+  void _freeResources();  // free all allocated SDK objects
   bool _authenticate();
   bool _startMonitor();
   bool _publishDeviceInfo();

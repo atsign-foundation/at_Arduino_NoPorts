@@ -38,16 +38,55 @@ static void (*_on_connected_cb)() = nullptr;
 static uint32_t _scan_start_ms = 0;
 static uint32_t _connect_start_ms = 0;
 static String _status_msg;
+static int _scan_retries = 0;
+#define MAX_SCAN_RETRIES 5
 
-// Simple on-screen keyboard keys
-static const char* _keyboard_keys[] = {
+// Keyboard mode: 0=lowercase, 1=uppercase, 2=symbols
+static int _wifi_kb_mode = 0;
+
+// Keyboard layouts — 4 rows of 10 + bottom row (DEL, SPACE, mode toggle, OK)
+static const char* _wifi_kb_lower[] = {
   "1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
   "q", "w", "e", "r", "t", "y", "u", "i", "o", "p",
-  "a", "s", "d", "f", "g", "h", "j", "k", "l", "-",
-  "z", "x", "c", "v", "b", "n", "m", "_", ".", "!",
-  "DEL", "SPACE", "OK"
+  "a", "s", "d", "f", "g", "h", "j", "k", "l", "@",
+  "z", "x", "c", "v", "b", "n", "m", ",", ".", "-",
+  "DEL", "SPACE", "ABC", "OK"
 };
-static const int _keyboard_key_count = sizeof(_keyboard_keys) / sizeof(_keyboard_keys[0]);
+static const int _wifi_kb_lower_count = sizeof(_wifi_kb_lower) / sizeof(_wifi_kb_lower[0]);
+
+static const char* _wifi_kb_upper[] = {
+  "1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
+  "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P",
+  "A", "S", "D", "F", "G", "H", "J", "K", "L", "@",
+  "Z", "X", "C", "V", "B", "N", "M", ",", ".", "-",
+  "DEL", "SPACE", "#$%", "OK"
+};
+static const int _wifi_kb_upper_count = sizeof(_wifi_kb_upper) / sizeof(_wifi_kb_upper[0]);
+
+static const char* _wifi_kb_sym[] = {
+  "!", "#", "$", "%", "^", "&", "*", "(", ")", "~",
+  "+", "=", "[", "]", "{", "}", "|", "\\", ";", "'",
+  "\"", "<", ">", "?", "/", ":", "_", "`", "@", ".",
+  "1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
+  "DEL", "SPACE", "abc", "OK"
+};
+static const int _wifi_kb_sym_count = sizeof(_wifi_kb_sym) / sizeof(_wifi_kb_sym[0]);
+
+static const char** _wifi_get_kb_keys() {
+  switch (_wifi_kb_mode) {
+    case 1:  return _wifi_kb_upper;
+    case 2:  return _wifi_kb_sym;
+    default: return _wifi_kb_lower;
+  }
+}
+
+static int _wifi_get_kb_key_count() {
+  switch (_wifi_kb_mode) {
+    case 1:  return _wifi_kb_upper_count;
+    case 2:  return _wifi_kb_sym_count;
+    default: return _wifi_kb_lower_count;
+  }
+}
 
 #define KEYS_PER_ROW 10
 #define KEY_WIDTH    30
@@ -59,6 +98,7 @@ static const int _keyboard_key_count = sizeof(_keyboard_keys) / sizeof(_keyboard
 // ---------------------------------------------------------------------------
 static void _draw_keyboard();
 static bool _check_keyboard_press(int16_t tx, int16_t ty);
+static void _draw_network_list();
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -89,11 +129,60 @@ static void _start_scan() {
   _state = WIFI_SCANNING;
   _network_count = 0;
   _scan_start_ms = millis();
+
+  // Show scanning message before blocking
+  _draw_status("Scanning...");
+
+  WiFi.scanDelete();
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  WiFi.scanNetworks(true);  // Async scan
-  Serial.println("[ui_wifi] Starting WiFi scan...");
+
+  // Synchronous scan — blocks 2-4 seconds but is far more reliable
+  // than the async variant on ESP32 (which often returns WIFI_SCAN_FAILED)
+  Serial.printf("[ui_wifi] Starting WiFi scan (attempt %d)...\n", _scan_retries + 1);
+  int n = WiFi.scanNetworks(false);  // synchronous
+
+  if (n < 0) {
+    // Scan failed
+    _scan_retries++;
+    Serial.printf("[ui_wifi] Scan failed (err=%d), retries=%d\n", n, _scan_retries);
+    if (_scan_retries < MAX_SCAN_RETRIES) {
+      char msg[48];
+      snprintf(msg, sizeof(msg), "Scan failed, retrying (%d/%d)...", _scan_retries, MAX_SCAN_RETRIES);
+      _draw_status(msg);
+      WiFi.scanDelete();
+      // Retry immediately (recursive, but bounded by MAX_SCAN_RETRIES)
+      _start_scan();
+      return;
+    }
+    _state = WIFI_SHOW_LIST;
+    _network_count = 0;
+    _draw_status("No networks found - tap Rescan");
+    _draw_network_list();
+    return;
+  }
+
+  // Filter out empty/hidden SSIDs
+  _network_count = 0;
+  for (int i = 0; i < n && _network_count < MAX_NETWORKS; i++) {
+    String ssid = WiFi.SSID(i);
+    if (ssid.length() > 0) {
+      _networks[_network_count++] = ssid;
+    }
+  }
+  WiFi.scanDelete();
+  _scan_retries = 0;
+
+  Serial.printf("[ui_wifi] Found %d networks\n", _network_count);
+  _state = WIFI_SHOW_LIST;
+  _draw_status(_network_count > 0 ? "Touch to select network" : "No networks found - tap Rescan");
+  _draw_network_list();
 }
+
+// Y position for the Rescan button (below the network list)
+#define RESCAN_BTN_W  70
+#define RESCAN_BTN_H  24
+#define RESCAN_BTN_X  ((TFT_WIDTH - RESCAN_BTN_W) / 2)
+#define RESCAN_BTN_Y  (TFT_HEIGHT - RESCAN_BTN_H - 4)
 
 static void _draw_network_list() {
   TFT_eSPI &tft = ui_get_tft();
@@ -115,31 +204,74 @@ static void _draw_network_list() {
     
     y += NETWORK_HEIGHT;
   }
+
+  // Draw Rescan button at the bottom
+  ui_draw_rounded_rect(RESCAN_BTN_X, RESCAN_BTN_Y, RESCAN_BTN_W, RESCAN_BTN_H, 4, COLOR_BG_CARD);
+  tft.setTextColor(COLOR_ACCENT);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(1);
+  tft.drawString("Rescan", RESCAN_BTN_X + RESCAN_BTN_W / 2, RESCAN_BTN_Y + RESCAN_BTN_H / 2, 2);
 }
 
-static void _draw_password_entry() {
+// Draw just the password field (no keyboard redraw — avoids flicker)
+static void _draw_password_field() {
   TFT_eSPI &tft = ui_get_tft();
-  
-  // Draw selected SSID at top
-  tft.fillRect(0, LIST_START_Y, TFT_WIDTH, 30, COLOR_BG_DARK);
+  int kb_start_y = TFT_HEIGHT - KEYBOARD_HEIGHT;
+  int field_y = kb_start_y - 28;  // place field 28px above keyboard
+
+  // Clear field area
+  tft.fillRect(0, LIST_START_Y, TFT_WIDTH, field_y + 26 - LIST_START_Y, COLOR_BG_DARK);
+
+  // SSID label
   tft.setTextColor(COLOR_PRIMARY);
   tft.setTextDatum(TC_DATUM);
   tft.setTextSize(1);
-  tft.drawString(_networks[_selected_network].c_str(), TFT_WIDTH / 2, LIST_START_Y + 5, 2);
-  
-  // Draw password field
-  int field_y = LIST_START_Y + 35;
-  ui_draw_rounded_rect(10, field_y, TFT_WIDTH - 20, 30, 4, COLOR_BG_CARD);
-  
-  // Show password (masked)
-  tft.setTextColor(COLOR_TEXT_WHITE);
+  tft.drawString(_networks[_selected_network].c_str(), TFT_WIDTH / 2, LIST_START_Y + 2, 2);
+
+  // Password field box
+  ui_draw_rounded_rect(10, field_y, TFT_WIDTH - 20, 24, 4, COLOR_BG_CARD);
+
+  // Show password text with cursor
   tft.setTextDatum(ML_DATUM);
-  String masked(_password_len, '*');
-  tft.drawString(masked.c_str(), 15, field_y + 15, 2);
-  
-  // Draw keyboard
+  if (_password_len > 0) {
+    tft.setTextColor(COLOR_TEXT_WHITE);
+    // Show the tail of the password if it's too wide for the field
+    const char *display = _password;
+    int max_w = TFT_WIDTH - 50;  // leave room for count
+    int tw = tft.textWidth(_password, 2);
+    if (tw > max_w) {
+      int skip = 0;
+      while (tft.textWidth(_password + skip, 2) > max_w && _password[skip]) skip++;
+      display = _password + skip;
+    }
+    tft.drawString(display, 15, field_y + 12, 2);
+    // Cursor
+    int cx = 15 + tft.textWidth(display, 2);
+    if (cx > TFT_WIDTH - 25) cx = TFT_WIDTH - 25;
+    tft.drawLine(cx, field_y + 4, cx, field_y + 20, COLOR_PRIMARY);
+  } else {
+    tft.setTextColor(COLOR_TEXT_GREY);
+    tft.drawString("Enter password", 15, field_y + 12, 2);
+  }
+
+}
+
+// Draw SSID, password field, and keyboard (full redraw)
+static void _draw_password_entry() {
+  _draw_password_field();
   _draw_keyboard();
 }
+
+// Bottom row key positions (explicit pixel layout to avoid overlap)
+// DEL(60) + 4 + SPACE(88) + 4 + mode(52) + 4 + OK(98) = 310
+#define WBROW_DEL_X    5
+#define WBROW_DEL_W    60
+#define WBROW_SPC_X    (WBROW_DEL_X + WBROW_DEL_W + 4)
+#define WBROW_SPC_W    88
+#define WBROW_MODE_X   (WBROW_SPC_X + WBROW_SPC_W + 4)
+#define WBROW_MODE_W   52
+#define WBROW_OK_X     (WBROW_MODE_X + WBROW_MODE_W + 4)
+#define WBROW_OK_W     (TFT_WIDTH - 5 - WBROW_OK_X)
 
 static void _draw_keyboard() {
   TFT_eSPI &tft = ui_get_tft();
@@ -147,106 +279,110 @@ static void _draw_keyboard() {
   int kb_start_y = TFT_HEIGHT - KEYBOARD_HEIGHT;
   tft.fillRect(0, kb_start_y, TFT_WIDTH, KEYBOARD_HEIGHT, COLOR_BG_DARK);
   
-  int key_idx = 0;
-  int row = 0;
+  const char **keys = _wifi_get_kb_keys();
+  int count = _wifi_get_kb_key_count();
   int x_start = 5;
-  
-  for (int i = 0; i < _keyboard_key_count; i++) {
-    int col = key_idx % KEYS_PER_ROW;
+
+  // Draw character rows (rows 0-3, 10 keys each = indices 0..39)
+  int char_count = count - 4;  // last 4 are action keys
+  for (int i = 0; i < char_count; i++) {
+    int row = i / KEYS_PER_ROW;
+    int col = i % KEYS_PER_ROW;
     int x = x_start + col * (KEY_WIDTH + KEY_SPACING);
     int y = kb_start_y + row * (KEY_HEIGHT + KEY_SPACING) + 2;
-    
-    // Wide keys: DEL=3cols, SPACE=4cols, OK=3cols (total 10 = full row)
-    int key_w = KEY_WIDTH;
-    int col_span = 1;
-    if (strcmp(_keyboard_keys[i], "DEL") == 0) {
-      key_w = KEY_WIDTH * 3 + KEY_SPACING * 2;
-      col_span = 3;
-    } else if (strcmp(_keyboard_keys[i], "SPACE") == 0) {
-      key_w = KEY_WIDTH * 4 + KEY_SPACING * 3;
-      col_span = 4;
-    } else if (strcmp(_keyboard_keys[i], "OK") == 0) {
-      key_w = KEY_WIDTH * 3 + KEY_SPACING * 2;
-      col_span = 3;
-    }
-    
-    // Draw key
-    ui_draw_rounded_rect(x, y, key_w, KEY_HEIGHT, 3, COLOR_BUTTON_BG);
-    
+
+    ui_draw_rounded_rect(x, y, KEY_WIDTH, KEY_HEIGHT, 3, COLOR_BUTTON_BG);
     tft.setTextColor(COLOR_TEXT_WHITE);
     tft.setTextDatum(MC_DATUM);
     tft.setTextSize(1);
-    tft.drawString(_keyboard_keys[i], x + key_w / 2, y + KEY_HEIGHT / 2, 2);
-    
-    key_idx += col_span;
-    if (key_idx >= KEYS_PER_ROW) {
-      row++;
-      key_idx = 0;
-    }
+    tft.drawString(keys[i], x + KEY_WIDTH / 2, y + KEY_HEIGHT / 2, 2);
   }
+
+  // Draw bottom row (explicit positions)
+  int brow_y = kb_start_y + 4 * (KEY_HEIGHT + KEY_SPACING) + 2;
+
+  // DEL
+  ui_draw_rounded_rect(WBROW_DEL_X, brow_y, WBROW_DEL_W, KEY_HEIGHT, 3, COLOR_BUTTON_BG);
+  tft.setTextColor(COLOR_TEXT_WHITE);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("DEL", WBROW_DEL_X + WBROW_DEL_W / 2, brow_y + KEY_HEIGHT / 2, 2);
+
+  // SPACE
+  ui_draw_rounded_rect(WBROW_SPC_X, brow_y, WBROW_SPC_W, KEY_HEIGHT, 3, COLOR_BUTTON_BG);
+  tft.drawString("SPACE", WBROW_SPC_X + WBROW_SPC_W / 2, brow_y + KEY_HEIGHT / 2, 2);
+
+  // Mode toggle (ABC / #$% / abc)
+  const char *mode_label = keys[count - 2];  // second-to-last key
+  ui_draw_rounded_rect(WBROW_MODE_X, brow_y, WBROW_MODE_W, KEY_HEIGHT, 3, COLOR_PRIMARY);
+  tft.drawString(mode_label, WBROW_MODE_X + WBROW_MODE_W / 2, brow_y + KEY_HEIGHT / 2, 2);
+
+  // OK (connect)
+  ui_draw_rounded_rect(WBROW_OK_X, brow_y, WBROW_OK_W, KEY_HEIGHT, 3, COLOR_SUCCESS);
+  tft.drawString("OK", WBROW_OK_X + WBROW_OK_W / 2, brow_y + KEY_HEIGHT / 2, 2);
 }
 
 static bool _check_keyboard_press(int16_t tx, int16_t ty) {
   int kb_start_y = TFT_HEIGHT - KEYBOARD_HEIGHT;
-  int key_idx = 0;
-  int row = 0;
+  const char **keys = _wifi_get_kb_keys();
+  int count = _wifi_get_kb_key_count();
+  int char_count = count - 4;  // last 4 are bottom-row action keys
   int x_start = 5;
-  
-  for (int i = 0; i < _keyboard_key_count; i++) {
-    int col = key_idx % KEYS_PER_ROW;
+
+  // Check character keys (rows 0-3)
+  for (int i = 0; i < char_count; i++) {
+    int row = i / KEYS_PER_ROW;
+    int col = i % KEYS_PER_ROW;
     int x = x_start + col * (KEY_WIDTH + KEY_SPACING);
     int y = kb_start_y + row * (KEY_HEIGHT + KEY_SPACING) + 2;
-    
-    // Wide keys: DEL=3cols, SPACE=4cols, OK=3cols
-    int key_w = KEY_WIDTH;
-    int col_span = 1;
-    if (strcmp(_keyboard_keys[i], "DEL") == 0) {
-      key_w = KEY_WIDTH * 3 + KEY_SPACING * 2;
-      col_span = 3;
-    } else if (strcmp(_keyboard_keys[i], "SPACE") == 0) {
-      key_w = KEY_WIDTH * 4 + KEY_SPACING * 3;
-      col_span = 4;
-    } else if (strcmp(_keyboard_keys[i], "OK") == 0) {
-      key_w = KEY_WIDTH * 3 + KEY_SPACING * 2;
-      col_span = 3;
-    }
-    
-    if (ui_touch_in_rect(tx, ty, x, y, key_w, KEY_HEIGHT)) {
-      // Handle key press
-      if (strcmp(_keyboard_keys[i], "DEL") == 0) {
-        if (_password_len > 0) {
-          _password[--_password_len] = '\0';
-        }
-      } else if (strcmp(_keyboard_keys[i], "SPACE") == 0) {
-        if (_password_len < 63) {
-          _password[_password_len++] = ' ';
-          _password[_password_len] = '\0';
-        }
-      } else if (strcmp(_keyboard_keys[i], "OK") == 0) {
-        // Start connection
-        _state = WIFI_CONNECTING;
-        _connect_start_ms = millis();
-        WiFi.begin(_networks[_selected_network].c_str(), _password);
-        Serial.printf("[ui_wifi] Connecting to %s...\n", _networks[_selected_network].c_str());
-      } else {
-        // Regular character
-        if (_password_len < 63) {
-          _password[_password_len++] = _keyboard_keys[i][0];
-          _password[_password_len] = '\0';
-        }
+
+    if (ui_touch_in_rect(tx, ty, x, y, KEY_WIDTH, KEY_HEIGHT)) {
+      if (_password_len < 63) {
+        _password[_password_len++] = keys[i][0];
+        _password[_password_len] = '\0';
       }
-      
-      _draw_password_entry();
+      _draw_password_field();  // only refresh field, not keyboard
       return true;
     }
-    
-    key_idx += col_span;
-    if (key_idx >= KEYS_PER_ROW) {
-      row++;
-      key_idx = 0;
-    }
   }
-  
+
+  // Check bottom row (explicit positions)
+  int brow_y = kb_start_y + 4 * (KEY_HEIGHT + KEY_SPACING) + 2;
+
+  // DEL
+  if (ui_touch_in_rect(tx, ty, WBROW_DEL_X, brow_y, WBROW_DEL_W, KEY_HEIGHT)) {
+    if (_password_len > 0) {
+      _password[--_password_len] = '\0';
+    }
+    _draw_password_field();
+    return true;
+  }
+
+  // SPACE
+  if (ui_touch_in_rect(tx, ty, WBROW_SPC_X, brow_y, WBROW_SPC_W, KEY_HEIGHT)) {
+    if (_password_len < 63) {
+      _password[_password_len++] = ' ';
+      _password[_password_len] = '\0';
+    }
+    _draw_password_field();
+    return true;
+  }
+
+  // Mode toggle
+  if (ui_touch_in_rect(tx, ty, WBROW_MODE_X, brow_y, WBROW_MODE_W, KEY_HEIGHT)) {
+    _wifi_kb_mode = (_wifi_kb_mode + 1) % 3;
+    _draw_keyboard();
+    return true;
+  }
+
+  // OK (connect)
+  if (ui_touch_in_rect(tx, ty, WBROW_OK_X, brow_y, WBROW_OK_W, KEY_HEIGHT)) {
+    _state = WIFI_CONNECTING;
+    _connect_start_ms = millis();
+    WiFi.begin(_networks[_selected_network].c_str(), _password);
+    Serial.printf("[ui_wifi] Connecting to %s...\n", _networks[_selected_network].c_str());
+    return true;
+  }
+
   return false;
 }
 
@@ -256,6 +392,11 @@ static bool _check_keyboard_press(int16_t tx, int16_t ty) {
 
 void ui_wifi_create(void (*on_connected)()) {
   _on_connected_cb = on_connected;
+  _scan_retries = 0;
+  _selected_network = -1;
+  _password_len = 0;
+  _password[0] = '\0';
+  _wifi_kb_mode = 0;
   
   TFT_eSPI &tft = ui_get_tft();
   tft.fillScreen(COLOR_BG_DARK);
@@ -266,38 +407,10 @@ void ui_wifi_create(void (*on_connected)()) {
 
 void ui_wifi_update() {
   switch (_state) {
-    case WIFI_SCANNING: {
-      // Check if scan is complete
-      int n = WiFi.scanComplete();
-      if (n == WIFI_SCAN_FAILED) {
-        _status_msg = "Scan failed";
-        _draw_status(_status_msg.c_str());
-        delay(2000);
-        _start_scan();
-      } else if (n >= 0) {
-        // Scan complete
-        _network_count = min(n, MAX_NETWORKS);
-        for (int i = 0; i < _network_count; i++) {
-          _networks[i] = WiFi.SSID(i);
-        }
-        Serial.printf("[ui_wifi] Found %d networks\n", _network_count);
-        _state = WIFI_SHOW_LIST;
-        _draw_status("Touch to select network");
-        _draw_network_list();
-        WiFi.scanDelete();
-      } else {
-        // Still scanning
-        if (millis() - _scan_start_ms > 10000) {
-          _status_msg = "Scan timeout";
-          _draw_status(_status_msg.c_str());
-          delay(2000);
-          _start_scan();
-        } else {
-          _draw_status("Scanning...");
-        }
-      }
+    case WIFI_SCANNING:
+      // Synchronous scan is handled entirely inside _start_scan() now.
+      // If we still land here, the scan completed and transitioned state.
       break;
-    }
     
     case WIFI_CONNECTING: {
       // Check connection status
@@ -360,6 +473,17 @@ void ui_wifi_update() {
 
 bool ui_wifi_handle_touch(int16_t tx, int16_t ty) {
   if (_state == WIFI_SHOW_LIST) {
+    // Check Rescan button first
+    if (ui_touch_in_rect(tx, ty, RESCAN_BTN_X, RESCAN_BTN_Y - 5, RESCAN_BTN_W, RESCAN_BTN_H + 10)) {
+      Serial.println("[ui_wifi] Rescan pressed");
+      TFT_eSPI &tft = ui_get_tft();
+      tft.fillScreen(COLOR_BG_DARK);
+      _draw_header("WiFi Setup");
+      _scan_retries = 0;
+      _start_scan();
+      return true;
+    }
+
     // Check if a network was tapped
     int y = LIST_START_Y;
     for (int i = 0; i < _network_count && i < MAX_NETWORKS; i++) {
@@ -367,6 +491,7 @@ bool ui_wifi_handle_touch(int16_t tx, int16_t ty) {
         _selected_network = i;
         _password_len = 0;
         _password[0] = '\0';
+        _wifi_kb_mode = 0;  // start in lowercase
         _state = WIFI_ENTER_PASSWORD;
         
         TFT_eSPI &tft = ui_get_tft();
