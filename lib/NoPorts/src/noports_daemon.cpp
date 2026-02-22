@@ -22,6 +22,8 @@
 #include "noports/noports_daemon.h"
 #include "noports/noports_log.h"
 #include <stdarg.h>
+#include <esp_system.h>   // esp_restart()
+#include <esp_heap_caps.h> // heap_caps_get_largest_free_block()
 
 // === Embedded atSDK includes ===
 // These are bundled directly in this library (no external atsdk dependency)
@@ -365,7 +367,8 @@ void NoPortsDaemon::loop() {
       // Don't bump timeout — let the next loop() iteration retry with
       // the fresh worker connection.
     } else {
-      NOPORTS_LOGW(TAG, "Worker reconnect also failed, will reconnect monitor");
+      NOPORTS_LOGW(TAG, "Worker reconnect also failed (TLS failures: %d/%d), will reconnect monitor",
+                   _reconnect_failures, NOPORTS_MAX_RECONNECT_FAILURES);
       _timeout_counter = NOPORTS_MONITOR_NOOP_TIMEOUT_MS / NOPORTS_MONITOR_READ_TIMEOUT_MS + 1;
     }
     atclient_monitor_message_free(&message);
@@ -442,7 +445,11 @@ uint8_t NoPortsDaemon::getActiveRelayCount() const {
   uint8_t count = 0;
   for (int i = 0; i < NOPORTS_MAX_RELAYS; i++) {
     if (noports_relay_is_running(&_relays[i])) {
-      count++;
+      if (_relays[i].config.multi && _relays[i].active_sessions > 0) {
+        count += _relays[i].active_sessions;
+      } else {
+        count++;  // single-mode relay or multi with no subs yet
+      }
     }
   }
   return count;
@@ -450,6 +457,10 @@ uint8_t NoPortsDaemon::getActiveRelayCount() const {
 
 const char* NoPortsDaemon::getLastError() const {
   return _last_error;
+}
+
+uint8_t NoPortsDaemon::getReconnectFailures() const {
+  return _reconnect_failures;
 }
 
 void NoPortsDaemon::getThroughput(uint32_t &bytes_in, uint32_t &bytes_out) const {
@@ -1335,6 +1346,7 @@ void NoPortsDaemon::_cleanupFinishedRelays() {
         _relays[i].bytes_in = 0;
         _relays[i].bytes_out = 0;
         _relays[i].start_ms = 0;
+        _relays[i].active_sessions = 0;
         memset(&_relays[i].config, 0, sizeof(NoPortsRelayConfig));
       }
     }
@@ -1346,6 +1358,18 @@ void NoPortsDaemon::_cleanupFinishedRelays() {
 // ============================================================================
 
 bool NoPortsDaemon::_reconnectMonitor() {
+  // Too many consecutive failures — likely memory fragmentation preventing
+  // mbedTLS from allocating contiguous blocks for TLS handshake.
+  // A reboot is the only reliable fix on ESP32.
+  if (_reconnect_failures >= NOPORTS_MAX_RECONNECT_FAILURES) {
+    NOPORTS_LOGE(TAG, "Monitor reconnect failed %d times — rebooting (heap: %u, largest free: %u)",
+                 _reconnect_failures,
+                 (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    delay(1000);  // brief pause for serial flush
+    esp_restart();
+  }
+
   // Exponential backoff: 5s, 10s, 20s, 30s, 30s, ...
   if (_reconnect_failures > 0) {
     unsigned long backoff_ms = 5000UL << (_reconnect_failures - 1);
@@ -1386,7 +1410,7 @@ bool NoPortsDaemon::_reconnectMonitor() {
   atclient_monitor_set_read_timeout(monitor, NOPORTS_MONITOR_READ_TIMEOUT_MS);
 
   _reconnect_failures = 0;
-  NOPORTS_LOGI(TAG, "Monitor reconnected");
+  NOPORTS_LOGI(TAG, "Monitor reconnected (TLS failure counter reset)");
   return true;
 }
 
@@ -1405,7 +1429,9 @@ bool NoPortsDaemon::_reconnectWorker() {
     (atclient_authenticate_options *)_worker_options, NULL);
 
   if (res != 0) {
-    NOPORTS_LOGE(TAG, "Worker reconnect auth failed: %d", res);
+    NOPORTS_LOGE(TAG, "Worker reconnect auth failed: %d (heap: %u)", res,
+                 (unsigned)esp_get_free_heap_size());
+    if (_reconnect_failures < 255) _reconnect_failures++;
     return false;
   }
 

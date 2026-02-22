@@ -29,6 +29,12 @@
 // Noop timeout – after this many ms without data we send a noop/reconnect
 #define NOPORTS_MONITOR_NOOP_TIMEOUT_MS  40000
 
+// Maximum consecutive monitor reconnect failures before forced ESP.restart().
+// With 30s max backoff, 10 failures = ~5 minutes of retrying before reboot.
+// This handles memory fragmentation where mbedTLS can't allocate contiguous
+// blocks for TLS even with sufficient total free heap.
+#define NOPORTS_MAX_RECONNECT_FAILURES 10
+
 // Maximum number of permitopen entries
 #define NOPORTS_MAX_PERMITOPEN 255
 

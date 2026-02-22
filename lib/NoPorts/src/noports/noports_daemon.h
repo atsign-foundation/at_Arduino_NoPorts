@@ -105,6 +105,13 @@ public:
    */
   const char* getLastError() const;
 
+  /**
+   * @brief Get consecutive monitor reconnect failure count
+   * Resets to 0 on successful reconnect. Triggers ESP.restart()
+   * when it reaches NOPORTS_MAX_RECONNECT_FAILURES.
+   */
+  uint8_t getReconnectFailures() const;
+
 private:
   // Daemon state
   NoPortsDaemonState _state;
@@ -138,7 +145,7 @@ private:
 
   // Timeout tracking
   uint32_t _timeout_counter;
-  uint8_t  _reconnect_failures;   // consecutive monitor reconnect failures (for backoff)
+  uint8_t  _reconnect_failures;   // consecutive TLS connection failures (monitor + worker)
 
   // Internal methods (mirror the C sshnpd functions)
   void _freeResources();  // free all allocated SDK objects

@@ -1,8 +1,8 @@
-# NoPorts CYD - TFT_eSPI Migration
+# NoPorts CYD - Migration & Optimization Log
 
 ## Overview
 
-This package has been migrated from **LVGL + esp32-smartdisplay** to **TFT_eSPI** to dramatically reduce memory usage and improve performance on the CYD (ESP32-2432S028R) device.
+This package has been migrated from **LVGL + esp32-smartdisplay** to **TFT_eSPI** to dramatically reduce memory usage and improve performance on the CYD (ESP32-2432S028R) device. Subsequent work added multi-session relay support, dashboard enhancements, and stability improvements.
 
 ## Memory Improvements
 
@@ -142,6 +142,96 @@ Possible optimizations for even better performance:
 - [ ] DMA transfers for faster rendering
 - [ ] PSRAM buffer (if available on your CYD variant)
 
+## Multi-Session TCP Relay
+
+### Background
+
+The Dart sshnpd supports multiple concurrent TCP sessions per NPT connection
+using `multi: true` mode (see `srv_impl.dart` — `_runDaemonSideMulti()`). The
+original ESP32 relay opened 2 SRVD connections upfront, polled both for a single
+`connect:` message, and bridged one data socket to the local service. Additional
+`connect:` messages were silently discarded.
+
+### Implementation
+
+The relay now supports the Dart multi-session protocol:
+
+1. **Single control channel** — one TLS connection to SRVD carries `connect:` and
+   `heartbeat:` messages
+2. **On-demand sub-connections** — each `connect:` message spawns a new SRVD data
+   socket + local service socket pair (up to `MAX_RELAY_SUBS = 4`)
+3. **Per-session AES keys** — each `connect:` payload carries fresh
+   `keyC2D:ivC2D[:keyD2C:ivD2C]`; independent `aes_ctr_state` contexts are created
+   per sub-connection
+4. **Concurrent bridging** — all active subs are polled and relayed in the same
+   FreeRTOS task loop, with per-sub byte counters rolled into the relay totals
+
+### Key Structures
+
+```cpp
+#define MAX_RELAY_SUBS 4
+
+typedef struct {
+  WiFiClient rvd_client;    // SRVD data socket
+  WiFiClient local_client;  // Local service socket
+  aes_ctr_state *encrypter; // Per-sub encrypt context
+  aes_ctr_state *decrypter; // Per-sub decrypt context
+  bool active;
+  bool encrypted;
+} RelaySub;
+```
+
+### TCP PCB Budget
+
+ESP32 lwIP defaults to 10 TCP PCBs. Budget per relay:
+- 1 control channel + 4 subs × 2 sockets = 9 data sockets
+- Plus monitor connection (1) and worker (1, often disconnected during relay)
+- Practical maximum: 4 concurrent sub-connections is safe
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `noports_relay.cpp` | Added `RelaySub`, `_close_relay_sub()`, `_handle_connect_msg()`, `_relay_task_inner_multi()` |
+| `noports_relay.h` | No changes needed (multi flag already in config) |
+| `noports_daemon.cpp` | Sets `relay_cfg.multi = true` for all NPT requests |
+
+## Dashboard Improvements
+
+### Throughput Display
+- Real-time throughput shown in **bits per second** (bps/Kbps/Mbps)
+- Color-coded: **cyan** for RX, **green** for TX
+- Calculated from per-relay `bytes_in` / `bytes_out` counters with 1-second sampling
+
+### CPU Usage
+- Per-core CPU usage percentage displayed on dashboard
+- Uses FreeRTOS idle task hook for accurate measurement
+
+### Anti-Flicker
+- Partial screen updates only redraw changed regions
+- Eliminates full-screen clears that caused visible flicker
+- Consistent 60 FPS without tearing
+
+### Auth & Retry Screen
+- Redesigned authentication screen with clear error states
+- Retry mechanism for failed connections
+
+### LED Status Colors
+- **Green**: Connected and idle
+- **Amber**: Relay active (data flowing)
+- **Red**: Error state
+- **Blue**: Enrolling
+
+## Build Statistics
+
+| Metric | Value |
+|--------|-------|
+| RAM | 17.2% (56,268 / 327,680 bytes) |
+| Flash | 36.2% (900,893 / 2,490,368 bytes) |
+| Relay code | ~1,260 lines |
+| Daemon code | ~1,441 lines |
+| UI code | ~600 lines (dashboard) |
+
 ## Credits
 
 - **TFT_eSPI**: Bodmer - https://github.com/Bodmer/TFT_eSPI
@@ -150,6 +240,7 @@ Possible optimizations for even better performance:
 
 ---
 
-**Migration Date**: February 2026  
-**Tested On**: ESP32-2432S028R (CYD)  
+**Migration Date**: February 2025  
+**Multi-Session Relay**: July 2025  
+**Tested On**: ESP32-2432S028R (CYD), ESP32-2432S028Rv2 (CYD2USB)  
 **Status**: ✅ Production Ready

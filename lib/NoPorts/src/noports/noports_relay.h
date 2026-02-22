@@ -86,6 +86,9 @@ struct NoPortsRelay {
   volatile uint32_t  bytes_out;     // local → RVD
   volatile uint32_t  start_ms;      // millis() when relay entered RUNNING
 
+  // Active sub-connection count (multi mode: 0..MAX_RELAY_SUBS)
+  volatile uint8_t   active_sessions;
+
   // AES-CTR state for encryption (if enabled)
   // Uses mbedtls_aes_context from ESP-IDF's built-in mbedTLS
   void *encrypter; // opaque, cast to internal aes_ctr_state*

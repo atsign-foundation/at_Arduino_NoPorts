@@ -8,10 +8,12 @@ NoPorts daemon with touchscreen UI for the **CYD (Cheap Yellow Display)** ESP32-
 
 - 🌐 **WiFi Configuration** - Scan and connect to networks with on-screen keyboard
 - 🔐 **APKAM Enrollment** - Secure device enrollment with atProtocol
-- 📊 **Real-time Dashboard** - Monitor tunnels, pings, and connection status
-- 💡 **RGB LED Control** - 6 color presets for status indication
+- 📊 **Real-time Dashboard** - Monitor tunnels, pings, throughput (bps), and CPU usage
+- 🔀 **Multi-Session Relay** - Up to 4 concurrent TCP sessions per NPT connection
+- 🔒 **Per-Session Encryption** - Independent AES-CTR keys for each sub-connection
+- 💡 **RGB LED Status** - Color-coded states (green=connected, amber=relay active, red=error)
 - 💾 **Persistent Storage** - WiFi credentials and keys saved to NVS/LittleFS
-- 🎯 **Touch Interface** - Intuitive touchscreen UI optimized for 320x240 display
+- 🎯 **Touch Interface** - Flicker-free touchscreen UI optimized for 320x240 display
 
 ### Hardware Support
 
@@ -66,7 +68,7 @@ pio device monitor -b 115200
 ├── src/
 │   ├── main.cpp              # Main application entry point
 │   ├── ui_tft.cpp            # Core UI framework (TFT_eSPI)
-│   ├── ui_dashboard_tft.cpp  # Dashboard screen
+│   ├── ui_dashboard_tft.cpp  # Dashboard screen (throughput, CPU, relay stats)
 │   ├── ui_wifi_tft.cpp       # WiFi configuration screen
 │   ├── ui_enroll_tft.cpp     # Enrollment screen
 │   └── old_lvgl/             # Backup of previous LVGL implementation
@@ -74,7 +76,19 @@ pio device monitor -b 115200
 │   └── User_Setup.h          # TFT_eSPI hardware configuration
 ├── platformio.ini            # Build configuration
 ├── partitions.csv            # Flash partitions
-└── MIGRATION.md              # Memory optimization documentation
+└── MIGRATION.md              # Migration & optimization documentation
+```
+
+### NoPorts Library (../../lib/NoPorts/)
+
+```
+├── src/
+│   ├── noports_daemon.cpp    # NPT request handling, auth, relay orchestration
+│   ├── noports_relay.cpp     # TCP relay engine (single + multi-session)
+│   └── noports/
+│       ├── noports_daemon.h  # Daemon class, NOPORTS_MAX_RELAYS=4
+│       ├── noports_relay.h   # Relay struct, config, sub-connection types
+│       └── noports_config.h  # Timeout and buffer configuration
 ```
 
 ## Configuration
@@ -160,12 +174,41 @@ Colors are defined in `ui_tft.h`:
 
 Convert colors using: `RGB565 = (R >> 3) << 11 | (G >> 2) << 5 | (B >> 3)`
 
+## Relay Architecture
+
+### Multi-Session Relay
+
+The ESP32 NoPorts relay supports multiple concurrent TCP sessions per NPT connection,
+matching the Dart sshnpd `multi: true` protocol:
+
+1. **Control Channel** - Single encrypted connection to the SRVD relay server
+2. **Sub-Connections** - Each `connect:` message from the control channel spawns a new
+   SRVD data connection + local service connection pair
+3. **Per-Session Keys** - Each sub-connection gets independent AES-CTR encryption keys
+   derived from the `connect:` message payload
+4. **Concurrent Bridging** - All active sub-connections are polled and bridged in parallel
+
+```
+Client ──► SRVD ◄── Control Channel ──► ESP32
+             │                            │
+             ├── Sub 0: SRVD ◄──────────► local:22
+             ├── Sub 1: SRVD ◄──────────► local:22
+             ├── Sub 2: SRVD ◄──────────► local:22
+             └── Sub 3: SRVD ◄──────────► local:22
+```
+
+**Limits**: `MAX_RELAY_SUBS = 4` concurrent sessions per NPT connection,
+`NOPORTS_MAX_RELAYS = 4` concurrent NPT connections. Constrained by ESP32 lwIP
+TCP PCB limit (default 10 sockets).
+
 ## Performance
 
-- **Frame Rate**: 60 FPS (16ms rendering)
+- **Frame Rate**: 60 FPS (flicker-free partial updates)
 - **Touch Latency**: <50ms
-- **Memory Footprint**: ~26 KB (GUI + stack)
-- **Flash Usage**: ~1.2 MB
+- **RAM Usage**: ~17% (56 KB / 328 KB)
+- **Flash Usage**: ~36% (901 KB / 2.5 MB)
+- **Relay Throughput**: Real-time bps display with color-coded RX (cyan) / TX (green)
+- **CPU Monitoring**: Per-core usage displayed on dashboard
 
 ## License
 
@@ -177,6 +220,6 @@ For issues specific to the CYD package, please open an issue on GitHub.
 
 ---
 
-**Last Updated**: February 2026  
-**Tested Platform**: ESP32-2432S028R (CYD)  
+**Last Updated**: July 2025  
+**Tested Platform**: ESP32-2432S028R (CYD), ESP32-2432S028Rv2 (CYD2USB)  
 **Framework**: TFT_eSPI (memory-optimized)
