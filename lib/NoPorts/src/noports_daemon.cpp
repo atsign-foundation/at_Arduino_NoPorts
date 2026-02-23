@@ -445,10 +445,11 @@ uint8_t NoPortsDaemon::getActiveRelayCount() const {
   uint8_t count = 0;
   for (int i = 0; i < NOPORTS_MAX_RELAYS; i++) {
     if (noports_relay_is_running(&_relays[i])) {
-      if (_relays[i].config.multi && _relays[i].active_sessions > 0) {
+      if (_relays[i].config.multi) {
+        // Multi relay: count only active data sub-connections
         count += _relays[i].active_sessions;
       } else {
-        count++;  // single-mode relay or multi with no subs yet
+        count++;  // single-mode relay
       }
     }
   }
@@ -461,6 +462,10 @@ const char* NoPortsDaemon::getLastError() const {
 
 uint8_t NoPortsDaemon::getReconnectFailures() const {
   return _reconnect_failures;
+}
+
+int NoPortsDaemon::getRelayPcbCount() const {
+  return noports_relay_get_pcb_count();
 }
 
 void NoPortsDaemon::getThroughput(uint32_t &bytes_in, uint32_t &bytes_out) const {

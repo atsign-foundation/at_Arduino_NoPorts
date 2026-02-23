@@ -122,4 +122,9 @@ void noports_relay_stop(NoPortsRelay *relay);
  */
 bool noports_relay_is_running(const NoPortsRelay *relay);
 
+/**
+ * @brief Get current number of relay TCP sockets in use
+ */
+int noports_relay_get_pcb_count();
+
 #endif // NOPORTS_RELAY_H

@@ -38,6 +38,7 @@
 static uint32_t _boot_ms = 0;
 static int _active_relays = 0;
 static uint32_t _total_tunnels = 0;
+static int _relay_tcp_count = 0;
 static uint32_t _total_pings = 0;
 static char _daemon_state[32] = "init";
 static uint8_t _cpu_pct = 0;
@@ -168,10 +169,11 @@ static void _draw_stats_row2() {
   // Card background drawn once in ui_dashboard_create() — clear only text zones
   char buf[40];
   
-  // --- Tunnels (left zone) ---
+  // --- TCP socket count (left zone) ---
   tft.fillRect(HEADER_PADDING + 4, y + 2, 105, 18, COLOR_BG_CARD);
-  snprintf(buf, sizeof(buf), "Tunnels: %lu", (unsigned long)_total_tunnels);
-  tft.setTextColor(COLOR_ACCENT, COLOR_BG_CARD);
+  snprintf(buf, sizeof(buf), "TCP: %d/13", _relay_tcp_count);
+  uint16_t tcp_color = _relay_tcp_count > 10 ? COLOR_ERROR : (_relay_tcp_count > 6 ? COLOR_ACCENT : COLOR_SUCCESS);
+  tft.setTextColor(tcp_color, COLOR_BG_CARD);
   tft.setTextDatum(ML_DATUM);
   tft.setTextSize(1);
   tft.drawString(buf, HEADER_PADDING + 8, y + 11, 2);
@@ -439,7 +441,7 @@ void ui_dashboard_create(void (*on_reset)(), void (*on_settings)(), void (*on_wi
 void ui_dashboard_update(int active_relays, const char *daemon_state,
                          uint32_t total_tunnels, uint32_t total_pings,
                          uint32_t bytes_in, uint32_t bytes_out,
-                         uint8_t cpu_pct) {
+                         uint8_t cpu_pct, int relay_tcp_count) {
   _cpu_pct = cpu_pct;
   // Update state (only redraw if changed)
   bool stats_changed = false;
@@ -458,6 +460,11 @@ void ui_dashboard_update(int active_relays, const char *daemon_state,
   if (_total_tunnels != total_tunnels || _total_pings != total_pings) {
     _total_tunnels = total_tunnels;
     _total_pings = total_pings;
+    stats_changed = true;
+  }
+
+  if (_relay_tcp_count != relay_tcp_count) {
+    _relay_tcp_count = relay_tcp_count;
     stats_changed = true;
   }
 

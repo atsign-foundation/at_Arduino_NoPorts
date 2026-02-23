@@ -1040,7 +1040,8 @@ void loop() {
           ui_dashboard_update(npDaemon.getActiveRelayCount(),
                             daemon_state_str(npDaemon.getState()),
                             _total_tunnels, _total_pings,
-                            tp_in, tp_out, _cpu_pct);
+                            tp_in, tp_out, _cpu_pct,
+                            npDaemon.getRelayPcbCount());
         }
       }
       break;

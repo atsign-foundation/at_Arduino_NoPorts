@@ -112,6 +112,11 @@ public:
    */
   uint8_t getReconnectFailures() const;
 
+  /**
+   * @brief Get current number of relay TCP sockets in use
+   */
+  int getRelayPcbCount() const;
+
 private:
   // Daemon state
   NoPortsDaemonState _state;
