@@ -13,28 +13,28 @@
  */
 
 #include "noports/noports_relay.h"
+#include "noports/noports_config.h"
 #include "noports/noports_log.h"
 #include <WiFiClient.h>
 #include <mbedtls/aes.h>
 #include <mbedtls/base64.h>
 #include <lwip/sockets.h>   // recv, MSG_PEEK, MSG_DONTWAIT
+#include <esp_heap_caps.h>  // heap_caps_get_largest_free_block()
 #include <errno.h>
 
 #define TAG "noports_relay"
 
-// Buffer size for relay forwarding
-// 4 KB lets us read multiple full TCP segments per iteration (MSS ~1436).
-// Both buf and crypt_buf are heap-allocated so this doesn't affect stack.
-// Smaller = more heap for TLS reconnects under load (each saves 2×delta).
-#define RELAY_BUF_SIZE 4096
+// Buffer size for relay forwarding and for heap-allocated ctrl buffers.
+// 2 KB handles 1+ full TCP MSS (1436B) per read with room to spare.
+// Reducing from 4096: saves 2×1KB = 2KB in the shared buf+crypt_buf mallocs
+// without any throughput loss (we already only read RELAY_CHUNK_SIZE per call).
+#define RELAY_BUF_SIZE 2048
 // Max bytes read per sub per direction per main-loop iteration.
-// Both rvd→local and local→rvd now use a single non-blocking write() with
-// a pending buffer — any bytes not immediately accepted are stored and
-// flushed next iteration.  There is no _write_all spin anywhere in the hot
-// path, so a full TCP send buffer on one sub never stalls another.
-// This means chunk size only affects throughput, not latency fairness:
-// larger = fewer loop iterations per MB, better throughput.
+// Also the size of the embedded pending_rvd/pending_local buffers inside
+// RelaySub — reducing this is the biggest heap win since the pending bufs
+// are part of the subs[] calloc (4 × 2 × this = total embedded buffer cost).
 // 1460 = TCP MSS — one full segment per read(), optimal for bulk transfers.
+// Keep at 1460: reducing to 512 causes noticeable SSH slowdown.
 #define RELAY_CHUNK_SIZE 1460
 
 // Buffer size for early data captured during Phase 2 polling.
@@ -89,19 +89,34 @@
 // Incremented on every successful connect(), decremented on every stop().
 static volatile int _relay_pcb_count = 0;
 
-// Minimum free heap required before opening a new sub-connection.
-// lwIP allocates pbufs for each sub's TX/RX windows (TCP_SND_BUF +
-// TCP_WND = 2×5744 = ~11KB per sub).  With 4 concurrent subs that's
-// ~44KB of pbufs alone, plus TLS needs ~20KB for monitor/worker
-// reconnect.  Guard at 40KB to leave headroom for both.
-// Minimum free heap to open a new relay sub (2 TCP sockets + buffers ≈ 15KB).
-// The daemon's monitor/worker TLS reconnect needs ~42KB for mbedTLS handshake
-// buffers — but TLS reconnects only happen when the relay is IDLE (between
-// sessions), at which point heap returns to ~60KB as lwIP pbufs are freed.
-// During active data transfer, heap can dip to ~27KB (lwIP TX/RX bufs in
-// flight) — this is transient and does NOT affect TLS reconnect capability.
-// 30KB allows up to MAX_RELAY_SUBS concurrent subs while staying safe.
-#define MIN_HEAP_FOR_SUB 30000
+// Relay task CPU busyness tracking.
+// _relay_busy_iters counts loop iterations where data was actually relayed.
+// _relay_total_iters counts every iteration (busy + idle vTaskDelay).
+// Updated by the relay task; read from main task via noports_relay_get_cpu_pct().
+static volatile uint32_t _relay_busy_iters = 0;
+static volatile uint32_t _relay_total_iters = 0;
+static volatile uint32_t _relay_cpu_win_ms  = 0;  // millis() of current window start
+static volatile uint8_t  _relay_cpu_pct     = 0;  // last computed busyness (0-100)
+
+// Minimum free heap required before opening a new sub-connection (2 TCP sockets).
+//
+// Actual marginal cost of two WiFiClient::connect() calls:
+//   - WiFiClientSocketHandle (heap):  ~48 bytes × 2  = ~100 bytes
+//   - lwIP PCB structs:  come from the lwIP internal pool, NOT the heap
+//   - lwIP pbufs (TX_SND_BUF 5744 + TCP_WND 5744 per socket):  allocated
+//       LAZILY as data flows — zero heap cost at connect() time
+//   - RelaySub struct (embedded AES states + 2×1460 pending bufs ≈ 3.8 KB):
+//       already calloc'd as subs[] at session start — zero marginal cost
+// Total marginal heap cost at connect time: ~200 bytes.
+//
+// This guard is therefore NOT the right tool to protect against TLS heap
+// exhaustion — that is already handled by NOPORTS_TLS_MIN_CONTIGUOUS_HEAP.
+// This guard's only job: ensure the system isn't completely out of heap.
+// 12 KB covers the connect() overhead plus several KB of initial pbufs
+// and leaves plenty of margin.  The old 30 KB value exceeded the observed
+// ~27 KB free-heap floor under active data transfer, so it incorrectly
+// refused connections during normal SSH/HTTP use.
+#define MIN_HEAP_FOR_SUB 12000
 
 // AES-CTR encryption state
 struct aes_ctr_state {
@@ -443,24 +458,55 @@ static int _handle_connect_msg(NoPortsRelay *relay, RelaySub *subs,
   // This is free — those connections are already done.
   _reclaim_dead_subs(subs);
 
-  // PCB budget guard: refuse if opening 2 more sockets would exceed
-  // the relay pool.  This guarantees atServer PCBs are never stolen.
-  if (_relay_pcb_count + 2 > MAX_RELAY_PCBS) {
-    int victim = _find_evictable_sub(subs);
-    if (victim >= 0) {
-      unsigned long idle_ms = millis() - subs[victim].last_activity_ms;
-      NOPORTS_LOGW(TAG, "Sub[%d] evicted (idle %lums, PCBs %d/%d)",
-                   victim, idle_ms, _relay_pcb_count, MAX_RELAY_PCBS);
-      _close_relay_sub(&subs[victim], victim);
-    } else {
-      NOPORTS_LOGW(TAG, "Multi: PCBs %d/%d, all subs active — ignoring (back-pressure)",
-                   _relay_pcb_count, MAX_RELAY_PCBS);
-      return -2;
+  // PCB budget guard: refuse if opening 2 more sockets would exceed the relay
+  // pool, ensuring atServer (monitor/worker) PCBs are never starved.
+  //
+  // IMPORTANT: use the session-local socket count derived from the live subs[]
+  // state rather than the global _relay_pcb_count.  The global counter is
+  // shared across all concurrent relay sessions (up to NOPORTS_MAX_RELAYS=4)
+  // and can become inaccurate when sessions exit via error paths or when
+  // multiple sessions are running simultaneously.  Counting from subs[] is
+  // always correct for THIS session:
+  //   - ctrl socket:  always 1 (we hold it for the life of the multi loop)
+  //   - each active sub: 2  (rvd + local)
+  {
+    int session_pcbs = 1;  // ctrl socket
+    for (int i = 0; i < MAX_RELAY_SUBS; i++) {
+      if (subs[i].active) session_pcbs += 2;
+    }
+    if (session_pcbs + 2 > MAX_RELAY_PCBS) {
+      int victim = _find_evictable_sub(subs);
+      if (victim >= 0) {
+        unsigned long idle_ms = millis() - subs[victim].last_activity_ms;
+        NOPORTS_LOGW(TAG, "Sub[%d] evicted (idle %lums, session_pcbs=%d/%d global=%d)",
+                     victim, idle_ms, session_pcbs, MAX_RELAY_PCBS, _relay_pcb_count);
+        _close_relay_sub(&subs[victim], victim);
+      } else {
+        NOPORTS_LOGW(TAG, "Multi: session_pcbs=%d/%d (global=%d), all subs active — back-pressure",
+                     session_pcbs, MAX_RELAY_PCBS, _relay_pcb_count);
+        return -2;
+      }
     }
   }
 
-  // Heap guard: protect atServer TLS connections.
-  // If heap is too low for a TLS handshake, try to free an idle sub.
+  // NOTE: No contiguous-heap guard here.
+  // Relay sub sockets are plain TCP — they do NOT perform a TLS handshake
+  // and need only ~200 bytes of heap at connect() time (WiFiClientSocketHandle).
+  // A contiguous-heap check using NOPORTS_TLS_MIN_CONTIGUOUS_HEAP (36 KB) is
+  // WRONG in this context: during active data transfer lwIP pbufs in-flight
+  // temporarily fragment DRAM, shrinking the largest contiguous block even
+  // when total free heap is >100 KB.  This causes false back-pressure that
+  // blocks the second SSH multiplexed connection mid-transfer.
+  // The correct place for the contiguous-heap guard is in _reconnectMonitor()
+  // and _reconnectWorker() (noports_daemon.cpp), where mbedTLS actually runs.
+  // Those reconnects only happen after the relay session ends and pbufs are
+  // freed — at which point the contiguous block naturally recovers.
+
+  // Total-heap guard: only backstop for genuine OOM (not fragmentation).
+  // Uses esp_get_free_heap_size() (total free, not largest contiguous block)
+  // so it is not fooled by transient pbuf fragmentation during data transfer.
+  // Only back-pressure when active subs exist — on a first connection with
+  // no subs there is nothing to evict and no reason to refuse.
   uint32_t heap = esp_get_free_heap_size();
   if (heap < MIN_HEAP_FOR_SUB) {
     int victim = _find_evictable_sub(subs);
@@ -470,9 +516,17 @@ static int _handle_connect_msg(NoPortsRelay *relay, RelaySub *subs,
                    millis() - subs[victim].last_activity_ms);
       _close_relay_sub(&subs[victim], victim);
     } else {
-      NOPORTS_LOGW(TAG, "Multi: heap %u < %u, all subs active — ignoring (back-pressure)",
+      int active_count = 0;
+      for (int i = 0; i < MAX_RELAY_SUBS; i++) {
+        if (subs[i].active) active_count++;
+      }
+      if (active_count > 0) {
+        NOPORTS_LOGW(TAG, "Multi: heap %u < %u, %d subs active — back-pressure",
+                     (unsigned)heap, MIN_HEAP_FOR_SUB, active_count);
+        return -2;
+      }
+      NOPORTS_LOGW(TAG, "Multi: heap %u < %u but no active subs — allowing",
                    (unsigned)heap, MIN_HEAP_FOR_SUB);
-      return -2;
     }
   }
 
@@ -1075,12 +1129,9 @@ static void _relay_task_inner(NoPortsRelay *relay) {
       break;
     }
 
-    // Yield policy: sleep 1 tick only when idle so the main loop (priority 1)
-    // gets CPU time.  When data is moving, loop tight — sub turns are bounded
-    // by RELAY_CHUNK_SIZE so no sub can monopolise the loop for long.
-    if (!activity) {
-      vTaskDelay(pdMS_TO_TICKS(1));
-    }
+    // Yield policy: always yield — see multi version for sliding-scale rationale.
+    // Single session always uses 1 ms (minimum delay).
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 
 cleanup:
@@ -1618,11 +1669,39 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
       break;
     }
 
-    // Yield policy: sleep 1 tick only when idle so the main loop (priority 1)
-    // gets CPU time.  When data is moving, loop tight — sub turns are bounded
-    // by RELAY_CHUNK_SIZE so no sub can monopolise the loop for long.
-    if (!activity) {
-      vTaskDelay(pdMS_TO_TICKS(1));
+    // Yield policy: sliding-scale delay keyed on active sub count.
+    // WiFi maxes out at ~2 Mbps regardless of how hard the relay loops.
+    // With N active subs each sub's fair share is 2Mbps/N, and the loop
+    // can deliver that at far lower rates than 1 iter/ms.  By setting
+    // delay = max(1, active_sessions) ms the TOTAL lwIP call rate stays
+    // roughly constant (~1000/s) no matter how many subs are active:
+    //   1 sub  → 1 ms → 1000 iter/s → ~1.46 MB/s (WiFi limited)
+    //   2 subs → 2 ms → 500 iter/s each → 1000 total
+    //   3 subs → 3 ms → 333 iter/s each → 1000 total
+    //   4 subs → 4 ms → 250 iter/s each → ~365 KB/s per sub, ~1.46 MB/s total
+    // This keeps tcpip_thread contention (Core 0) constant, prevents
+    // BEACON_TIMEOUT under load, and reduces heap oscillation amplitude.
+    {
+      int _delay_ms = relay->active_sessions > 1 ? relay->active_sessions : 1;
+      vTaskDelay(pdMS_TO_TICKS(_delay_ms));
+    }
+
+    // --- Relay CPU busyness tracking (1-second rolling window) ---
+    // busy = iterations that moved data; total = all iterations (incl. idle).
+    // Ratio gives a 0-100% indicator that reflects actual relay load.
+    _relay_total_iters++;
+    if (activity) _relay_busy_iters++;
+    {
+      uint32_t _now = millis();
+      if (_now - _relay_cpu_win_ms >= 1000) {
+        uint32_t t = _relay_total_iters;
+        uint8_t  p = (uint8_t)(t > 0 ? (_relay_busy_iters * 100u / t) : 0u);
+        if (p > 100) p = 100;
+        _relay_cpu_pct     = p;
+        _relay_busy_iters  = 0;
+        _relay_total_iters = 0;
+        _relay_cpu_win_ms  = _now;
+      }
     }
   }
 
@@ -1705,6 +1784,11 @@ cleanup:
 
   relay->state = RELAY_STOPPED;
   relay->task_handle = NULL;
+
+  // Reset CPU tracking so dashboard shows 0% after this session ends.
+  _relay_busy_iters  = 0;
+  _relay_total_iters = 0;
+  _relay_cpu_pct     = 0;
 }
 
 // FreeRTOS task entry point: calls inner function then deletes task.
@@ -1802,6 +1886,8 @@ void noports_relay_stop(NoPortsRelay *relay) {
 }
 
 int noports_relay_get_pcb_count() { return _relay_pcb_count; }
+
+uint8_t noports_relay_get_cpu_pct() { return _relay_cpu_pct; }
 
 bool noports_relay_is_running(const NoPortsRelay *relay) {
   if (!relay) return false;

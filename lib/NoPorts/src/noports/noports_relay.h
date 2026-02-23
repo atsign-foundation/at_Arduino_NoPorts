@@ -127,4 +127,12 @@ bool noports_relay_is_running(const NoPortsRelay *relay);
  */
 int noports_relay_get_pcb_count();
 
+/**
+ * @brief Get relay task CPU busyness (0-100%).
+ *        Measured as the ratio of data-moving iterations to total iterations
+ *        over a 1-second rolling window inside the relay FreeRTOS task.
+ *        Returns 0 when no relay session is active.
+ */
+uint8_t noports_relay_get_cpu_pct();
+
 #endif // NOPORTS_RELAY_H

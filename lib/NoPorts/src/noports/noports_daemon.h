@@ -117,6 +117,21 @@ public:
    */
   int getRelayPcbCount() const;
 
+  /**
+   * @brief Get relay task CPU busyness percentage (0-100).
+   *        Based on busy/idle iteration ratio over a 1-second window.
+   *        Returns 0 when no relay session is active.
+   */
+  uint8_t getRelayCpuPct() const;
+
+  /**
+   * @brief Set worker TLS keep-alive interval.
+   *        A heartbeat is sent on the worker connection every @p ms
+   *        milliseconds to prevent intermediate NAT/firewall tables
+   *        from expiring the session.  Set to 0 to disable.
+   */
+  void setWorkerKeepaliveMs(uint32_t ms);
+
 private:
   // Daemon state
   NoPortsDaemonState _state;
@@ -150,7 +165,12 @@ private:
 
   // Timeout tracking
   uint32_t _timeout_counter;
-  uint8_t  _reconnect_failures;   // consecutive TLS connection failures (monitor + worker)
+  uint8_t  _reconnect_failures;    // consecutive TLS connection failures (monitor + worker)
+  uint8_t  _monitor_fail_streak;   // consecutive monitor-read failures; used to detect dead monitor socket
+
+  // Worker TLS keep-alive
+  uint32_t _worker_keepalive_ms;  // 0 = disabled; heartbeat interval in ms
+  uint32_t _worker_last_used_ms;  // millis() of last worker activity
 
   // Internal methods (mirror the C sshnpd functions)
   void _freeResources();  // free all allocated SDK objects

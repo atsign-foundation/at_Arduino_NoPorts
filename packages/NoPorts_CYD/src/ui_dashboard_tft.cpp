@@ -45,6 +45,7 @@ static uint8_t _cpu_pct = 0;
 static void (*_on_reset_cb)() = nullptr;
 static void (*_on_settings_cb)() = nullptr;
 static void (*_on_wifi_cb)() = nullptr;
+static void (*_on_config_cb)() = nullptr;
 
 // Log entries (ring buffer)
 struct LogEntry {
@@ -67,18 +68,21 @@ static uint32_t _prev_bytes_out = 0;
 static String _atsign;
 static String _device;
 
-// Bottom row button layout — explicit pixel positions
-// LED(36) gap(4) WiFi(50) gap(4) Rules(50) ---- big gap ---- Reset(50)
+// Bottom row button layout — 6 uniform 49px buttons with 4px gaps
+// LED(49) gap(4) LCD(49) gap(4) WiFi(49) gap(4) Cfg(49) gap(4) Rules(49) gap(4) Reset(49)
+// Total: 6*49 + 5*4 + 2*3(margins) = 294+20+6 = 320 ✓
 #define BTN_H         26
 #define BTN_Y         (TFT_HEIGHT - BTN_H - 2)
-#define LED_BTN_X2     3
-#define LED_BTN_W2     36
-#define WIFI_BTN_X    (LED_BTN_X2 + LED_BTN_W2 + 4)
-#define WIFI_BTN_W    50
-#define RULES_BTN_X   (WIFI_BTN_X + WIFI_BTN_W + 4)
-#define RULES_BTN_W   50
-#define RESET_BTN_X2  (TFT_WIDTH - 53)
-#define RESET_BTN_W2  50
+#define BTN_W         49
+#define BTN_GAP        4
+#define BTN_MARGIN     3
+// Button x positions
+#define LED_BTN_X     BTN_MARGIN
+#define LCD_BTN_X     (BTN_MARGIN + 1*(BTN_W + BTN_GAP))
+#define WIFI_BTN_X    (BTN_MARGIN + 2*(BTN_W + BTN_GAP))
+#define CFG_BTN_X     (BTN_MARGIN + 3*(BTN_W + BTN_GAP))
+#define RULES_BTN_X   (BTN_MARGIN + 4*(BTN_W + BTN_GAP))
+#define RESET_BTN_X   (BTN_MARGIN + 5*(BTN_W + BTN_GAP))
 
 // Confirm-reset state
 static bool _reset_confirming = false;
@@ -87,6 +91,12 @@ static uint32_t _reset_confirm_ms = 0;
 
 // LED toggle state
 static bool _led_enabled = true;
+
+// Screen-off (backlight off) state
+// When true, backlight is off, all TFT drawing is suppressed.
+// Any touch wakes the screen immediately.
+static bool _screen_off        = false;
+static bool _screen_wake_redraw = false;  // flag: do a full redraw on next update after wake
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -360,43 +370,59 @@ static void _draw_bottom_row() {
 
   // LED on/off toggle (left)
   uint16_t led_bg = _led_enabled ? COLOR_SUCCESS : COLOR_BG_CARD;
-  ui_draw_rounded_rect(LED_BTN_X2, BTN_Y, LED_BTN_W2, BTN_H, 4, led_bg);
+  ui_draw_rounded_rect(LED_BTN_X, BTN_Y, BTN_W, BTN_H, 4, led_bg);
   tft.setTextColor(_led_enabled ? 0x0000 : COLOR_TEXT_GREY);
   tft.setTextDatum(MC_DATUM);
   tft.setTextSize(1);
-  tft.drawString("LED", LED_BTN_X2 + LED_BTN_W2 / 2, BTN_Y + BTN_H / 2, 2);
+  tft.drawString("LED", LED_BTN_X + BTN_W / 2, BTN_Y + BTN_H / 2, 2);
+
+  // LCD off button
+  ui_draw_rounded_rect(LCD_BTN_X, BTN_Y, BTN_W, BTN_H, 4, COLOR_BUTTON_BG);
+  tft.setTextColor(COLOR_TEXT_GREY);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("LCD", LCD_BTN_X + BTN_W / 2, BTN_Y + BTN_H / 2, 2);
 
   // WiFi button (blue)
-  ui_draw_rounded_rect(WIFI_BTN_X, BTN_Y, WIFI_BTN_W, BTN_H, 4, COLOR_ACCENT);
+  ui_draw_rounded_rect(WIFI_BTN_X, BTN_Y, BTN_W, BTN_H, 4, COLOR_ACCENT);
   tft.setTextColor(COLOR_TEXT_WHITE);
   tft.setTextDatum(MC_DATUM);
-  tft.drawString("WiFi", WIFI_BTN_X + WIFI_BTN_W / 2, BTN_Y + BTN_H / 2, 2);
+  tft.drawString("WiFi", WIFI_BTN_X + BTN_W / 2, BTN_Y + BTN_H / 2, 2);
+
+  // Settings/Config button
+  ui_draw_rounded_rect(CFG_BTN_X, BTN_Y, BTN_W, BTN_H, 4, COLOR_BUTTON_BG);
+  tft.setTextColor(COLOR_TEXT_WHITE);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("Stngs", CFG_BTN_X + BTN_W / 2, BTN_Y + BTN_H / 2, 2);
 
   // Rules button
-  ui_draw_rounded_rect(RULES_BTN_X, BTN_Y, RULES_BTN_W, BTN_H, 4, COLOR_BUTTON_BG);
+  ui_draw_rounded_rect(RULES_BTN_X, BTN_Y, BTN_W, BTN_H, 4, COLOR_BUTTON_BG);
   tft.setTextColor(COLOR_TEXT_WHITE);
   tft.setTextDatum(MC_DATUM);
-  tft.drawString("Rules", RULES_BTN_X + RULES_BTN_W / 2, BTN_Y + BTN_H / 2, 2);
+  tft.drawString("Rules", RULES_BTN_X + BTN_W / 2, BTN_Y + BTN_H / 2, 2);
 
   // Reset button (far right, dark red — bright red when confirming)
   uint16_t reset_color = _reset_confirming ? COLOR_ERROR : 0x8000;
-  ui_draw_rounded_rect(RESET_BTN_X2, BTN_Y, RESET_BTN_W2, BTN_H, 4, reset_color);
+  ui_draw_rounded_rect(RESET_BTN_X, BTN_Y, BTN_W, BTN_H, 4, reset_color);
   tft.setTextColor(COLOR_TEXT_WHITE);
   tft.setTextDatum(MC_DATUM);
   tft.drawString(_reset_confirming ? "Sure?" : "Reset",
-                 RESET_BTN_X2 + RESET_BTN_W2 / 2, BTN_Y + BTN_H / 2, 2);
+                 RESET_BTN_X + BTN_W / 2, BTN_Y + BTN_H / 2, 2);
 }
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-void ui_dashboard_create(void (*on_reset)(), void (*on_settings)(), void (*on_wifi)()) {
+void ui_dashboard_create(void (*on_reset)(), void (*on_settings)(), void (*on_wifi)(), void (*on_config)()) {
   _boot_ms = millis();
   _on_reset_cb = on_reset;
   _on_settings_cb = on_settings;
   _on_wifi_cb = on_wifi;
+  _on_config_cb = on_config;
   _reset_confirming = false;
+  _screen_off = false;
+  _screen_wake_redraw = false;
+  ui_set_backlight(true);  // ensure backlight is on when dashboard is created
   
   // Load atSign and device info
   _atsign = ui_load_string(NVS_KEY_ATSIGN);
@@ -442,6 +468,50 @@ void ui_dashboard_update(int active_relays, const char *daemon_state,
                          uint32_t total_tunnels, uint32_t total_pings,
                          uint32_t bytes_in, uint32_t bytes_out,
                          uint8_t cpu_pct, int relay_tcp_count) {
+  // — — — screen-off early exit — — —
+  // Still drain the event queue so log entries aren't lost, but skip
+  // all TFT writes to save SPI bandwidth / CPU while backlight is off.
+  if (_screen_off) {
+    UiEvent evt;
+    while (ui_event_pop(&evt)) {
+      uint16_t c = COLOR_TEXT_WHITE;
+      if (evt.type == UI_EVT_TUNNEL_OPEN)  c = COLOR_SUCCESS;
+      else if (evt.type == UI_EVT_TUNNEL_CLOSE) c = COLOR_TEXT_GREY;
+      else if (evt.type == UI_EVT_PING)    c = COLOR_ACCENT;
+      else if (evt.type == UI_EVT_ERROR)   c = COLOR_ERROR;
+      _add_log_entry(evt.text, c);
+    }
+    // LED updates still run (relay status LED should still reflect state)
+    if (_led_enabled) {
+      uint32_t delta_in  = bytes_in  - _prev_bytes_in;
+      uint32_t delta_out = bytes_out - _prev_bytes_out;
+      _prev_bytes_in  = bytes_in;
+      _prev_bytes_out = bytes_out;
+      if (delta_in + delta_out > 0)    ui_set_led(false, true, false);
+      else if (active_relays > 0)      ui_set_led(true, true, false);
+      else {
+        bool blink = ((millis() / 1000) % 2) == 0;
+        ui_set_led(false, blink, blink);
+      }
+    }
+    return;
+  }
+
+  // If just woken up, do a full redraw to clear stale content
+  if (_screen_wake_redraw) {
+    _screen_wake_redraw = false;
+    TFT_eSPI &tft = ui_get_tft();
+    tft.fillScreen(COLOR_BG_DARK);
+    _draw_header();
+    ui_draw_rounded_rect(HEADER_PADDING, STATS_ROW1_Y, TFT_WIDTH - 6, 22, 4, COLOR_BG_CARD);
+    ui_draw_rounded_rect(HEADER_PADDING, STATS_ROW2_Y, TFT_WIDTH - 6, 22, 4, COLOR_BG_CARD);
+    ui_draw_rounded_rect(HEADER_PADDING, LOG_TOP_Y,    TFT_WIDTH - 6, LOG_HEIGHT, 5, COLOR_BG_CARD);
+    ui_draw_rounded_rect(HEADER_PADDING, GRAPH_TOP_Y,  TFT_WIDTH - 6, GRAPH_HEIGHT, 5, COLOR_BG_CARD);
+    _draw_log();
+    _draw_graph();
+    _draw_bottom_row();
+  }
+
   _cpu_pct = cpu_pct;
   // Update state (only redraw if changed)
   bool stats_changed = false;
@@ -544,6 +614,15 @@ void ui_dashboard_update(int active_relays, const char *daemon_state,
 }
 
 bool ui_dashboard_handle_touch(int16_t tx, int16_t ty) {
+  // Wake screen if backlight is off — consume this touch, don't act on it
+  if (_screen_off) {
+    _screen_off = false;
+    _screen_wake_redraw = true;
+    ui_set_backlight(true);
+    Serial.println("[ui_dashboard] Screen woken by touch");
+    return true;
+  }
+
   // Extend touch targets upward by BTN_PAD so buttons at screen edge are easier to hit
   #define BTN_PAD 10
   int touch_top = BTN_Y - BTN_PAD;
@@ -551,7 +630,7 @@ bool ui_dashboard_handle_touch(int16_t tx, int16_t ty) {
   // Only process bottom row if touch is roughly in the button strip
   if (ty >= touch_top) {
     // Check LED toggle button
-    if (ui_touch_in_rect(tx, ty, LED_BTN_X2, touch_top, LED_BTN_W2, BTN_H + BTN_PAD)) {
+    if (ui_touch_in_rect(tx, ty, LED_BTN_X, touch_top, BTN_W, BTN_H + BTN_PAD)) {
       _led_enabled = !_led_enabled;
       if (!_led_enabled) {
         ui_set_led(false, false, false);  // turn off immediately
@@ -561,8 +640,16 @@ bool ui_dashboard_handle_touch(int16_t tx, int16_t ty) {
       return true;
     }
 
+    // Check LCD off button
+    if (ui_touch_in_rect(tx, ty, LCD_BTN_X, touch_top, BTN_W, BTN_H + BTN_PAD)) {
+      Serial.println("[ui_dashboard] LCD off");
+      _screen_off = true;
+      ui_set_backlight(false);
+      return true;
+    }
+
     // Check WiFi button
-    if (ui_touch_in_rect(tx, ty, WIFI_BTN_X, touch_top, WIFI_BTN_W, BTN_H + BTN_PAD)) {
+    if (ui_touch_in_rect(tx, ty, WIFI_BTN_X, touch_top, BTN_W, BTN_H + BTN_PAD)) {
       Serial.println("[ui_dashboard] WiFi pressed");
       if (_on_wifi_cb) {
         _on_wifi_cb();
@@ -570,8 +657,17 @@ bool ui_dashboard_handle_touch(int16_t tx, int16_t ty) {
       return true;
     }
 
+    // Check Settings/Config button
+    if (ui_touch_in_rect(tx, ty, CFG_BTN_X, touch_top, BTN_W, BTN_H + BTN_PAD)) {
+      Serial.println("[ui_dashboard] Config pressed");
+      if (_on_config_cb) {
+        _on_config_cb();
+      }
+      return true;
+    }
+
     // Check Rules button
-    if (ui_touch_in_rect(tx, ty, RULES_BTN_X, touch_top, RULES_BTN_W, BTN_H + BTN_PAD)) {
+    if (ui_touch_in_rect(tx, ty, RULES_BTN_X, touch_top, BTN_W, BTN_H + BTN_PAD)) {
       Serial.println("[ui_dashboard] Rules pressed");
       if (_on_settings_cb) {
         _on_settings_cb();
@@ -580,7 +676,7 @@ bool ui_dashboard_handle_touch(int16_t tx, int16_t ty) {
     }
 
     // Check Reset button
-    if (ui_touch_in_rect(tx, ty, RESET_BTN_X2, touch_top, RESET_BTN_W2, BTN_H + BTN_PAD)) {
+    if (ui_touch_in_rect(tx, ty, RESET_BTN_X, touch_top, BTN_W, BTN_H + BTN_PAD)) {
       if (_reset_confirming) {
         Serial.println("[ui_dashboard] Reset confirmed!");
         if (_on_reset_cb) {

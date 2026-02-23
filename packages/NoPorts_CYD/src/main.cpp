@@ -28,6 +28,7 @@ extern "C" {
 #include "ui_enroll_tft.h"
 #include "ui_dashboard_tft.h"
 #include "ui_settings_tft.h"
+#include "ui_config_tft.h"
 
 // ---------------------------------------------------------------------------
 // Globals
@@ -46,6 +47,7 @@ enum AppScreen {
   SCREEN_ENROLL,
   SCREEN_DASHBOARD,
   SCREEN_SETTINGS,
+  SCREEN_CONFIG,
   SCREEN_AUTH
 };
 
@@ -125,7 +127,9 @@ static void on_ping(const char *from_atsign) {
 static void _do_reset();
 static void _show_settings();
 static void _show_wifi();
+static void _show_config();
 static void _on_settings_saved();
+static void _on_config_saved();
 
 // Check if managers and permitopen rules are configured
 static bool _rules_valid() {
@@ -504,7 +508,7 @@ static void _auth_loop() {
     if (start_daemon()) {
       Serial.printf("[auth] PKAM succeeded on attempt %d\n", _auth_attempt);
       current_screen = SCREEN_DASHBOARD;
-      ui_dashboard_create(_do_reset, _show_settings, _show_wifi);
+      ui_dashboard_create(_do_reset, _show_settings, _show_wifi, _show_config);
 
       if (_auth_attempt > 1) {
         char evt_buf[EVENT_TEXT_LEN];
@@ -551,7 +555,7 @@ static bool _auth_handle_touch(int16_t tx, int16_t ty) {
 static void _on_enrolled() {
   if (start_daemon()) {
     current_screen = SCREEN_DASHBOARD;
-    ui_dashboard_create(_do_reset, _show_settings, _show_wifi);
+    ui_dashboard_create(_do_reset, _show_settings, _show_wifi, _show_config);
   } else {
     _enter_auth_screen();
   }
@@ -635,7 +639,7 @@ static void _on_wifi_reconnected() {
       if (start_daemon()) { started = true; break; }
     }
     current_screen = SCREEN_DASHBOARD;
-    ui_dashboard_create(_do_reset, _show_settings, _show_wifi);
+    ui_dashboard_create(_do_reset, _show_settings, _show_wifi, _show_config);
     if (!started) {
       // Log the failure on the dashboard in RED
       ui_event_push(UI_EVT_ERROR, "PKAM auth failed after reconnect");
@@ -643,7 +647,7 @@ static void _on_wifi_reconnected() {
     }
   } else {
     current_screen = SCREEN_DASHBOARD;
-    ui_dashboard_create(_do_reset, _show_settings, _show_wifi);
+    ui_dashboard_create(_do_reset, _show_settings, _show_wifi, _show_config);
   }
 }
 
@@ -681,7 +685,7 @@ static void _on_settings_saved() {
   }
 
   current_screen = SCREEN_DASHBOARD;
-  ui_dashboard_create(_do_reset, _show_settings, _show_wifi);
+  ui_dashboard_create(_do_reset, _show_settings, _show_wifi, _show_config);
   if (!started) {
     // Log the failure on the dashboard in RED
     ui_event_push(UI_EVT_ERROR, "PKAM auth failed after settings save");
@@ -693,6 +697,27 @@ static void _on_settings_saved() {
 static void _show_settings() {
   current_screen = SCREEN_SETTINGS;
   ui_settings_create(_on_settings_saved);
+}
+
+// Show config screen (called from dashboard's Settings/Config button)
+static void _on_config_saved() {
+  // Apply new keepalive value to the running daemon — no restart needed
+  if (daemon_running) {
+    String ka = ui_load_string(NVS_KEY_WORKER_KEEPALIVE);
+    uint32_t ka_ms = (ka.length() > 0 && ka.toInt() > 0)
+                     ? (uint32_t)ka.toInt() * 60000UL
+                     : 0;
+    npDaemon.setWorkerKeepaliveMs(ka_ms);
+    Serial.printf("[main] Worker keepalive updated: %u ms\n", ka_ms);
+  }
+  // Return to dashboard
+  current_screen = SCREEN_DASHBOARD;
+  ui_dashboard_create(_do_reset, _show_settings, _show_wifi, _show_config);
+}
+
+static void _show_config() {
+  current_screen = SCREEN_CONFIG;
+  ui_config_create(_on_config_saved);
 }
 
 // Show WiFi setup screen (called from dashboard)
@@ -988,7 +1013,11 @@ void loop() {
       case SCREEN_SETTINGS:
         ui_settings_handle_touch(tx, ty);
         break;
-        
+
+      case SCREEN_CONFIG:
+        ui_config_handle_touch(tx, ty);
+        break;
+
       case SCREEN_AUTH:
         _auth_handle_touch(tx, ty);
         break;
@@ -1017,7 +1046,11 @@ void loop() {
     case SCREEN_SETTINGS:
       ui_settings_update();
       break;
-      
+
+    case SCREEN_CONFIG:
+      ui_config_update();
+      break;
+
     case SCREEN_AUTH:
       _auth_loop();
       break;

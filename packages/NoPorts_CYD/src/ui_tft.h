@@ -83,6 +83,7 @@ struct UiEvent {
 #define NVS_KEY_CONFIGURED "configured"
 #define NVS_KEY_MANAGERS  "managers"   // comma-separated atSign list e.g. "@colin,@cconstab"
 #define NVS_KEY_PERMITOPEN "permitopen" // comma-separated host:port rules e.g. "localhost:22,localhost:80"
+#define NVS_KEY_WORKER_KEEPALIVE "worker_ka"  // worker TLS keepalive interval in minutes (0=off)
 
 #define PERMITOPEN_PATH   "/permitopen.json"
 #define ATKEYS_PATH       "/atkeys.json"           // Arduino LittleFS API (auto-prepends /littlefs)
@@ -183,6 +184,11 @@ void ui_draw_textfield(const TextField &field);
  * @brief Draw centered text
  */
 void ui_draw_text_centered(const char *text, int16_t y, uint16_t color, uint8_t font_size = 2);
+
+/**
+ * @brief Control TFT backlight on/off (GPIO 21 on CYD)
+ */
+void ui_set_backlight(bool on);
 
 /**
  * @brief Set RGB LED color (active low hardware)

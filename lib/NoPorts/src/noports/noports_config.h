@@ -35,6 +35,39 @@
 // blocks for TLS even with sufficient total free heap.
 #define NOPORTS_MAX_RECONNECT_FAILURES 10
 
+// Minimum TOTAL free heap before attempting a TLS reconnect.
+// mbedTLS makes many small-to-medium allocations rather than one huge
+// contiguous block, so total free is the right wait metric.
+// Observed on CYD (ESP32, no PSRAM):
+//   TLS SUCCEEDS: total=46 KB, largest_contiguous=11 KB (fragmented post-relay)
+//   TLS FAILS:    total=9 KB  (heap genuinely exhausted mid-relay)
+// 30 KB is a comfortable margin above the ~20-25 KB mbedTLS peak usage.
+//
+// Also used as the OOM guard in daemon.loop(): if heap < this threshold we
+// skip calling atclient_monitor_read() to avoid 'Failed to allocate read
+// buffer' spam.  The SDK allocates READ_BUF_SIZE=4096 bytes on every read.
+// With 4 active SSH sessions the relay task transiently allocates ~10-14 KB
+// of pbufs between our check and the SDK malloc, so we need >4+14=18 KB of
+// margin.  40 KB gives ~22 KB of headroom, preventing the race.
+#define NOPORTS_TLS_MIN_FREE_HEAP        40000   // min total free heap for TLS reconnect
+
+// Largest-contiguous block required before attempting TLS while relay subs
+// are active (pcbs > 1).  With active subs, pbufs fragment DRAM even when
+// total free is >60 KB, so this condition gates the wait loop.
+// Observed on CYD (ESP32):
+//   TLS SUCCEEDS: largest=22516 (3 active subs, total=39 KB)
+//   TLS SUCCEEDS: largest=11252 (0 subs, post-drain)
+//   TLS FAILS:    largest=1396  (total=9 KB — genuine heap exhaustion)
+// 20 KB gives ~2.5 KB margin below the observed minimum success value.
+#define NOPORTS_TLS_MIN_CONTIGUOUS_HEAP  20000
+
+// Default worker keep-alive interval (ms).  The worker TLS connection is
+// periodically exercised with a heartbeat so that intermediate NAT/firewall
+// tables don't silently expire the TCP session between tunnel uses.
+// 4 minutes is below most residential NAT timeouts (typically 5-30 min).
+// Set to 0 to disable.  Overridden at runtime via setWorkerKeepaliveMs().
+#define NOPORTS_WORKER_KEEPALIVE_MS  240000UL
+
 // Maximum number of permitopen entries
 #define NOPORTS_MAX_PERMITOPEN 255
 

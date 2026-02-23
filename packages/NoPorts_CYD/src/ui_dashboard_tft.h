@@ -13,8 +13,10 @@
  * @param on_reset Callback when user presses the Reset button
  * @param on_settings Callback when user presses the Rules button
  * @param on_wifi Callback when user presses the WiFi button
+ * @param on_config Callback when user presses the Settings/Config button
  */
-void ui_dashboard_create(void (*on_reset)() = nullptr, void (*on_settings)() = nullptr, void (*on_wifi)() = nullptr);
+void ui_dashboard_create(void (*on_reset)() = nullptr, void (*on_settings)() = nullptr,
+                          void (*on_wifi)() = nullptr, void (*on_config)() = nullptr);
 
 /**
  * @brief Update dashboard with current status

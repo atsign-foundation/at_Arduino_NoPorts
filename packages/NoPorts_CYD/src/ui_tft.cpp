@@ -363,6 +363,10 @@ void ui_draw_text_centered(const char *text, int16_t y, uint16_t color, uint8_t 
 // LED control
 // ---------------------------------------------------------------------------
 
+void ui_set_backlight(bool on) {
+  digitalWrite(21, on ? HIGH : LOW);
+}
+
 void ui_set_led(bool r, bool g, bool b) {
   // CYD RGB LED is active LOW
   digitalWrite(LED_R, !r);

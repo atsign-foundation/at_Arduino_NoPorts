@@ -78,7 +78,10 @@ NoPortsDaemon::NoPortsDaemon()
   , _root_port(0)
   , _relay_count(0)
   , _timeout_counter(0)
-  , _reconnect_failures(0) {
+  , _reconnect_failures(0)
+  , _monitor_fail_streak(0)
+  , _worker_keepalive_ms(NOPORTS_WORKER_KEEPALIVE_MS)
+  , _worker_last_used_ms(0) {
   memset(_last_error, 0, sizeof(_last_error));
   memset(_root_host, 0, sizeof(_root_host));
   // Don't memset _relays — it contains WiFiClient C++ objects whose
@@ -325,6 +328,7 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
 
   _should_run = true;
   _state = DAEMON_MONITORING;
+  _worker_last_used_ms = millis();  // start keepalive timer from now
   NOPORTS_LOGI(TAG, "NoPorts daemon started for %s (device: %s)",
                _config.atsign, _config.device_name);
 
@@ -337,12 +341,28 @@ void NoPortsDaemon::loop() {
   // Clean up finished relays
   _cleanupFinishedRelays();
 
+  // Worker TLS keep-alive: send a heartbeat if the worker connection has
+  // been idle for longer than the configured interval.  This prevents NAT/
+  // firewall tables from expiring the session between tunnel requests.
+  atclient *worker = (atclient *)_worker_ctx;
+  if (_worker_keepalive_ms > 0 &&
+      (millis() - _worker_last_used_ms) >= _worker_keepalive_ms) {
+    int hb = atclient_send_heartbeat(worker);
+    if (hb != 0) {
+      NOPORTS_LOGW(TAG, "Worker heartbeat failed (%d) — reconnecting worker", hb);
+      _reconnectWorker();
+    } else {
+      NOPORTS_LOGD(TAG, "Worker heartbeat OK (ka=%lums)", _worker_keepalive_ms);
+    }
+    _worker_last_used_ms = millis();
+  }
+
   // Read next monitor message
   atclient_monitor_message message;
   atclient_monitor_message_init(&message);
 
   atclient *monitor = (atclient *)_monitor_ctx;
-  atclient *worker  = (atclient *)_worker_ctx;
+  // (worker declared above for keepalive check)
 
   // Check if we need to reconnect
   if (_timeout_counter * NOPORTS_MONITOR_READ_TIMEOUT_MS > NOPORTS_MONITOR_NOOP_TIMEOUT_MS) {
@@ -356,16 +376,66 @@ void NoPortsDaemon::loop() {
 
   int ret = atclient_monitor_read(monitor, worker, &message, NULL);
   if (ret != 0) {
-    // The monitor uses the worker to fetch shared encryption keys for
-    // decrypting notifications. If the worker's TLS connection dropped
-    // (common while a relay is active), decrypt fails and we get ret=-1.
-    // Try reconnecting the worker first — it's cheaper than a full
-    // monitor reconnect and usually fixes the issue.
-    NOPORTS_LOGW(TAG, "Monitor read failed (ret: %d), reconnecting worker first", ret);
+    // atclient_monitor_read sets message.type even on error — dispatch on it
+    // so we don't needlessly kill a healthy worker TLS connection.
+    if (message.type == ATCLIENT_MONITOR_ERROR_PARSE_NOTIFICATION) {
+      // Malformed server message (e.g. statsNotification without trailing \n).
+      // The worker is uninvolved — dont't touch it.
+      NOPORTS_LOGD(TAG, "Monitor: ignoring unparseable server message (type=%d)", message.type);
+      _timeout_counter++;   // count the same as an empty/noop
+      atclient_monitor_message_free(&message);
+      return;
+    }
+
+    if (message.type == ATCLIENT_MONITOR_ERROR_DECRYPT_NOTIFICATION) {
+      // Decrypt failed — the worker's shared-key cache may be stale.
+      // Reconnect the worker but leave the monitor stream intact.
+      NOPORTS_LOGW(TAG, "Monitor: decrypt failed, reconnecting worker");
+      _reconnectWorker();
+      atclient_monitor_message_free(&message);
+      return;
+    }
+
+    // ATCLIENT_MONITOR_ERROR_READ (or unknown): could be either:
+    //   (a) OOM: atclient_tls_socket_read couldn't malloc its receive buffer
+    //       because relay traffic exhausted the heap.  The TLS socket is fine.
+    //       Reconnecting the worker would waste ~30 s and achieve nothing.
+    //   (b) genuine TLS/network failure.  Worker reconnect is correct.
+    //
+    // Distinguish them by current heap: if total free is below the TLS
+    // threshold, the malloc failure is the likely cause — wait briefly and
+    // retry without touching the worker.  Only do the worker-reconnect dance
+    // when heap is adequate (implies a true connection drop).
+    if (esp_get_free_heap_size() < NOPORTS_TLS_MIN_FREE_HEAP) {
+      // Heap is depleted by relay traffic — the TLS socket is fine, the SDK's
+      // malloc for its read buffer just failed.  Log at DEBUG (not WARN) since
+      // this is expected under load and not actionable.  Delay 500 ms so we
+      // don't tight-loop and re-enter atclient_tls_socket_read hundreds of
+      // times per second (which also spams "atsdk_socket | Failed to allocate
+      // read buffer" from inside the SDK before we even get back here).
+      NOPORTS_LOGD(TAG, "Monitor read OOM (heap=%u, relay_pcbs=%d) — backing off",
+                   (unsigned)esp_get_free_heap_size(), noports_relay_get_pcb_count());
+      atclient_monitor_message_free(&message);
+      delay(500);
+      return;
+    }
+
+    // Heap is adequate — this is a genuine read/TLS failure.
+    _monitor_fail_streak++;
+    NOPORTS_LOGW(TAG, "Monitor read error (ret: %d, type: %d, streak: %u, heap: %u)",
+                 ret, (int)message.type, (unsigned)_monitor_fail_streak,
+                 (unsigned)esp_get_free_heap_size());
     if (_reconnectWorker()) {
-      NOPORTS_LOGI(TAG, "Worker reconnected, will retry monitor read");
-      // Don't bump timeout — let the next loop() iteration retry with
-      // the fresh worker connection.
+      if (_monitor_fail_streak >= 3) {
+        // Worker keeps reconnecting fine but monitor keeps failing —
+        // the monitor socket is dead (e.g. WiFi BEACON_TIMEOUT).
+        NOPORTS_LOGW(TAG, "Monitor fail streak %u — forcing full monitor reconnect",
+                     (unsigned)_monitor_fail_streak);
+        _timeout_counter = NOPORTS_MONITOR_NOOP_TIMEOUT_MS / NOPORTS_MONITOR_READ_TIMEOUT_MS + 1;
+        _monitor_fail_streak = 0;
+      } else {
+        NOPORTS_LOGI(TAG, "Worker reconnected, will retry monitor read");
+      }
     } else {
       NOPORTS_LOGW(TAG, "Worker reconnect also failed (TLS failures: %d/%d), will reconnect monitor",
                    _reconnect_failures, NOPORTS_MAX_RECONNECT_FAILURES);
@@ -374,6 +444,9 @@ void NoPortsDaemon::loop() {
     atclient_monitor_message_free(&message);
     return;
   }
+
+  // Monitor read succeeded — clear the fail streak
+  _monitor_fail_streak = 0;
 
   switch (message.type) {
     case ATCLIENT_MONITOR_MESSAGE_TYPE_EMPTY:
@@ -466,6 +539,17 @@ uint8_t NoPortsDaemon::getReconnectFailures() const {
 
 int NoPortsDaemon::getRelayPcbCount() const {
   return noports_relay_get_pcb_count();
+}
+
+uint8_t NoPortsDaemon::getRelayCpuPct() const {
+  return noports_relay_get_cpu_pct();
+}
+
+void NoPortsDaemon::setWorkerKeepaliveMs(uint32_t ms) {
+  _worker_keepalive_ms = ms;
+  // Reset last-used so the new interval starts from now.
+  _worker_last_used_ms = millis();
+  NOPORTS_LOGI(TAG, "Worker keep-alive set to %lu ms", (unsigned long)ms);
 }
 
 void NoPortsDaemon::getThroughput(uint32_t &bytes_in, uint32_t &bytes_out) const {
@@ -1387,6 +1471,45 @@ bool NoPortsDaemon::_reconnectMonitor() {
 
   NOPORTS_LOGI(TAG, "Reconnecting monitor...");
 
+  // Wait until the heap is suitable for a TLS handshake, up to 30 s.
+  //
+  // Two conditions must hold before mbedTLS can succeed:
+  //   (a) enough total free heap   — checked always
+  //   (b) a large enough contiguous block — ONLY checked while relay subs are
+  //       active (pcbs > 1).  Active relay sockets hold lwIP pbufs that
+  //       fragment DRAM; with 3 active subs the largest block is ~20 KB even
+  //       when total free is 80+ KB.  Once the relay drains (pcbs ≤ 1) the
+  //       pbufs are released and the heap consolidates, so (b) is moot.
+  //
+  // Observed on CYD (ESP32, no PSRAM):
+  //   TLS FAILS:    total=81 KB, largest=20 KB, pcbs=7  (relay active)
+  //   TLS SUCCEEDS: total=46 KB, largest=11 KB, pcbs=0  (relay just drained)
+  {
+    uint32_t ws = millis();
+    while ((millis() - ws) < 30000) {
+      uint32_t total   = esp_get_free_heap_size();
+      uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+      int      pcbs    = noports_relay_get_pcb_count();
+      bool heap_ok = (total >= NOPORTS_TLS_MIN_FREE_HEAP) &&
+                     (largest >= NOPORTS_TLS_MIN_CONTIGUOUS_HEAP || pcbs <= 1);
+      if (heap_ok) break;
+      NOPORTS_LOGW(TAG, "Monitor reconnect: waiting for heap (total=%u, largest=%u, relay_pcbs=%d)",
+                   total, largest, pcbs);
+      delay(200);
+    }
+    {
+      uint32_t total   = esp_get_free_heap_size();
+      uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+      int      pcbs    = noports_relay_get_pcb_count();
+      bool heap_ok = (total >= NOPORTS_TLS_MIN_FREE_HEAP) &&
+                     (largest >= NOPORTS_TLS_MIN_CONTIGUOUS_HEAP || pcbs <= 1);
+      if (!heap_ok) {
+        NOPORTS_LOGW(TAG, "Monitor reconnect: heap not ready after 30s (total=%u, largest=%u, relay_pcbs=%d) — proceeding anyway",
+                     total, largest, pcbs);
+      }
+    }
+  }
+
   atclient *monitor = (atclient *)_monitor_ctx;
   atclient_atkeys *keys = (atclient_atkeys *)_atkeys;
 
@@ -1422,6 +1545,33 @@ bool NoPortsDaemon::_reconnectMonitor() {
 bool NoPortsDaemon::_reconnectWorker() {
   NOPORTS_LOGI(TAG, "Reconnecting worker...");
 
+  // Wait until the heap is suitable for TLS (see monitor reconnect comment above).
+  {
+    uint32_t ws = millis();
+    while ((millis() - ws) < 30000) {
+      uint32_t total   = esp_get_free_heap_size();
+      uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+      int      pcbs    = noports_relay_get_pcb_count();
+      bool heap_ok = (total >= NOPORTS_TLS_MIN_FREE_HEAP) &&
+                     (largest >= NOPORTS_TLS_MIN_CONTIGUOUS_HEAP || pcbs <= 1);
+      if (heap_ok) break;
+      NOPORTS_LOGW(TAG, "Worker reconnect: waiting for heap (total=%u, largest=%u, relay_pcbs=%d)",
+                   total, largest, pcbs);
+      delay(200);
+    }
+    {
+      uint32_t total   = esp_get_free_heap_size();
+      uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+      int      pcbs    = noports_relay_get_pcb_count();
+      bool heap_ok = (total >= NOPORTS_TLS_MIN_FREE_HEAP) &&
+                     (largest >= NOPORTS_TLS_MIN_CONTIGUOUS_HEAP || pcbs <= 1);
+      if (!heap_ok) {
+        NOPORTS_LOGW(TAG, "Worker reconnect: heap not ready after 30s (total=%u, largest=%u, relay_pcbs=%d) — proceeding anyway",
+                     total, largest, pcbs);
+      }
+    }
+  }
+
   atclient *worker = (atclient *)_worker_ctx;
   atclient_atkeys *keys = (atclient_atkeys *)_atkeys;
 
@@ -1441,6 +1591,7 @@ bool NoPortsDaemon::_reconnectWorker() {
   }
 
   NOPORTS_LOGI(TAG, "Worker reconnected");
+  _worker_last_used_ms = millis();
   return true;
 }
 
@@ -1456,6 +1607,7 @@ int NoPortsDaemon::_notifyWithRetry(void *w, void *np, char **notification_id) {
       res = atclient_notify(worker, params, notification_id);
     }
   }
+  if (res == 0) _worker_last_used_ms = millis();
   return res;
 }
 
