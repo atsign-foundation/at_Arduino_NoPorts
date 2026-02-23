@@ -1129,9 +1129,8 @@ static void _relay_task_inner(NoPortsRelay *relay) {
       break;
     }
 
-    // Yield policy: always yield — see multi version for sliding-scale rationale.
-    // Single session always uses 1 ms (minimum delay).
-    vTaskDelay(pdMS_TO_TICKS(1));
+    // Yield policy: 5 ms — see multi version for rationale (1 sub = N×5 = 5ms).
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 
 cleanup:
@@ -1669,21 +1668,24 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
       break;
     }
 
-    // Yield policy: sliding-scale delay keyed on active sub count.
-    // WiFi maxes out at ~2 Mbps regardless of how hard the relay loops.
-    // With N active subs each sub's fair share is 2Mbps/N, and the loop
-    // can deliver that at far lower rates than 1 iter/ms.  By setting
-    // delay = max(1, active_sessions) ms the TOTAL lwIP call rate stays
-    // roughly constant (~1000/s) no matter how many subs are active:
-    //   1 sub  → 1 ms → 1000 iter/s → ~1.46 MB/s (WiFi limited)
-    //   2 subs → 2 ms → 500 iter/s each → 1000 total
-    //   3 subs → 3 ms → 333 iter/s each → 1000 total
-    //   4 subs → 4 ms → 250 iter/s each → ~365 KB/s per sub, ~1.46 MB/s total
-    // This keeps tcpip_thread contention (Core 0) constant, prevents
-    // BEACON_TIMEOUT under load, and reduces heap oscillation amplitude.
+    // Yield policy: linear delay scaled to WiFi capacity.
+    // WiFi max = ~2 Mbps = 250 KB/s total across all subs.
+    // Each iteration can move up to RELAY_CHUNK_SIZE (1460) bytes per sub.
+    // To avoid looping faster than WiFi can consume data (which just wastes
+    // Core 0 tcpip_thread lock acquisitions and causes BEACON_TIMEOUT):
+    //   delay_ms ≈ N × 1460 / 250000 × 1000 = N × 5.84 ms
+    // Rounded to N×5 for simplicity:
+    //   1 sub  →  5 ms → 200 iter/s → ~292 KB/s (WiFi caps it)
+    //   2 subs → 10 ms → 100 iter/s each → ~292 KB/s total
+    //   3 subs → 15 ms →  67 iter/s each → ~292 KB/s total
+    //   4 subs → 20 ms →  50 iter/s each → ~292 KB/s total
+    // Each case stays at or below 2 Mbps WiFi ceiling.  The daemon loop
+    // (priority 1) and WiFi beacon processing (Core 0 tcpip_thread) both
+    // get adequate CPU time at these rates.
     {
-      int _delay_ms = relay->active_sessions > 1 ? relay->active_sessions : 1;
-      vTaskDelay(pdMS_TO_TICKS(_delay_ms));
+      int _s = relay->active_sessions > 0 ? relay->active_sessions : 1;
+      if (_s > 4) _s = 4;
+      vTaskDelay(pdMS_TO_TICKS(_s * 5));
     }
 
     // --- Relay CPU busyness tracking (1-second rolling window) ---
