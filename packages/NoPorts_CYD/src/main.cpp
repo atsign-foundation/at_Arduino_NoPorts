@@ -258,6 +258,15 @@ static bool start_daemon() {
   noports_keys_free(&config);
   daemon_running = true;
   Serial.println("[main] NoPorts daemon running!");
+
+  // Apply NVS-stored settings to the running daemon
+  {
+    String ms = ui_load_string(NVS_KEY_MAX_RELAYS);
+    uint8_t max_r = (ms.length() > 0 && ms.toInt() >= 1)
+                    ? (uint8_t)constrain(ms.toInt(), 1, 4) : 2;
+    npDaemon.setMaxRelays(max_r);
+    Serial.printf("[main] Max TCP clients configured: %d\n", (int)max_r);
+  }
   
   // Set LED to cyan (running)
   ui_load_led_color();
@@ -709,6 +718,12 @@ static void _on_config_saved() {
                      : 0;
     npDaemon.setWorkerKeepaliveMs(ka_ms);
     Serial.printf("[main] Worker keepalive updated: %u ms\n", ka_ms);
+
+    String ms = ui_load_string(NVS_KEY_MAX_RELAYS);
+    uint8_t max_r = (ms.length() > 0 && ms.toInt() >= 1)
+                    ? (uint8_t)constrain(ms.toInt(), 1, 4) : 2;
+    npDaemon.setMaxRelays(max_r);
+    Serial.printf("[main] Max TCP clients updated: %d\n", (int)max_r);
   }
   // Return to dashboard
   current_screen = SCREEN_DASHBOARD;

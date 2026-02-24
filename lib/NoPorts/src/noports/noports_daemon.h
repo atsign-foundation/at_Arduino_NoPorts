@@ -132,6 +132,16 @@ public:
    */
   void setWorkerKeepaliveMs(uint32_t ms);
 
+  /**
+   * @brief Set maximum concurrent relay sub-connections (1–4, default 2).
+   *        Takes effect on the next NPT request; does not affect running sessions.
+   */
+  // Max TCP session slots per relay task (1–4, default 2).
+  // Each slot = one rvd socket + one local socket.
+  // The relay PCB budget check enforces the hardware limit independently.
+  void setMaxRelays(uint8_t max) { _max_relays = (max >= 1 && max <= 4) ? max : 2; }
+  uint8_t getMaxRelays() const { return _max_relays; }
+
 private:
   // Daemon state
   NoPortsDaemonState _state;
@@ -171,6 +181,9 @@ private:
   // Worker TLS keep-alive
   uint32_t _worker_keepalive_ms;  // 0 = disabled; heartbeat interval in ms
   uint32_t _worker_last_used_ms;  // millis() of last worker activity
+
+  // Max relay sub-connections per session (default 2, range 1-NOPORTS_MAX_RELAYS)
+  uint8_t _max_relays;
 
   // Internal methods (mirror the C sshnpd functions)
   void _freeResources();  // free all allocated SDK objects

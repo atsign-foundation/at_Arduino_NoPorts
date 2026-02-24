@@ -28,7 +28,7 @@
 // 2 KB handles 1+ full TCP MSS (1436B) per read with room to spare.
 // Reducing from 4096: saves 2×1KB = 2KB in the shared buf+crypt_buf mallocs
 // without any throughput loss (we already only read RELAY_CHUNK_SIZE per call).
-#define RELAY_BUF_SIZE 2048
+#define RELAY_BUF_SIZE 1460
 // Max bytes read per sub per direction per main-loop iteration.
 // Also the size of the embedded pending_rvd/pending_local buffers inside
 // RelaySub — reducing this is the biggest heap win since the pending bufs
@@ -116,7 +116,7 @@ static volatile uint8_t  _relay_cpu_pct     = 0;  // last computed busyness (0-1
 // and leaves plenty of margin.  The old 30 KB value exceeded the observed
 // ~27 KB free-heap floor under active data transfer, so it incorrectly
 // refused connections during normal SSH/HTTP use.
-#define MIN_HEAP_FOR_SUB 12000
+#define MIN_HEAP_FOR_SUB 15000
 
 // AES-CTR encryption state
 struct aes_ctr_state {
@@ -188,6 +188,7 @@ struct RelaySub {
   // Drain runs one pass per main-loop iteration so other subs
   // (SSH, etc.) are never starved while an HTTP sub is draining.
   bool draining;               // true while in post-FIN drain phase
+  bool dir_flip;                // alternates which direction is serviced first each pass
   unsigned long drain_start_ms; // millis() when drain began
   unsigned long last_activity_ms; // millis() of last data transfer
   uint32_t sub_bytes_in;   // per-sub rvd→local byte counter
@@ -372,9 +373,9 @@ static void _close_relay_sub(RelaySub *sub, int index) {
 }
 
 // Internal: recount active subs and update relay->active_sessions
-static void _update_active_session_count(NoPortsRelay *relay, RelaySub *subs) {
+static void _update_active_session_count(NoPortsRelay *relay, RelaySub *subs, int n_subs) {
   uint8_t count = 0;
-  for (int i = 0; i < MAX_RELAY_SUBS; i++) {
+  for (int i = 0; i < n_subs; i++) {
     if (subs[i].active) count++;
   }
   relay->active_sessions = count;
@@ -389,8 +390,8 @@ static void _update_active_session_count(NoPortsRelay *relay, RelaySub *subs) {
 // Reclaims only when BOTH sides are fully closed to avoid cutting off
 // a sub where one side is still actively sending (e.g. rvd closed by
 // HTTP keep-alive while web server is still sending the response).
-static void _reclaim_dead_subs(RelaySub *subs) {
-  for (int i = 0; i < MAX_RELAY_SUBS; i++) {
+static void _reclaim_dead_subs(RelaySub *subs, int n_subs) {
+  for (int i = 0; i < n_subs; i++) {
     if (!subs[i].active) continue;
     if (subs[i].draining) continue; // drain state machine owns these
     bool rvd_dead   = !subs[i].rvd.available()   && _peer_closed(subs[i].rvd);
@@ -409,11 +410,11 @@ static void _reclaim_dead_subs(RelaySub *subs) {
 // (mid-TLS-handshake guard).  After that grace window a zero-bytes-out
 // sub is considered stuck and becomes evictable.
 // Returns -1 if no eligible victim found.
-static int _find_evictable_sub(RelaySub *subs) {
+static int _find_evictable_sub(RelaySub *subs, int n_subs) {
   int victim = -1;
   unsigned long oldest_activity = ULONG_MAX;
   unsigned long now = millis();
-  for (int i = 0; i < MAX_RELAY_SUBS; i++) {
+  for (int i = 0; i < n_subs; i++) {
     if (!subs[i].active) continue;
     // Protect mid-TLS-handshake subs (sub_bytes_out==0) only during the
     // initial grace window.  After SUB_EVICTION_GRACE_MS a zero-bytes-out
@@ -452,11 +453,11 @@ static int _find_evictable_sub(RelaySub *subs) {
 // Return values:
 //   0 = success, sub is active
 //  -2 = failure (rejected, parse error, AES setup, TCP connect refused)
-static int _handle_connect_msg(NoPortsRelay *relay, RelaySub *subs,
+static int _handle_connect_msg(NoPortsRelay *relay, RelaySub *subs, int n_subs,
                                const char *msg) {
   // Step 1: Reclaim any subs whose peer has already closed.
   // This is free — those connections are already done.
-  _reclaim_dead_subs(subs);
+  _reclaim_dead_subs(subs, n_subs);
 
   // PCB budget guard: refuse if opening 2 more sockets would exceed the relay
   // pool, ensuring atServer (monitor/worker) PCBs are never starved.
@@ -471,11 +472,11 @@ static int _handle_connect_msg(NoPortsRelay *relay, RelaySub *subs,
   //   - each active sub: 2  (rvd + local)
   {
     int session_pcbs = 1;  // ctrl socket
-    for (int i = 0; i < MAX_RELAY_SUBS; i++) {
+    for (int i = 0; i < n_subs; i++) {
       if (subs[i].active) session_pcbs += 2;
     }
     if (session_pcbs + 2 > MAX_RELAY_PCBS) {
-      int victim = _find_evictable_sub(subs);
+      int victim = _find_evictable_sub(subs, n_subs);
       if (victim >= 0) {
         unsigned long idle_ms = millis() - subs[victim].last_activity_ms;
         NOPORTS_LOGW(TAG, "Sub[%d] evicted (idle %lums, session_pcbs=%d/%d global=%d)",
@@ -497,19 +498,16 @@ static int _handle_connect_msg(NoPortsRelay *relay, RelaySub *subs,
   // temporarily fragment DRAM, shrinking the largest contiguous block even
   // when total free heap is >100 KB.  This causes false back-pressure that
   // blocks the second SSH multiplexed connection mid-transfer.
-  // The correct place for the contiguous-heap guard is in _reconnectMonitor()
-  // and _reconnectWorker() (noports_daemon.cpp), where mbedTLS actually runs.
-  // Those reconnects only happen after the relay session ends and pbufs are
-  // freed — at which point the contiguous block naturally recovers.
-
-  // Total-heap guard: only backstop for genuine OOM (not fragmentation).
-  // Uses esp_get_free_heap_size() (total free, not largest contiguous block)
-  // so it is not fooled by transient pbuf fragmentation during data transfer.
+  // Total-heap guard: backstop for genuine OOM.
+  // Relay subs are plain TCP — they need only small pbuf allocations (1460
+  // bytes each), not a large contiguous block.  So we check total free heap
+  // only.  The contiguous-block guard for TLS lives in _reconnectMonitor()
+  // and _reconnectWorker() in noports_daemon.cpp, where mbedTLS actually runs.
   // Only back-pressure when active subs exist — on a first connection with
   // no subs there is nothing to evict and no reason to refuse.
   uint32_t heap = esp_get_free_heap_size();
   if (heap < MIN_HEAP_FOR_SUB) {
-    int victim = _find_evictable_sub(subs);
+    int victim = _find_evictable_sub(subs, n_subs);
     if (victim >= 0) {
       NOPORTS_LOGW(TAG, "Sub[%d] evicted (heap %u < %u, idle %lums)",
                    victim, (unsigned)heap, MIN_HEAP_FOR_SUB,
@@ -517,7 +515,7 @@ static int _handle_connect_msg(NoPortsRelay *relay, RelaySub *subs,
       _close_relay_sub(&subs[victim], victim);
     } else {
       int active_count = 0;
-      for (int i = 0; i < MAX_RELAY_SUBS; i++) {
+      for (int i = 0; i < n_subs; i++) {
         if (subs[i].active) active_count++;
       }
       if (active_count > 0) {
@@ -532,7 +530,7 @@ static int _handle_connect_msg(NoPortsRelay *relay, RelaySub *subs,
 
   // Find free sub slot
   int slot = -1;
-  for (int i = 0; i < MAX_RELAY_SUBS; i++) {
+  for (int i = 0; i < n_subs; i++) {
     if (!subs[i].active) { slot = i; break; }
   }
 
@@ -542,7 +540,7 @@ static int _handle_connect_msg(NoPortsRelay *relay, RelaySub *subs,
   // sub-channel will timeout and the browser will retry once a slot
   // frees up naturally (via _peer_closed).
   if (slot < 0) {
-    int victim = _find_evictable_sub(subs);
+    int victim = _find_evictable_sub(subs, n_subs);
     if (victim >= 0) {
       unsigned long idle_ms = millis() - subs[victim].last_activity_ms;
       NOPORTS_LOGW(TAG, "Sub[%d] evicted (idle %lums) to make room", victim, idle_ms);
@@ -550,13 +548,13 @@ static int _handle_connect_msg(NoPortsRelay *relay, RelaySub *subs,
       slot = victim;
     } else {
       NOPORTS_LOGW(TAG, "Multi: all %d subs active — ignoring (back-pressure, heap=%u)",
-                   MAX_RELAY_SUBS, (unsigned)esp_get_free_heap_size());
+                   n_subs, (unsigned)esp_get_free_heap_size());
       return -2;
     }
   }
 
   if (slot < 0) {
-    NOPORTS_LOGE(TAG, "Multi: no free sub slots (max %d) — ignoring (back-pressure)", MAX_RELAY_SUBS);
+    NOPORTS_LOGE(TAG, "Multi: no free sub slots (max %d) — ignoring (back-pressure)", n_subs);
     return -2;
   }
 
@@ -638,7 +636,7 @@ static int _handle_connect_msg(NoPortsRelay *relay, RelaySub *subs,
   sub->last_activity_ms = millis();
   sub->sub_bytes_in = 0;
   sub->sub_bytes_out = 0;
-  _update_active_session_count(relay, subs);
+  _update_active_session_count(relay, subs, n_subs);
   NOPORTS_LOGI(TAG, "Sub[%d] active: SRVD <-> %s:%d (sessions=%d, pcbs=%d/%d, heap=%u)",
                slot, relay->config.local_host, relay->config.local_port,
                relay->active_sessions, _relay_pcb_count, MAX_RELAY_PCBS,
@@ -1253,7 +1251,10 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
   }
 
   // Sub-connection tracking (heap-allocated so it doesn't consume task stack)
-  RelaySub *subs = (RelaySub *)calloc(MAX_RELAY_SUBS, sizeof(RelaySub));
+  // Clamp configured max_subs to [1, MAX_RELAY_SUBS]; 0 = use default.
+  int n_subs = (relay->config.max_subs >= 1 && relay->config.max_subs <= MAX_RELAY_SUBS)
+               ? (int)relay->config.max_subs : MAX_RELAY_SUBS;
+  RelaySub *subs = (RelaySub *)calloc(n_subs, sizeof(RelaySub));
   if (!subs) {
     NOPORTS_LOGE(TAG, "Multi: failed to allocate subs array");
     relay->state = RELAY_ERROR;
@@ -1261,7 +1262,7 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
     free(crypt_buf);
     return;
   }
-  for (int i = 0; i < MAX_RELAY_SUBS; i++) {
+  for (int i = 0; i < n_subs; i++) {
     new (&subs[i]) RelaySub();  // placement-new: run WiFiClient constructors
     subs[i].active = false;
     subs[i].encrypted = false;
@@ -1276,6 +1277,7 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
   int ctrl_msg_pos = 0;
   unsigned long idle_since = 0;
   unsigned long last_stats_time = 0;
+  uint32_t last_active_ms = 0;   // millis() of last data movement — drives adaptive delay
   bool ctrl_lost = false;            // control channel lost, draining subs
   unsigned long ctrl_lost_since = 0; // when ctrl was lost
   const unsigned long DRAIN_TIMEOUT_MS = 15000UL; // max time to drain after ctrl lost
@@ -1326,6 +1328,7 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
   relay->start_ms = millis();
   idle_since = millis();
   last_stats_time = millis();
+  last_active_ms = millis();
 
   NOPORTS_LOGI(TAG, "Multi: relay running session %s (ctrl e2ee=%d)",
                relay->config.session_id, ctrl_dec != NULL);
@@ -1354,7 +1357,7 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
         if (ctrl_msg_pos > 0) {
           if (strncmp(ctrl_msg, "connect:", 8) == 0) {
             NOPORTS_LOGI(TAG, "Multi: connect request received");
-            int rc = _handle_connect_msg(relay, subs, ctrl_msg);
+            int rc = _handle_connect_msg(relay, subs, n_subs, ctrl_msg);
             if (rc != 0) {
               // _handle_connect_msg already rejected via SRVD if needed
               consecutive_connect_fails++;
@@ -1382,7 +1385,7 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
     }
 
     // --- Relay data for all active sub-connections ---
-    for (int i = 0; i < MAX_RELAY_SUBS; i++) {
+    for (int i = 0; i < n_subs; i++) {
       // Non-blocking drain state machine.
       // When a peer sends FIN we enter draining=true and do ONE pass of
       // buffer-flushing per main-loop iteration, then continue to the next
@@ -1499,99 +1502,100 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
 
       if (!subs[i].active) continue;
 
-      // SRVD -> local (decrypt + non-blocking single-shot write)
-      // Mirrors the local→rvd pending-buffer design: flush pending_local
-      // first, then read new data only when the buffer is clear.
-      // A single local.write() per iteration means a backpressured LAN socket
-      // (e.g. Proxmox receive buffer temporarily full) never stalls the loop
-      // and never stops SSH keyboard data from getting to its SSH server.
-      {
-        // Step 1: flush leftover bytes from last iteration.
-        if (subs[i].pending_local_len > 0) {
-          size_t w = subs[i].local.write(subs[i].pending_local,
-                                         subs[i].pending_local_len);
-          if (w > 0) {
-            if ((int)w < subs[i].pending_local_len)
-              memmove(subs[i].pending_local, subs[i].pending_local + w,
-                      subs[i].pending_local_len - (int)w);
-            subs[i].pending_local_len -= (int)w;
-            activity = true;
-            idle_since = millis();
-            subs[i].last_activity_ms = millis();
-          }
-          // Local socket still full → skip reading more rvd data this pass.
-        }
-        // Step 2: read new data only when pending is fully flushed.
-        if (subs[i].pending_local_len == 0 && subs[i].rvd.available()) {
-          int n = subs[i].rvd.read(buf, RELAY_CHUNK_SIZE);
-          if (n > 0) {
-            const uint8_t *to_send = buf;
-            if (subs[i].encrypted) {
-              _aes_ctr_crypt(&subs[i].dec_state, n, buf, crypt_buf);
-              to_send = crypt_buf;
+      // Bidirectional relay — direction-fair.
+      // dir_flip alternates which direction is serviced first each pass.
+      // Without this, a download flood (rvd→local) always leaves
+      // upload (local→rvd — keystrokes, SCP acks) waiting one extra
+      // full loop iteration before getting a turn.
+      // _d==0 serves the "first" direction; _d==1 serves the other.
+      // The loop exits early if the sub becomes inactive mid-pass.
+      for (int _d = 0; _d < 2 && subs[i].active; _d++) {
+        if ((_d == 0) != subs[i].dir_flip) {
+          // SRVD → local (decrypt + non-blocking single-shot write)
+          // Flush pending_local first; read new rvd data only when clear.
+          {
+            // Step 1: flush leftover bytes from last iteration.
+            if (subs[i].pending_local_len > 0) {
+              size_t w = subs[i].local.write(subs[i].pending_local,
+                                             subs[i].pending_local_len);
+              if (w > 0) {
+                if ((int)w < subs[i].pending_local_len)
+                  memmove(subs[i].pending_local, subs[i].pending_local + w,
+                          subs[i].pending_local_len - (int)w);
+                subs[i].pending_local_len -= (int)w;
+                activity = true;
+                idle_since = millis();
+                subs[i].last_activity_ms = millis();
+              }
+              // Local socket still full → skip reading more rvd data this pass.
             }
-            size_t w = subs[i].local.write(to_send, n);
-            relay->bytes_in += n;
-            subs[i].sub_bytes_in += n;
-            activity = true;
-            idle_since = millis();
-            subs[i].last_activity_ms = millis();
-            if ((int)w < n) {
-              subs[i].pending_local_len = n - (int)w;
-              memcpy(subs[i].pending_local, to_send + w, n - (int)w);
+            // Step 2: read new data only when pending is fully flushed.
+            if (subs[i].pending_local_len == 0 && subs[i].rvd.available()) {
+              int n = subs[i].rvd.read(buf, RELAY_CHUNK_SIZE);
+              if (n > 0) {
+                const uint8_t *to_send = buf;
+                if (subs[i].encrypted) {
+                  _aes_ctr_crypt(&subs[i].dec_state, n, buf, crypt_buf);
+                  to_send = crypt_buf;
+                }
+                size_t w = subs[i].local.write(to_send, n);
+                relay->bytes_in += n;
+                subs[i].sub_bytes_in += n;
+                activity = true;
+                idle_since = millis();
+                subs[i].last_activity_ms = millis();
+                if ((int)w < n) {
+                  subs[i].pending_local_len = n - (int)w;
+                  memcpy(subs[i].pending_local, to_send + w, n - (int)w);
+                }
+              }
+            }
+          }
+        } else {
+          // local → SRVD (encrypt + non-blocking single-shot write)
+          // Flush pending_rvd first; read new local data only when clear.
+          {
+            // Step 1: flush leftover bytes from last iteration.
+            if (subs[i].pending_rvd_len > 0) {
+              size_t w = subs[i].rvd.write(subs[i].pending_rvd,
+                                           subs[i].pending_rvd_len);
+              if (w > 0) {
+                if ((int)w < subs[i].pending_rvd_len)
+                  memmove(subs[i].pending_rvd, subs[i].pending_rvd + w,
+                          subs[i].pending_rvd_len - (int)w);
+                subs[i].pending_rvd_len -= (int)w;
+                activity = true;
+                idle_since = millis();
+                subs[i].last_activity_ms = millis();
+              }
+              // Send buffer still full → skip reading more this pass.
+            }
+            // Step 2: read new data only when pending is fully flushed.
+            if (subs[i].pending_rvd_len == 0 && subs[i].local.available()) {
+              int n = subs[i].local.read(buf, RELAY_CHUNK_SIZE);
+              if (n > 0) {
+                const uint8_t *to_send = buf;
+                if (subs[i].encrypted) {
+                  _aes_ctr_crypt(&subs[i].enc_state, n, buf, crypt_buf);
+                  to_send = crypt_buf;
+                }
+                size_t w = subs[i].rvd.write(to_send, n);
+                relay->bytes_out += n;
+                subs[i].sub_bytes_out += n;
+                activity = true;
+                idle_since = millis();
+                subs[i].last_activity_ms = millis();
+                if ((int)w < n) {
+                  // TCP send buffer couldn't absorb all bytes; stash remainder.
+                  subs[i].pending_rvd_len = n - (int)w;
+                  memcpy(subs[i].pending_rvd, to_send + w, n - (int)w);
+                }
+              }
             }
           }
         }
       }
-
-      if (!subs[i].active) continue;
-
-      // local -> SRVD (encrypt + non-blocking single-shot write)
-      // pending_rvd holds bytes from a prior read that didn't fit in the
-      // TCP send buffer (SRVD at ~100ms RTT).  We flush it first; only
-      // read new data once the pending buffer is fully drained.
-      // A single rvd.write() call per iteration means _write_all is never
-      // entered for the WAN direction, so a full send buffer on one sub
-      // never stalls SSH or other concurrent subs.
-      {
-        // Step 1: flush leftover bytes from last iteration.
-        if (subs[i].pending_rvd_len > 0) {
-          size_t w = subs[i].rvd.write(subs[i].pending_rvd,
-                                       subs[i].pending_rvd_len);
-          if (w > 0) {
-            if ((int)w < subs[i].pending_rvd_len)
-              memmove(subs[i].pending_rvd, subs[i].pending_rvd + w,
-                      subs[i].pending_rvd_len - (int)w);
-            subs[i].pending_rvd_len -= (int)w;
-            activity = true;
-            idle_since = millis();
-            subs[i].last_activity_ms = millis();
-          }
-          // Send buffer still full → skip reading more this pass.
-        }
-        // Step 2: read new data only when pending is fully flushed.
-        if (subs[i].pending_rvd_len == 0 && subs[i].local.available()) {
-          int n = subs[i].local.read(buf, RELAY_CHUNK_SIZE);
-          if (n > 0) {
-            const uint8_t *to_send = buf;
-            if (subs[i].encrypted) {
-              _aes_ctr_crypt(&subs[i].enc_state, n, buf, crypt_buf);
-              to_send = crypt_buf;
-            }
-            size_t w = subs[i].rvd.write(to_send, n);
-            relay->bytes_out += n;
-            subs[i].sub_bytes_out += n;
-            activity = true;
-            idle_since = millis();
-            subs[i].last_activity_ms = millis();
-            if ((int)w < n) {
-              // TCP send buffer couldn't absorb all bytes; stash remainder.
-              subs[i].pending_rvd_len = n - (int)w;
-              memcpy(subs[i].pending_rvd, to_send + w, n - (int)w);
-            }
-          }
-        }
-      }
+      subs[i].dir_flip = !subs[i].dir_flip;
 
       if (!subs[i].active) continue;
 
@@ -1624,7 +1628,7 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
     }
 
     // Update session count (visible to daemon/UI)
-    _update_active_session_count(relay, subs);
+    _update_active_session_count(relay, subs, n_subs);
 
     // --- Periodic stats ---
     if ((millis() - last_stats_time) > 10000) {
@@ -1668,24 +1672,32 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
       break;
     }
 
-    // Yield policy: linear delay scaled to WiFi capacity.
-    // WiFi max = ~2 Mbps = 250 KB/s total across all subs.
-    // Each iteration can move up to RELAY_CHUNK_SIZE (1460) bytes per sub.
-    // To avoid looping faster than WiFi can consume data (which just wastes
-    // Core 0 tcpip_thread lock acquisitions and causes BEACON_TIMEOUT):
-    //   delay_ms ≈ N × 1460 / 250000 × 1000 = N × 5.84 ms
-    // Rounded to N×5 for simplicity:
-    //   1 sub  →  5 ms → 200 iter/s → ~292 KB/s (WiFi caps it)
-    //   2 subs → 10 ms → 100 iter/s each → ~292 KB/s total
-    //   3 subs → 15 ms →  67 iter/s each → ~292 KB/s total
-    //   4 subs → 20 ms →  50 iter/s each → ~292 KB/s total
-    // Each case stays at or below 2 Mbps WiFi ceiling.  The daemon loop
-    // (priority 1) and WiFi beacon processing (Core 0 tcpip_thread) both
-    // get adequate CPU time at these rates.
+    // Track last time data actually moved (drives adaptive delay below)
+    if (activity) last_active_ms = millis();
+
+    // Heap-floor back-pressure: when free heap is critically low, pause to
+    // let the lwIP stack drain in-flight pbufs before we push more data.
+    // This prevents the heap from hitting ~12KB where the daemon starts
+    // failing mallocs and locks up.  25ms gives tcpip_thread time to ACK
+    // and free pbufs from the send path without stalling SSH noticeably.
+    if (esp_get_free_heap_size() < 20000) {
+      vTaskDelay(pdMS_TO_TICKS(25));
+    }
+
+    // Yield policy: adaptive delay based on recent activity.
+    // When data moved within the last 15ms (SSH inter-packet RTT window),
+    // use 1ms×N to keep latency low without spinning the CPU hard.
+    // After 15ms of silence, back off to 5ms×N to yield to daemon + WiFi.
+    //   Active:  1/2/3/4 ms for 1/2/3/4 subs → low latency
+    //   Idle:    5/10/15/20 ms for 1/2/3/4 subs → yield CPU
     {
       int _s = relay->active_sessions > 0 ? relay->active_sessions : 1;
       if (_s > 4) _s = 4;
-      vTaskDelay(pdMS_TO_TICKS(_s * 5));
+      uint32_t since_active = millis() - last_active_ms;
+      if (since_active < 15)
+        vTaskDelay(pdMS_TO_TICKS(_s));
+      else
+        vTaskDelay(pdMS_TO_TICKS(_s * 5));
     }
 
     // --- Relay CPU busyness tracking (1-second rolling window) ---
@@ -1714,7 +1726,7 @@ cleanup:
                (unsigned)relay->bytes_out);
 
   // Close all active sub-connections
-  for (int i = 0; i < MAX_RELAY_SUBS; i++) {
+  for (int i = 0; i < n_subs; i++) {
     if (subs[i].active) {
       _close_relay_sub(&subs[i], i);
     }
@@ -1747,7 +1759,7 @@ cleanup:
   free(crypt_buf);
   // Explicitly destroy RelaySub objects (WiFiClient dtors) then free heap block.
   if (subs) {
-    for (int i = 0; i < MAX_RELAY_SUBS; i++) subs[i].~RelaySub();
+    for (int i = 0; i < n_subs; i++) subs[i].~RelaySub();
     free(subs);
   }
 
@@ -1806,6 +1818,14 @@ static void _relay_task(void *pvParameters) {
   vTaskDelete(NULL);
 }
 
+uint8_t noports_relay_subs_for_clients(uint8_t n_clients) {
+  if (n_clients < 1) n_clients = 1;
+  int n = (MAX_RELAY_PCBS - (int)n_clients) / ((int)n_clients * 2);
+  if (n < 1) n = 1;
+  if (n > MAX_RELAY_SUBS) n = MAX_RELAY_SUBS;
+  return (uint8_t)n;
+}
+
 void noports_relay_config_init(NoPortsRelayConfig *cfg) {
   memset(cfg, 0, sizeof(NoPortsRelayConfig));
   cfg->local_host = "127.0.0.1";
@@ -1813,6 +1833,7 @@ void noports_relay_config_init(NoPortsRelayConfig *cfg) {
   cfg->rv_auth = false;
   cfg->rv_e2ee = false;
   cfg->multi = false;
+  cfg->max_subs = 0;  // 0 = use MAX_RELAY_SUBS default
 }
 
 int noports_relay_start(NoPortsRelay *relay, const NoPortsRelayConfig *config) {

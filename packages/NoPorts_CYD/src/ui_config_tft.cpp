@@ -42,6 +42,7 @@
 static void (*_on_save_cb)() = nullptr;
 
 static int _keepalive_min = 4;   // 0 = off, 1-15 minutes
+static int _max_subs      = 2;   // 1-4 relay sub-connections per session
 
 // ---------------------------------------------------------------------------
 // Drawing helpers
@@ -115,7 +116,8 @@ static void _draw_rows() {
   tft.drawString("Heartbeat to keep atServer TLS alive", 10, y, 1);
   y += 12;
 
-  // (reserved space for future config rows)
+  // ── Concurrent TCP sessions per relay ──
+  _draw_stepper(y, "TCP clients:", _max_subs, 1, 4);
 }
 
 static void _draw_buttons() {
@@ -156,6 +158,9 @@ void ui_config_create(void (*on_save)()) {
   if (_keepalive_min < 0)  _keepalive_min = 0;
   if (_keepalive_min > 15) _keepalive_min = 15;
 
+  String ms = ui_load_string(NVS_KEY_MAX_RELAYS);
+  _max_subs = (ms.length() > 0) ? (int)constrain(ms.toInt(), 1, 4) : 2;
+
   _draw_screen();
 }
 
@@ -183,12 +188,33 @@ bool ui_config_handle_touch(int16_t tx, int16_t ty) {
       return true;
     }
   }
+  y += ROW_H + ROW_GAP + 12;  // skip KA row + hint text
+
+  // Max sessions stepper row
+  if (ty >= y && ty < y + ROW_H) {
+    if (ui_touch_in_rect(tx, ty, STEP_MINUS_X, y, STEP_MINUS_W, ROW_H)) {
+      if (_max_subs > 1) {
+        _max_subs--;
+        _draw_stepper(y, "TCP clients:", _max_subs, 1, 4);
+      }
+      return true;
+    }
+    if (ui_touch_in_rect(tx, ty, STEP_PLUS_X, y, STEP_PLUS_W, ROW_H)) {
+      if (_max_subs < 4) {
+        _max_subs++;
+        _draw_stepper(y, "TCP clients:", _max_subs, 1, 4);
+      }
+      return true;
+    }
+  }
 
   // BACK button
   if (ui_touch_in_rect(tx, ty, BACK_BTN_X, BTN_ROW_Y, BACK_BTN_W, BTN_ROW_H)) {
     // Reload from NVS (discard changes) then call on_save to return to dashboard
     String ka = ui_load_string(NVS_KEY_WORKER_KEEPALIVE);
     _keepalive_min = (ka.length() > 0) ? (int)ka.toInt() : 4;
+    String ms = ui_load_string(NVS_KEY_MAX_RELAYS);
+    _max_subs = (ms.length() > 0) ? (int)constrain(ms.toInt(), 1, 4) : 2;
     Serial.println("[config] BACK — changes discarded");
     if (_on_save_cb) _on_save_cb();
     return true;
@@ -199,7 +225,11 @@ bool ui_config_handle_touch(int16_t tx, int16_t ty) {
     char ka_str[4];
     snprintf(ka_str, sizeof(ka_str), "%d", _keepalive_min);
     ui_save_string(NVS_KEY_WORKER_KEEPALIVE, ka_str);
-    Serial.printf("[config] Saved worker keepalive: %d min\n", _keepalive_min);
+    char ms_str[4];
+    snprintf(ms_str, sizeof(ms_str), "%d", _max_subs);
+    ui_save_string(NVS_KEY_MAX_RELAYS, ms_str);
+    Serial.printf("[config] Saved: worker keepalive=%d min, max sessions=%d\n",
+                  _keepalive_min, _max_subs);
     if (_on_save_cb) _on_save_cb();
     return true;
   }

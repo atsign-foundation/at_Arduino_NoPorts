@@ -65,6 +65,9 @@ struct NoPortsRelayConfig {
 
   // Session ID for tracking
   char session_id[64];
+
+  // Max sub-connections per relay session (0 = use MAX_RELAY_SUBS default)
+  uint8_t max_subs;
 };
 
 /**
@@ -134,5 +137,16 @@ int noports_relay_get_pcb_count();
  *        Returns 0 when no relay session is active.
  */
 uint8_t noports_relay_get_cpu_pct();
+
+/**
+ * @brief Return the maximum number of sub-connections each relay session
+ *        should be allowed, given @p n_clients simultaneous relay sessions.
+ *
+ * Derived from the total relay PCB budget so that
+ *   n_clients × (1 ctrl + n_subs×2 data) ≤ MAX_RELAY_PCBS
+ * Clamped to [1, MAX_RELAY_SUBS].
+ * n_clients is the number of concurrent TCP clients being relayed.
+ */
+uint8_t noports_relay_subs_for_clients(uint8_t n_clients);
 
 #endif // NOPORTS_RELAY_H

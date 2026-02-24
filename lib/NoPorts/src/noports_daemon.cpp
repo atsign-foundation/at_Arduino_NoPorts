@@ -81,7 +81,8 @@ NoPortsDaemon::NoPortsDaemon()
   , _reconnect_failures(0)
   , _monitor_fail_streak(0)
   , _worker_keepalive_ms(NOPORTS_WORKER_KEEPALIVE_MS)
-  , _worker_last_used_ms(0) {
+  , _worker_last_used_ms(0)
+  , _max_relays(2) {
   memset(_last_error, 0, sizeof(_last_error));
   memset(_root_host, 0, sizeof(_root_host));
   // Don't memset _relays — it contains WiFiClient C++ objects whose
@@ -378,9 +379,13 @@ void NoPortsDaemon::loop() {
   if (ret != 0) {
     // atclient_monitor_read sets message.type even on error — dispatch on it
     // so we don't needlessly kill a healthy worker TLS connection.
-    if (message.type == ATCLIENT_MONITOR_ERROR_PARSE_NOTIFICATION) {
-      // Malformed server message (e.g. statsNotification without trailing \n).
-      // The worker is uninvolved — dont't touch it.
+    if (message.type == ATCLIENT_MONITOR_ERROR_PARSE_NOTIFICATION ||
+        message.type == 0) {
+      // Malformed/partial server message (e.g. statsNotification without trailing \n)
+      // or SDK parse error returning type=0.  The worker is uninvolved —
+      // don't touch it.  Treating type=0 here prevents _reconnectWorker()
+      // from being called, which blocked the daemon for up to 30s and caused
+      // new SSH sessions to miss their connect: notifications.
       NOPORTS_LOGD(TAG, "Monitor: ignoring unparseable server message (type=%d)", message.type);
       _timeout_counter++;   // count the same as an empty/noop
       atclient_monitor_message_free(&message);
@@ -1000,6 +1005,11 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
   // Setup relay config
   NoPortsRelayConfig relay_cfg;
   noports_relay_config_init(&relay_cfg);
+  // max_subs is set directly from _max_relays — how many sub-connections
+  // (TCP client sessions) this relay task will accept on its ctrl channel.
+  // The per-session PCB check in _handle_connect_msg enforces the hardware
+  // PCB budget independently; max_subs just sizes the slot array.
+  relay_cfg.max_subs = _max_relays;  // direct: each unit = one TCP session slot
 
   relay_cfg.rvd_host = cJSON_GetStringValue(rvd_host);
   relay_cfg.rvd_port = (uint16_t)cJSON_GetNumberValue(rvd_port);
@@ -1241,6 +1251,13 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
         atclient_atkey_metadata_set_is_encrypted(meta, true);
         atclient_atkey_metadata_set_ttl(meta, 10000);
 
+        // _verifyEnvelopeSignature used the worker to fetch the requester's
+        // public key.  A concurrent statsNotification push from the atServer
+        // can arrive in-band during that round-trip and leave garbage in the
+        // worker's read buffer, making the next atclient_notify fail with
+        // "no ':' token".  Reconnect here to guarantee a clean connection.
+        _reconnectWorker();
+
         atclient_notify_params nparams;
         atclient_notify_params_init(&nparams);
         atclient_notify_params_set_atkey(&nparams, &res_atkey);
@@ -1414,7 +1431,7 @@ bool NoPortsDaemon::_verifyEnvelopeContents(void *env, int payload_type) {
 // ============================================================================
 
 int NoPortsDaemon::_findFreeRelaySlot() {
-  for (int i = 0; i < NOPORTS_MAX_RELAYS; i++) {
+  for (int i = 0; i < _max_relays; i++) {
     if (!noports_relay_is_running(&_relays[i]) &&
         _relays[i].state != RELAY_CONNECTING &&
         _relays[i].state != RELAY_AUTHENTICATING) {
@@ -1471,20 +1488,13 @@ bool NoPortsDaemon::_reconnectMonitor() {
 
   NOPORTS_LOGI(TAG, "Reconnecting monitor...");
 
-  // Wait until the heap is suitable for a TLS handshake, up to 30 s.
-  //
-  // Two conditions must hold before mbedTLS can succeed:
-  //   (a) enough total free heap   — checked always
-  //   (b) a large enough contiguous block — ONLY checked while relay subs are
-  //       active (pcbs > 1).  Active relay sockets hold lwIP pbufs that
-  //       fragment DRAM; with 3 active subs the largest block is ~20 KB even
-  //       when total free is 80+ KB.  Once the relay drains (pcbs ≤ 1) the
-  //       pbufs are released and the heap consolidates, so (b) is moot.
-  //
-  // Observed on CYD (ESP32, no PSRAM):
-  //   TLS FAILS:    total=81 KB, largest=20 KB, pcbs=7  (relay active)
-  //   TLS SUCCEEDS: total=46 KB, largest=11 KB, pcbs=0  (relay just drained)
-  {
+  // Wait for heap only when the relay has just stopped (pcbs <= 1).
+  // When pcbs > 1 the relay is actively running and holds pbufs that fragment
+  // the heap — those pbufs will NOT be released until sessions close, so
+  // waiting here is pointless and blocks notification delivery for up to 30s,
+  // which freezes all active SSH sessions.  Skip the wait; TLS will either
+  // succeed (brief lull between relay bursts) or fail and be retried quickly.
+  if (noports_relay_get_pcb_count() <= 1) {
     uint32_t ws = millis();
     while ((millis() - ws) < 30000) {
       uint32_t total   = esp_get_free_heap_size();
@@ -1508,6 +1518,9 @@ bool NoPortsDaemon::_reconnectMonitor() {
                      total, largest, pcbs);
       }
     }
+  } else {
+    NOPORTS_LOGD(TAG, "Monitor reconnect: relay active (pcbs=%d), skipping heap wait",
+                 noports_relay_get_pcb_count());
   }
 
   atclient *monitor = (atclient *)_monitor_ctx;
@@ -1545,8 +1558,8 @@ bool NoPortsDaemon::_reconnectMonitor() {
 bool NoPortsDaemon::_reconnectWorker() {
   NOPORTS_LOGI(TAG, "Reconnecting worker...");
 
-  // Wait until the heap is suitable for TLS (see monitor reconnect comment above).
-  {
+  // Same logic as monitor reconnect: skip heap wait when relay is active.
+  if (noports_relay_get_pcb_count() <= 1) {
     uint32_t ws = millis();
     while ((millis() - ws) < 30000) {
       uint32_t total   = esp_get_free_heap_size();
@@ -1570,6 +1583,9 @@ bool NoPortsDaemon::_reconnectWorker() {
                      total, largest, pcbs);
       }
     }
+  } else {
+    NOPORTS_LOGD(TAG, "Worker reconnect: relay active (pcbs=%d), skipping heap wait",
+                 noports_relay_get_pcb_count());
   }
 
   atclient *worker = (atclient *)_worker_ctx;
