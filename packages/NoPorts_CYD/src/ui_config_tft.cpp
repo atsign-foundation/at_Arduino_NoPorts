@@ -42,6 +42,7 @@
 static void (*_on_save_cb)() = nullptr;
 
 static int _keepalive_min = 4;   // 0 = off, 1-15 minutes
+static int _max_relays    = 4;   // 1-4 concurrent relay sessions
 
 // ---------------------------------------------------------------------------
 // Drawing helpers
@@ -104,8 +105,8 @@ static void _draw_rows() {
   TFT_eSPI &tft = ui_get_tft();
   int y = ROW_Y_START;
 
-  // ── Worker keep-alive ──
-  _draw_stepper(y, "Worker KA (min):", _keepalive_min, 0, 15, "off");
+  // ── atServer keep-alive ──
+  _draw_stepper(y, "atServer KeepAlive (mins):", _keepalive_min, 0, 15, "off");
   y += ROW_H + ROW_GAP;
 
   // hint line
@@ -115,7 +116,13 @@ static void _draw_rows() {
   tft.drawString("Heartbeat to keep atServer TLS alive", 10, y, 1);
   y += 12;
 
-  // (reserved space for future config rows)
+  // ── Max relay sessions ──
+  _draw_stepper(y, "Max sessions:", _max_relays, 1, 4);
+  y += ROW_H + ROW_GAP;
+
+  tft.setTextColor(COLOR_TEXT_GREY, COLOR_BG_DARK);
+  tft.setTextDatum(ML_DATUM);
+  tft.drawString("Max concurrent SSH/NPT tunnels (1-4)", 10, y, 1);
 }
 
 static void _draw_buttons() {
@@ -156,6 +163,11 @@ void ui_config_create(void (*on_save)()) {
   if (_keepalive_min < 0)  _keepalive_min = 0;
   if (_keepalive_min > 15) _keepalive_min = 15;
 
+  String mr = ui_load_string(NVS_KEY_MAX_RELAYS);
+  _max_relays = (mr.length() > 0) ? (int)mr.toInt() : 4;
+  if (_max_relays < 1) _max_relays = 1;
+  if (_max_relays > 4) _max_relays = 4;
+
   _draw_screen();
 }
 
@@ -166,19 +178,38 @@ void ui_config_update() {
 bool ui_config_handle_touch(int16_t tx, int16_t ty) {
   int y = ROW_Y_START;
 
-  // Worker KA stepper row
+  // atServer KeepAlive stepper row
   if (ty >= y && ty < y + ROW_H) {
     if (ui_touch_in_rect(tx, ty, STEP_MINUS_X, y, STEP_MINUS_W, ROW_H)) {
       if (_keepalive_min > 0) {
         _keepalive_min--;
-        _draw_stepper(y, "Worker KA (min):", _keepalive_min, 0, 15, "off");
+        _draw_stepper(y, "atServer KeepAlive (mins):", _keepalive_min, 0, 15, "off");
       }
       return true;
     }
     if (ui_touch_in_rect(tx, ty, STEP_PLUS_X, y, STEP_PLUS_W, ROW_H)) {
       if (_keepalive_min < 15) {
         _keepalive_min++;
-        _draw_stepper(y, "Worker KA (min):", _keepalive_min, 0, 15, "off");
+        _draw_stepper(y, "atServer KeepAlive (mins):", _keepalive_min, 0, 15, "off");
+      }
+      return true;
+    }
+  }
+  y += ROW_H + ROW_GAP + 12;  // skip hint line
+
+  // Max sessions stepper row
+  if (ty >= y && ty < y + ROW_H) {
+    if (ui_touch_in_rect(tx, ty, STEP_MINUS_X, y, STEP_MINUS_W, ROW_H)) {
+      if (_max_relays > 1) {
+        _max_relays--;
+        _draw_stepper(y, "Max sessions:", _max_relays, 1, 4);
+      }
+      return true;
+    }
+    if (ui_touch_in_rect(tx, ty, STEP_PLUS_X, y, STEP_PLUS_W, ROW_H)) {
+      if (_max_relays < 4) {
+        _max_relays++;
+        _draw_stepper(y, "Max sessions:", _max_relays, 1, 4);
       }
       return true;
     }
@@ -199,7 +230,11 @@ bool ui_config_handle_touch(int16_t tx, int16_t ty) {
     char ka_str[4];
     snprintf(ka_str, sizeof(ka_str), "%d", _keepalive_min);
     ui_save_string(NVS_KEY_WORKER_KEEPALIVE, ka_str);
-    Serial.printf("[config] Saved worker keepalive: %d min\n", _keepalive_min);
+    char mr_str[4];
+    snprintf(mr_str, sizeof(mr_str), "%d", _max_relays);
+    ui_save_string(NVS_KEY_MAX_RELAYS, mr_str);
+    Serial.printf("[config] Saved: keepalive=%d min, max_relays=%d\n",
+                  _keepalive_min, _max_relays);
     if (_on_save_cb) _on_save_cb();
     return true;
   }

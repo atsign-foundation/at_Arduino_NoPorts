@@ -132,6 +132,18 @@ public:
    */
   void setWorkerKeepaliveMs(uint32_t ms);
 
+  /**
+   * @brief Set maximum concurrent relay sessions (1 – NOPORTS_MAX_RELAYS).
+   *        Limits how many simultaneous NPT tunnels the daemon will accept.
+   *        Takes effect immediately; already-running relays are not affected.
+   */
+  void setMaxRelays(uint8_t max);
+
+  /**
+   * @brief Get current max relay limit.
+   */
+  uint8_t getMaxRelays() const;
+
 private:
   // Daemon state
   NoPortsDaemonState _state;
@@ -171,6 +183,9 @@ private:
   // Worker TLS keep-alive
   uint32_t _worker_keepalive_ms;  // 0 = disabled; heartbeat interval in ms
   uint32_t _worker_last_used_ms;  // millis() of last worker activity
+
+  // Relay concurrency cap (runtime-adjustable, 1 – NOPORTS_MAX_RELAYS)
+  uint8_t  _max_relays;
 
   // Internal methods (mirror the C sshnpd functions)
   void _freeResources();  // free all allocated SDK objects

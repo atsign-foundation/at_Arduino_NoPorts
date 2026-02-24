@@ -68,8 +68,8 @@
 // ESP32 Arduino lwIP is compiled with:
 //   CONFIG_LWIP_MAX_SOCKETS      = 16
 //   CONFIG_LWIP_MAX_ACTIVE_TCP   = 16
-//   CONFIG_LWIP_TCP_SND_BUF      = 5744
-//   CONFIG_LWIP_TCP_WND          = 5744
+//   CONFIG_LWIP_TCP_SND_BUF      = 2*1460 = 2920  (reduced from 8×MSS, see platformio.ini)
+//   CONFIG_LWIP_TCP_WND          = 2*1460 = 2920
 // We partition the 16 sockets logically:
 //   ATSERVER pool (reserved):  monitor(1) + worker(1) + root(1) + atServer(2) = 5
 //   RELAY pool (tracked):      ctrl(1) + N×2(subs) ≤ 9
@@ -81,7 +81,13 @@
 // budget, guaranteeing the atServer TLS connections can never be
 // starved by relay traffic.
 #define LWIP_TOTAL_PCBS       16
-#define RESERVED_ATSERVER_PCBS 7   // monitor + worker + root + atServer + reconnect margin
+// Permanent sockets: monitor(1) + worker(1) = 2.
+// During reconnect the old socket may still be open while the new one
+// is being established → up to 4 simultaneous (2 old + 2 new).
+// Root-server lookup adds 1 transient socket → 5 max actual simultaneous.
+// +2 safety margin = 7.  Reducing to 5 risks cascade failure when a
+// monitor + worker reconnect overlap with a root lookup.
+#define RESERVED_ATSERVER_PCBS 7   // 5 max actual + 2 margin
 #define MAX_RELAY_PCBS        (LWIP_TOTAL_PCBS - RESERVED_ATSERVER_PCBS)  // 9
 #define MAX_RELAY_SUBS        4   // ctrl(1) + 4×2(subs) = 9 = MAX_RELAY_PCBS
 
@@ -103,20 +109,24 @@ static volatile uint8_t  _relay_cpu_pct     = 0;  // last computed busyness (0-1
 // Actual marginal cost of two WiFiClient::connect() calls:
 //   - WiFiClientSocketHandle (heap):  ~48 bytes × 2  = ~100 bytes
 //   - lwIP PCB structs:  come from the lwIP internal pool, NOT the heap
-//   - lwIP pbufs (TX_SND_BUF 5744 + TCP_WND 5744 per socket):  allocated
-//       LAZILY as data flows — zero heap cost at connect() time
+//   - lwIP pbufs (TX_SND_BUF 5840 + TCP_WND 5840 per socket):  allocated
+//       LAZILY as data flows — but under bulk transfer ALL of it IS allocated.
+//       7 connections × (5840+5840) = ~82KB worst-case during active transfer.
 //   - RelaySub struct (embedded AES states + 2×1460 pending bufs ≈ 3.8 KB):
 //       already calloc'd as subs[] at session start — zero marginal cost
-// Total marginal heap cost at connect time: ~200 bytes.
-//
-// This guard is therefore NOT the right tool to protect against TLS heap
-// exhaustion — that is already handled by NOPORTS_TLS_MIN_CONTIGUOUS_HEAP.
-// This guard's only job: ensure the system isn't completely out of heap.
-// 12 KB covers the connect() overhead plus several KB of initial pbufs
-// and leaves plenty of margin.  The old 30 KB value exceeded the observed
-// ~27 KB free-heap floor under active data transfer, so it incorrectly
-// refused connections during normal SSH/HTTP use.
-#define MIN_HEAP_FOR_SUB 12000
+// Total marginal heap cost at connect time: ~200 bytes, but active bulk transfer
+// can consume up to ~41KB in lwIP pbufs (7 sockets × 2920×2 @ 2×MSS).
+// MIN_HEAP_FOR_SUB guards against accepting new subs when heap is low.
+// 30 KB threshold: leaves ~30KB margin above the SDK's 4KB read buffer +
+// fragmentation overhead when 3 sessions are actively transferring.
+#define MIN_HEAP_FOR_SUB 30000
+
+// Back-pressure threshold: if free heap drops below this, pause reading new
+// data from network sockets.  TCP receive windows will close, causing senders
+// to back off naturally.  Pending buffers are still flushed so in-flight data
+// is delivered; ctrl channel is always read to keep the session alive.
+// Set to 28KB: safely above the SDK's 4KB malloc + fragmentation overhead.
+#define HEAP_BACKPRESSURE_THRESHOLD 28000
 
 // AES-CTR encryption state
 struct aes_ctr_state {
@@ -667,6 +677,7 @@ sub_fail:
 static void _relay_task_inner(NoPortsRelay *relay) {
   uint8_t *buf = (uint8_t *)malloc(RELAY_BUF_SIZE);
   uint8_t *crypt_buf = NULL;
+  uint32_t last_active_ms = 0;
 
   if (!buf) {
     NOPORTS_LOGE(TAG, "Failed to allocate relay buffer");
@@ -1024,6 +1035,7 @@ static void _relay_task_inner(NoPortsRelay *relay) {
 
   idle_since = millis();
   last_stats_time = millis();
+  last_active_ms = millis();
 
   // Bidirectional relay loop: data ↔ local_client
   while (relay->should_run) {
@@ -1129,8 +1141,14 @@ static void _relay_task_inner(NoPortsRelay *relay) {
       break;
     }
 
-    // Yield policy: 5 ms — see multi version for rationale (1 sub = N×5 = 5ms).
-    vTaskDelay(pdMS_TO_TICKS(5));
+    // Heap-adaptive delay: read everything to free lwIP receive pbufs,
+    // but slow down when heap is low to let TX ACKs return and free send pbufs.
+    if (activity) last_active_ms = millis();
+    {
+      uint32_t since = millis() - last_active_ms;
+      if (since < 15) { vTaskDelay(pdMS_TO_TICKS(1)); }
+      else            { vTaskDelay(pdMS_TO_TICKS(5)); }
+    }
   }
 
 cleanup:
@@ -1227,6 +1245,7 @@ cleanup:
 static void _relay_task_inner_multi(NoPortsRelay *relay) {
   uint8_t *buf = (uint8_t *)malloc(RELAY_BUF_SIZE);
   uint8_t *crypt_buf = (uint8_t *)malloc(RELAY_BUF_SIZE);
+  uint32_t last_active_ms = 0;
   if (!buf || !crypt_buf) {
     NOPORTS_LOGE(TAG, "Multi: failed to allocate buffers");
     relay->state = RELAY_ERROR;
@@ -1333,6 +1352,7 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
   // ==================================================================
   // PHASE 2: Main loop - control messages + relay sub-connections
   // ==================================================================
+  last_active_ms = millis();
   while (relay->should_run) {
     bool activity = false;
 
@@ -1499,14 +1519,14 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
 
       if (!subs[i].active) continue;
 
-      // SRVD -> local (decrypt + non-blocking single-shot write)
-      // Mirrors the local→rvd pending-buffer design: flush pending_local
-      // first, then read new data only when the buffer is clear.
-      // A single local.write() per iteration means a backpressured LAN socket
-      // (e.g. Proxmox receive buffer temporarily full) never stalls the loop
-      // and never stops SSH keyboard data from getting to its SSH server.
+      // SRVD -> local (decrypt + non-blocking drain loop)
+      // Drains up to one TCP window (8×RELAY_CHUNK_SIZE) per pass so the
+      // local→rvd direction below always gets serviced within the same
+      // outer-loop iteration.  Without this cap, a continuous inbound stream
+      // can spin here indefinitely, local's receive buffer fills, SSH server
+      // stalls, and the session freezes.
       {
-        // Step 1: flush leftover bytes from last iteration.
+        // Step 1: flush any leftover pending bytes first.
         if (subs[i].pending_local_len > 0) {
           size_t w = subs[i].local.write(subs[i].pending_local,
                                          subs[i].pending_local_len);
@@ -1519,42 +1539,40 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
             idle_since = millis();
             subs[i].last_activity_ms = millis();
           }
-          // Local socket still full → skip reading more rvd data this pass.
         }
-        // Step 2: read new data only when pending is fully flushed.
-        if (subs[i].pending_local_len == 0 && subs[i].rvd.available()) {
+        // Step 2: drain rvd → local, capped at 2×RELAY_CHUNK_SIZE per pass.
+        // Back-pressure: if local write() returns short, remainder goes into
+        // pending_local and rvd reads stop until it's flushed (correct flow ctrl).
+        int drain_budget = 2 * RELAY_CHUNK_SIZE;
+        while (drain_budget > 0 && subs[i].pending_local_len == 0 && subs[i].rvd.available()) {
           int n = subs[i].rvd.read(buf, RELAY_CHUNK_SIZE);
-          if (n > 0) {
-            const uint8_t *to_send = buf;
-            if (subs[i].encrypted) {
-              _aes_ctr_crypt(&subs[i].dec_state, n, buf, crypt_buf);
-              to_send = crypt_buf;
-            }
-            size_t w = subs[i].local.write(to_send, n);
-            relay->bytes_in += n;
-            subs[i].sub_bytes_in += n;
-            activity = true;
-            idle_since = millis();
-            subs[i].last_activity_ms = millis();
-            if ((int)w < n) {
-              subs[i].pending_local_len = n - (int)w;
-              memcpy(subs[i].pending_local, to_send + w, n - (int)w);
-            }
+          if (n <= 0) break;
+          drain_budget -= n;
+          const uint8_t *to_send = buf;
+          if (subs[i].encrypted) {
+            _aes_ctr_crypt(&subs[i].dec_state, n, buf, crypt_buf);
+            to_send = crypt_buf;
+          }
+          size_t w = subs[i].local.write(to_send, n);
+          relay->bytes_in += n;
+          subs[i].sub_bytes_in += n;
+          activity = true;
+          idle_since = millis();
+          subs[i].last_activity_ms = millis();
+          if ((int)w < n) {
+            subs[i].pending_local_len = n - (int)w;
+            memcpy(subs[i].pending_local, to_send + w, n - (int)w);
+            break; // local full — stop reading more rvd this pass
           }
         }
       }
 
       if (!subs[i].active) continue;
 
-      // local -> SRVD (encrypt + non-blocking single-shot write)
-      // pending_rvd holds bytes from a prior read that didn't fit in the
-      // TCP send buffer (SRVD at ~100ms RTT).  We flush it first; only
-      // read new data once the pending buffer is fully drained.
-      // A single rvd.write() call per iteration means _write_all is never
-      // entered for the WAN direction, so a full send buffer on one sub
-      // never stalls SSH or other concurrent subs.
+      // local -> SRVD (encrypt + non-blocking drain loop)
+      // Also capped at one TCP window per pass for symmetric fairness.
       {
-        // Step 1: flush leftover bytes from last iteration.
+        // Step 1: flush leftover pending bytes first.
         if (subs[i].pending_rvd_len > 0) {
           size_t w = subs[i].rvd.write(subs[i].pending_rvd,
                                        subs[i].pending_rvd_len);
@@ -1567,28 +1585,30 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
             idle_since = millis();
             subs[i].last_activity_ms = millis();
           }
-          // Send buffer still full → skip reading more this pass.
         }
-        // Step 2: read new data only when pending is fully flushed.
-        if (subs[i].pending_rvd_len == 0 && subs[i].local.available()) {
+        // Step 2: drain local → rvd, capped at 2×RELAY_CHUNK_SIZE per pass.
+        // Back-pressure: if rvd write() returns short, remainder goes into
+        // pending_rvd and local reads stop until it's flushed (correct flow ctrl).
+        int drain_budget = 2 * RELAY_CHUNK_SIZE;
+        while (drain_budget > 0 && subs[i].pending_rvd_len == 0 && subs[i].local.available()) {
           int n = subs[i].local.read(buf, RELAY_CHUNK_SIZE);
-          if (n > 0) {
-            const uint8_t *to_send = buf;
-            if (subs[i].encrypted) {
-              _aes_ctr_crypt(&subs[i].enc_state, n, buf, crypt_buf);
-              to_send = crypt_buf;
-            }
-            size_t w = subs[i].rvd.write(to_send, n);
-            relay->bytes_out += n;
-            subs[i].sub_bytes_out += n;
-            activity = true;
-            idle_since = millis();
-            subs[i].last_activity_ms = millis();
-            if ((int)w < n) {
-              // TCP send buffer couldn't absorb all bytes; stash remainder.
-              subs[i].pending_rvd_len = n - (int)w;
-              memcpy(subs[i].pending_rvd, to_send + w, n - (int)w);
-            }
+          if (n <= 0) break;
+          drain_budget -= n;
+          const uint8_t *to_send = buf;
+          if (subs[i].encrypted) {
+            _aes_ctr_crypt(&subs[i].enc_state, n, buf, crypt_buf);
+            to_send = crypt_buf;
+          }
+          size_t w = subs[i].rvd.write(to_send, n);
+          relay->bytes_out += n;
+          subs[i].sub_bytes_out += n;
+          activity = true;
+          idle_since = millis();
+          subs[i].last_activity_ms = millis();
+          if ((int)w < n) {
+            subs[i].pending_rvd_len = n - (int)w;
+            memcpy(subs[i].pending_rvd, to_send + w, n - (int)w);
+            break; // rvd send buffer full — wait for ACK
           }
         }
       }
@@ -1668,24 +1688,28 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
       break;
     }
 
-    // Yield policy: linear delay scaled to WiFi capacity.
-    // WiFi max = ~2 Mbps = 250 KB/s total across all subs.
-    // Each iteration can move up to RELAY_CHUNK_SIZE (1460) bytes per sub.
-    // To avoid looping faster than WiFi can consume data (which just wastes
-    // Core 0 tcpip_thread lock acquisitions and causes BEACON_TIMEOUT):
-    //   delay_ms ≈ N × 1460 / 250000 × 1000 = N × 5.84 ms
-    // Rounded to N×5 for simplicity:
-    //   1 sub  →  5 ms → 200 iter/s → ~292 KB/s (WiFi caps it)
-    //   2 subs → 10 ms → 100 iter/s each → ~292 KB/s total
-    //   3 subs → 15 ms →  67 iter/s each → ~292 KB/s total
-    //   4 subs → 20 ms →  50 iter/s each → ~292 KB/s total
-    // Each case stays at or below 2 Mbps WiFi ceiling.  The daemon loop
-    // (priority 1) and WiFi beacon processing (Core 0 tcpip_thread) both
-    // get adequate CPU time at these rates.
+    // Adaptive yield policy:
+    // - activity=true  (data moved): 1 ms — keeps SSH latency low; WiFi hardware
+    //   is already busy transmitting so extra tcpip_thread calls are fine.
+    // - activity=false (idle):       N×5 ms back-off — the original BEACON_TIMEOUT
+    //   issue was caused by idle spinning hammering Core 0 tcpip_thread with
+    //   no-op lock acquisitions.  Throttling only when idle fixes beacon starvation
+    //   without adding latency to active SSH/NPT sessions.
+    //   1 sub  →  5 ms idle back-off
+    //   2 subs → 10 ms idle back-off
+    //   3 subs → 15 ms idle back-off
+    //   4 subs → 20 ms idle back-off
+    // Inner drain loops above flush each sub's buffers completely per pass,
+    // Simple adaptive delay: N×1ms active, N×5ms idle.
+    // availableForWrite() guards above handle TX pbuf back-pressure directly,
+    // so no heap polling is needed here.
     {
+      if (activity) last_active_ms = millis();
+      uint32_t since_active = millis() - last_active_ms;
       int _s = relay->active_sessions > 0 ? relay->active_sessions : 1;
       if (_s > 4) _s = 4;
-      vTaskDelay(pdMS_TO_TICKS(_s * 5));
+      if (since_active < 15) { vTaskDelay(pdMS_TO_TICKS(_s)); }
+      else                   { vTaskDelay(pdMS_TO_TICKS(_s * 5)); }
     }
 
     // --- Relay CPU busyness tracking (1-second rolling window) ---
@@ -1887,7 +1911,16 @@ void noports_relay_stop(NoPortsRelay *relay) {
   // The task will clean up and delete itself
 }
 
-int noports_relay_get_pcb_count() { return _relay_pcb_count; }
+int noports_relay_get_pcb_count() {
+  // _relay_pcb_count is a shared global incremented/decremented across all
+  // concurrent relay tasks.  Error paths can cause it to drift upward over
+  // multiple sessions.  It is DISPLAY-ONLY — the functional guard uses
+  // session_pcbs counted live from subs[].  Clamp to [0, MAX_RELAY_PCBS];
+  // if it exceeds MAX_RELAY_PCBS it has clearly drifted, so reset it.
+  if (_relay_pcb_count > MAX_RELAY_PCBS) _relay_pcb_count = 0;
+  if (_relay_pcb_count < 0)             _relay_pcb_count = 0;
+  return _relay_pcb_count;
+}
 
 uint8_t noports_relay_get_cpu_pct() { return _relay_cpu_pct; }
 

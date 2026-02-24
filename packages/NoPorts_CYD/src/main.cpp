@@ -701,7 +701,7 @@ static void _show_settings() {
 
 // Show config screen (called from dashboard's Settings/Config button)
 static void _on_config_saved() {
-  // Apply new keepalive value to the running daemon — no restart needed
+  // Apply new settings to the running daemon — no restart needed
   if (daemon_running) {
     String ka = ui_load_string(NVS_KEY_WORKER_KEEPALIVE);
     uint32_t ka_ms = (ka.length() > 0 && ka.toInt() > 0)
@@ -709,6 +709,11 @@ static void _on_config_saved() {
                      : 0;
     npDaemon.setWorkerKeepaliveMs(ka_ms);
     Serial.printf("[main] Worker keepalive updated: %u ms\n", ka_ms);
+
+    String mr = ui_load_string(NVS_KEY_MAX_RELAYS);
+    uint8_t max_r = (mr.length() > 0) ? (uint8_t)mr.toInt() : 4;
+    npDaemon.setMaxRelays(max_r);
+    Serial.printf("[main] Max relays updated: %u\n", (unsigned)max_r);
   }
   // Return to dashboard
   current_screen = SCREEN_DASHBOARD;

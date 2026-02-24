@@ -81,7 +81,8 @@ NoPortsDaemon::NoPortsDaemon()
   , _reconnect_failures(0)
   , _monitor_fail_streak(0)
   , _worker_keepalive_ms(NOPORTS_WORKER_KEEPALIVE_MS)
-  , _worker_last_used_ms(0) {
+  , _worker_last_used_ms(0)
+  , _max_relays(NOPORTS_MAX_RELAYS) {
   memset(_last_error, 0, sizeof(_last_error));
   memset(_root_host, 0, sizeof(_root_host));
   // Don't memset _relays — it contains WiFiClient C++ objects whose
@@ -378,9 +379,13 @@ void NoPortsDaemon::loop() {
   if (ret != 0) {
     // atclient_monitor_read sets message.type even on error — dispatch on it
     // so we don't needlessly kill a healthy worker TLS connection.
-    if (message.type == ATCLIENT_MONITOR_ERROR_PARSE_NOTIFICATION) {
-      // Malformed server message (e.g. statsNotification without trailing \n).
-      // The worker is uninvolved — dont't touch it.
+    if (message.type == ATCLIENT_MONITOR_ERROR_PARSE_NOTIFICATION ||
+        message.type == 0) {
+      // Malformed server message (e.g. statsNotification without trailing \n,
+      // or any other low-level parse failure where the SDK leaves type=0).
+      // The TLS socket and worker are uninvolved — don't touch either.
+      // If the socket is genuinely dead, _timeout_counter will eventually
+      // reach NOOP_TIMEOUT and trigger a clean reconnect via the normal path.
       NOPORTS_LOGD(TAG, "Monitor: ignoring unparseable server message (type=%d)", message.type);
       _timeout_counter++;   // count the same as an empty/noop
       atclient_monitor_message_free(&message);
@@ -550,6 +555,17 @@ void NoPortsDaemon::setWorkerKeepaliveMs(uint32_t ms) {
   // Reset last-used so the new interval starts from now.
   _worker_last_used_ms = millis();
   NOPORTS_LOGI(TAG, "Worker keep-alive set to %lu ms", (unsigned long)ms);
+}
+
+void NoPortsDaemon::setMaxRelays(uint8_t max) {
+  if (max < 1) max = 1;
+  if (max > NOPORTS_MAX_RELAYS) max = NOPORTS_MAX_RELAYS;
+  _max_relays = max;
+  NOPORTS_LOGI(TAG, "Max relay sessions set to %u", (unsigned)_max_relays);
+}
+
+uint8_t NoPortsDaemon::getMaxRelays() const {
+  return _max_relays;
 }
 
 void NoPortsDaemon::getThroughput(uint32_t &bytes_in, uint32_t &bytes_out) const {
@@ -992,7 +1008,7 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
   // Check if we have a free relay slot
   int slot = _findFreeRelaySlot();
   if (slot < 0) {
-    NOPORTS_LOGE(TAG, "NPT: no free relay slots (max %d)", NOPORTS_MAX_RELAYS);
+    NOPORTS_LOGE(TAG, "NPT: no free relay slots (max %d)", (int)_max_relays);
     cJSON_Delete(envelope);
     return;
   }
@@ -1241,6 +1257,13 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
         atclient_atkey_metadata_set_is_encrypted(meta, true);
         atclient_atkey_metadata_set_ttl(meta, 10000);
 
+        // _verifyEnvelopeSignature sent commands on the worker connection.
+        // A concurrent statsNotification push from the atServer can arrive
+        // in-band and leave a partial response in the worker's read buffer,
+        // making the next atclient_notify fail with "no ':' token".
+        // Reconnect here to guarantee a clean worker before the notify.
+        _reconnectWorker();
+
         atclient_notify_params nparams;
         atclient_notify_params_init(&nparams);
         atclient_notify_params_set_atkey(&nparams, &res_atkey);
@@ -1414,7 +1437,7 @@ bool NoPortsDaemon::_verifyEnvelopeContents(void *env, int payload_type) {
 // ============================================================================
 
 int NoPortsDaemon::_findFreeRelaySlot() {
-  for (int i = 0; i < NOPORTS_MAX_RELAYS; i++) {
+  for (int i = 0; i < _max_relays; i++) {
     if (!noports_relay_is_running(&_relays[i]) &&
         _relays[i].state != RELAY_CONNECTING &&
         _relays[i].state != RELAY_AUTHENTICATING) {

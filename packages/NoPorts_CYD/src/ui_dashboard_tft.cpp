@@ -181,8 +181,8 @@ static void _draw_stats_row2() {
   
   // --- TCP socket count (left zone) ---
   tft.fillRect(HEADER_PADDING + 4, y + 2, 105, 18, COLOR_BG_CARD);
-  snprintf(buf, sizeof(buf), "TCP: %d/13", _relay_tcp_count);
-  uint16_t tcp_color = _relay_tcp_count > 10 ? COLOR_ERROR : (_relay_tcp_count > 6 ? COLOR_ACCENT : COLOR_SUCCESS);
+  snprintf(buf, sizeof(buf), "TCP: %d/9", _relay_tcp_count);
+  uint16_t tcp_color = _relay_tcp_count >= 9 ? COLOR_ERROR : (_relay_tcp_count >= 7 ? COLOR_ACCENT : COLOR_SUCCESS);
   tft.setTextColor(tcp_color, COLOR_BG_CARD);
   tft.setTextDatum(ML_DATUM);
   tft.setTextSize(1);
