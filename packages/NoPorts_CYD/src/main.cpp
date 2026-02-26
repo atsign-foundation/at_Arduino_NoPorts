@@ -1113,5 +1113,6 @@ void loop() {
   // Record work time before yielding
   _cpu_work_us += (micros() - _cpu_loop_start_us);
 
+  ui_led_tick();  // advance breathing LED waveform every ~10ms tick
   delay(10);  // yield to FreeRTOS
 }

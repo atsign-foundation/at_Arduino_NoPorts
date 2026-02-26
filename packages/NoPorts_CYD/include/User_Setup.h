@@ -1,24 +1,39 @@
 /**
  * @file User_Setup.h
- * @brief TFT_eSPI configuration for CYD (ESP32-2432S028R)
+ * @brief TFT_eSPI configuration for CYD boards
  *
- * This file configures TFT_eSPI for the ILI9341 display and XPT2046 touch
- * controller on the CYD (Cheap Yellow Display) board.
+ * ESP32  (2432S028R / cyd2usb):  standard CYD SPI pins, XPT2046 resistive touch
+ * ESP32-S3 (FNK0104A/B cyd2usb_s3): Freenove display pins, FT6336U capacitive touch
  */
 
 // Display driver
 #define ILI9341_DRIVER
 
-// ESP32 Display pins (HSPI)
+#if defined(ESP32S3_2432S028R)
+// ── Freenove FNK0104 ESP32-S3 Display pins ──────────────────────────────────
+#define TFT_MISO 13
+#define TFT_MOSI 11
+#define TFT_SCLK 12
+#define TFT_CS   10
+#define TFT_DC   46
+#define TFT_RST  -1
+#define TFT_BL   45
+#define TFT_BACKLIGHT_ON HIGH
+#define TFT_RGB_ORDER TFT_BGR
+#define TFT_INVERSION_ON
+// Touch: FT6336U capacitive I2C (SDA=16, SCL=15, RST=18, INT=17) — not XPT2046
+#define TOUCH_CS -1
+#else
+// ── Standard CYD (ESP32-2432S028R) HSPI pins ────────────────────────────────
 #define TFT_MISO 12
 #define TFT_MOSI 13
 #define TFT_SCLK 14
 #define TFT_CS   15
 #define TFT_DC   2
 #define TFT_RST  -1  // Connected to ESP32 reset
-
 // Touch controller pins (shared SPI bus)
 #define TOUCH_CS 33
+#endif
 
 // Display size
 #define TFT_WIDTH  240

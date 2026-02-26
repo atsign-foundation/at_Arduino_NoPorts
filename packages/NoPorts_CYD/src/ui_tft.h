@@ -12,6 +12,7 @@
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
 #include <Preferences.h>
+#include <Wire.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
@@ -28,10 +29,23 @@
 #define TOUCH_CS   33
 #define TOUCH_IRQ  36
 
-// RGB LED pins (active low)
+// RGB LED pins (active low) — standard CYD (ESP32) only
+// GPIO 16 and 17 are FT6336U I2C pins on FNK0104 (ESP32-S3)
 #define LED_R 4
 #define LED_G 16
 #define LED_B 17
+
+#if defined(ESP32S3_2432S028R)
+// FNK0104 (Freenove ESP32-S3): FT6336U capacitive touch via I2C
+#define FT6336U_SDA   16
+#define FT6336U_SCL   15
+#define FT6336U_RST   18
+#define FT6336U_INT   17
+#define FT6336U_ADDR  0x38
+// FNK0104 RGB LED: single WS2812B NeoPixel on GPIO 42
+// (GPIO 16/17 are used for FT6336U I2C, not discrete LEDs)
+#define LED_WS2812_PIN 42
+#endif
 
 // ---------------------------------------------------------------------------
 // Color palette (16-bit RGB565)
@@ -144,10 +158,12 @@ bool ui_touch_is_calibrated();
  */
 TFT_eSPI& ui_get_tft();
 
+#if !defined(ESP32S3_2432S028R)
 /**
- * @brief Get reference to touch controller
+ * @brief Get reference to touch controller (CYD/ESP32 only — not on FNK0104 S3)
  */
 XPT2046_Touchscreen& ui_get_touch();
+#endif
 
 /**
  * @brief Poll touch input and return screen coordinates
@@ -192,9 +208,21 @@ void ui_draw_text_centered(const char *text, int16_t y, uint16_t color, uint8_t 
 void ui_set_backlight(bool on);
 
 /**
- * @brief Set RGB LED color (active low hardware)
+ * @brief Set RGB LED color (active low hardware). Clears any active breathe.
  */
 void ui_set_led(bool r, bool g, bool b);
+
+/**
+ * @brief Arm the breathing LED effect (sine-wave ramp like Apple sleep indicator).
+ * Call once when entering standby state; ui_led_tick() does the actual updates.
+ */
+void ui_led_breathe_start(bool r, bool g, bool b);
+
+/**
+ * @brief Drive LED updates — call from main loop every tick.
+ * Advances the breathe waveform when armed; no-op otherwise.
+ */
+void ui_led_tick();
 
 /**
  * @brief Load RGB LED state from NVS and apply

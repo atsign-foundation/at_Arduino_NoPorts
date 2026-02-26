@@ -490,8 +490,7 @@ void ui_dashboard_update(int active_relays, const char *daemon_state,
       if (delta_in + delta_out > 0)    ui_set_led(false, true, false);
       else if (active_relays > 0)      ui_set_led(true, true, false);
       else {
-        bool blink = ((millis() / 1000) % 2) == 0;
-        ui_set_led(false, blink, blink);
+        ui_led_breathe_start(false, true, true);  // cyan breathe — standby
       }
     }
     return;
@@ -555,9 +554,8 @@ void ui_dashboard_update(int active_relays, const char *daemon_state,
     } else if (active_relays > 0) {
       ui_set_led(true, true, false);    // amber — relay connected, idle
     } else {
-      // Daemon running but no relays — blink cyan slowly (on for even seconds)
-      bool blink = ((millis() / 1000) % 2) == 0;
-      ui_set_led(false, blink, blink);  // cyan blink — ready/waiting
+      // Daemon running but no relays — breathe cyan (Apple sleep indicator style)
+      ui_led_breathe_start(false, true, true);
     }
   }
   

@@ -6,6 +6,10 @@
 #include "ui_tft.h"
 #include <Arduino.h>
 #include <SPI.h>
+#include <math.h>
+#if defined(ESP32S3_2432S028R)
+#include <Adafruit_NeoPixel.h>
+#endif
 
 // ---------------------------------------------------------------------------
 // Global instances
@@ -14,7 +18,13 @@ static TFT_eSPI tft = TFT_eSPI();
 
 // CYD2USB: Touch uses a separate SPI bus (HSPI) with its own pins
 // MOSI=32, MISO=39, SCLK=25, CS=33, IRQ=36
+// FNK0104 (ESP32-S3): uses FT6336U capacitive I2C touch — XPT2046 not present
+#if !defined(ESP32S3_2432S028R)
 static XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
+#else
+// FNK0104: single WS2812B on GPIO 42
+static Adafruit_NeoPixel _ws2812(1, LED_WS2812_PIN, NEO_GRB + NEO_KHZ800);
+#endif
 
 static Preferences prefs;
 static bool prefs_opened = false;
@@ -53,6 +63,9 @@ static void _draw_crosshair(int16_t sx, int16_t sy, uint16_t color) {
 
 // Wait for touch and return raw XPT2046 coordinates
 static TS_Point _wait_for_touch_raw() {
+#if defined(ESP32S3_2432S028R)
+  return TS_Point(0, 0, 0);  // No XPT2046 on FNK0104
+#else
   // Wait for release first
   while (touch.touched()) { delay(10); }
   delay(100);
@@ -79,6 +92,7 @@ static TS_Point _wait_for_touch_raw() {
     return TS_Point(ax / samples, ay / samples, 1);
   }
   return TS_Point(0, 0, 0);
+#endif
 }
 
 /**
@@ -180,28 +194,47 @@ bool ui_touch_is_calibrated() {
 // ---------------------------------------------------------------------------
 
 void ui_tft_init() {
-  // Turn on backlight (GPIO 21 on CYD)
-  pinMode(21, OUTPUT);
-  digitalWrite(21, HIGH);
+  // Turn on backlight (DISPLAY_BCKL: GPIO 21 on CYD, GPIO 45 on FNK0104)
+  pinMode(DISPLAY_BCKL, OUTPUT);
+  digitalWrite(DISPLAY_BCKL, HIGH);
 
   // Initialize TFT
   tft.init();
   tft.setRotation(1);  // Landscape mode
   tft.fillScreen(COLOR_BG_DARK);
   
-  // Initialize touch on dedicated SPI pins
-  // CYD2USB touch pins: SCLK=25, MISO=39, MOSI=32
-  // The XPT2046 library uses the global SPI object internally.
-  // TFT_eSPI uses its own SPIClass(VSPI) instance, so redirecting
-  // the global SPI to touch pins does not affect display.
+  // Initialize touch
+#if !defined(ESP32S3_2432S028R)
+  // CYD2USB (ESP32): XPT2046 resistive touch on dedicated HSPI pins
+  // SCLK=25, MISO=39, MOSI=32, CS=33, IRQ=36
+  // TFT_eSPI uses its own SPIClass instance, so the global SPI can be
+  // redirected to the touch bus without affecting the display.
   SPI.begin(25, 39, 32, TOUCH_CS);
   touch.begin();
   touch.setRotation(1);
-  
-  // Initialize RGB LED pins
+#endif
+  // FNK0104 (ESP32-S3): FT6336U capacitive I2C touch — no XPT2046
+#if defined(ESP32S3_2432S028R)
+  // Reset FT6336U, then start I2C
+  pinMode(FT6336U_RST, OUTPUT);
+  digitalWrite(FT6336U_RST, LOW);
+  delay(10);
+  digitalWrite(FT6336U_RST, HIGH);
+  delay(300);
+  Wire.begin(FT6336U_SDA, FT6336U_SCL);
+  Serial.println("[ui_tft] FT6336U I2C touch initialized");
+  // WS2812B NeoPixel LED on GPIO 42
+  _ws2812.begin();
+  _ws2812.setBrightness(60);
+  _ws2812.clear();
+  _ws2812.show();
+  Serial.println("[ui_tft] WS2812B LED initialized");
+#else
+  // CYD/ESP32: three discrete active-LOW LEDs on GPIO 4/16/17
   pinMode(LED_R, OUTPUT);
   pinMode(LED_G, OUTPUT);
   pinMode(LED_B, OUTPUT);
+#endif
   
   // Load saved LED color or default to off
   ui_load_led_color();
@@ -225,15 +258,75 @@ TFT_eSPI& ui_get_tft() {
   return tft;
 }
 
+#if !defined(ESP32S3_2432S028R)
 XPT2046_Touchscreen& ui_get_touch() {
   return touch;
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // Touch handling
 // ---------------------------------------------------------------------------
 
 bool ui_touch_read(int16_t *x, int16_t *y) {
+#if defined(ESP32S3_2432S028R)
+  // FNK0104: FT6336U capacitive I2C touch
+  // Read TD_STATUS + P1 X/Y in a single burst from reg 0x02
+  Wire.beginTransmission(FT6336U_ADDR);
+  Wire.write(0x02);  // TD_STATUS register
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)FT6336U_ADDR, (uint8_t)5);
+  if (Wire.available() < 5) {
+    _touch_down = false;
+    _touch_fired = false;
+    _release_start = 0;
+    return false;
+  }
+  uint8_t td  = Wire.read();  // 0x02 TD_STATUS: lower nibble = number of touch points
+  uint8_t xh  = Wire.read();  // 0x03 P1_XH: bits[3:0] = X[11:8]
+  uint8_t xl  = Wire.read();  // 0x04 P1_XL: X[7:0]
+  uint8_t yh  = Wire.read();  // 0x05 P1_YH: bits[3:0] = Y[11:8]
+  uint8_t yl  = Wire.read();  // 0x06 P1_YL: Y[7:0]
+
+  if ((td & 0x0F) == 0) {
+    // No touch — sustain release timer before resetting edge state
+    if (_touch_down || _touch_fired) {
+      unsigned long now = millis();
+      if (_release_start == 0) {
+        _release_start = now;
+      } else if (now - _release_start >= TOUCH_RELEASE_MS) {
+        _touch_down  = false;
+        _touch_fired = false;
+        _release_start = 0;
+      }
+    }
+    return false;
+  }
+
+  _release_start = 0;
+  if (_touch_fired) return false;  // already reported this press
+
+  unsigned long now = millis();
+  if (_touch_down && (now - _last_touch_time < TOUCH_DEBOUNCE_MS)) return false;
+
+  // Decode portrait-space coordinates (raw_x: 0-239, raw_y: 0-319)
+  int16_t raw_x = (int16_t)(((xh & 0x0F) << 8) | xl);
+  int16_t raw_y = (int16_t)(((yh & 0x0F) << 8) | yl);
+
+  // Transform from portrait to landscape (tft.setRotation(1)):
+  //   landscape X (0..319) = portrait Y
+  //   landscape Y (0..239) = 239 - portrait X
+  *x = raw_y;
+  *y = 239 - raw_x;
+
+  *x = constrain(*x, 0, TFT_WIDTH  - 1);
+  *y = constrain(*y, 0, TFT_HEIGHT - 1);
+
+  _touch_down  = true;
+  _touch_fired = true;
+  _last_touch_time = now;
+  return true;
+#else
   unsigned long now = millis();
 
   if (!touch.touched()) {
@@ -286,6 +379,7 @@ bool ui_touch_read(int16_t *x, int16_t *y) {
   _last_touch_time = now;
   
   return true;
+#endif // !ESP32S3_2432S028R
 }
 
 bool ui_touch_in_rect(int16_t tx, int16_t ty, int16_t x, int16_t y, int16_t w, int16_t h) {
@@ -363,15 +457,63 @@ void ui_draw_text_centered(const char *text, int16_t y, uint16_t color, uint8_t 
 // LED control
 // ---------------------------------------------------------------------------
 
+// Breathe state
+static bool _breathe_active = false;
+static bool _breathe_r = false, _breathe_g = false, _breathe_b = false;
+static uint32_t _breathe_start_ms = 0;  // millis() when armed, for phase continuity
+
 void ui_set_backlight(bool on) {
-  digitalWrite(21, on ? HIGH : LOW);
+  digitalWrite(DISPLAY_BCKL, on ? HIGH : LOW);
 }
 
 void ui_set_led(bool r, bool g, bool b) {
-  // CYD RGB LED is active LOW
-  digitalWrite(LED_R, !r);
-  digitalWrite(LED_G, !g);
-  digitalWrite(LED_B, !b);
+  _breathe_active = false;  // solid colour cancels breathe
+#if defined(ESP32S3_2432S028R)
+  // FNK0104: WS2812B NeoPixel — map bool r/g/b to full RGB byte values
+  _ws2812.setPixelColor(0, _ws2812.Color(r ? 80 : 0, g ? 80 : 0, b ? 80 : 0));
+  _ws2812.show();
+#else
+  // CYD: active-low LEDs via analogWrite (LEDC) for consistency with breathe mode
+  analogWrite(LED_R, r ? 0 : 255);
+  analogWrite(LED_G, g ? 0 : 255);
+  analogWrite(LED_B, b ? 0 : 255);
+#endif
+}
+
+void ui_led_breathe_start(bool r, bool g, bool b) {
+  if (!_breathe_active || _breathe_r != r || _breathe_g != g || _breathe_b != b) {
+    _breathe_active   = true;
+    _breathe_r = r; _breathe_g = g; _breathe_b = b;
+    // Don't reset _breathe_start_ms so phase stays continuous across calls
+  }
+}
+
+void ui_led_tick() {
+  if (!_breathe_active) return;
+
+  static uint32_t last_ms = 0;
+  uint32_t now = millis();
+  if (now - last_ms < 30) return;  // ~33 fps cap
+  last_ms = now;
+
+  // 4-second sine cycle with gamma — rise² keeps the LED dim most of the time
+  // (the Apple sleep-indicator characteristic)
+  float t     = (float)(now % 4000u) / 4000.0f;
+  float rise  = (1.0f - cosf(2.0f * (float)M_PI * t)) * 0.5f;
+  float gamma = rise * rise;
+  uint8_t val = (uint8_t)(gamma * 60.0f + 0.5f);  // peak ≈ 24%
+
+#if defined(ESP32S3_2432S028R)
+  _ws2812.setPixelColor(0, _ws2812.Color(
+    _breathe_r ? val : 0,
+    _breathe_g ? val : 0,
+    _breathe_b ? val : 0));
+  _ws2812.show();
+#else
+  analogWrite(LED_R, _breathe_r ? (255 - val) : 255);
+  analogWrite(LED_G, _breathe_g ? (255 - val) : 255);
+  analogWrite(LED_B, _breathe_b ? (255 - val) : 255);
+#endif
 }
 
 void ui_load_led_color() {

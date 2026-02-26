@@ -142,27 +142,24 @@ static volatile uint8_t  _relay_cpu_pct     = 0;  // last computed busyness (0-1
 // refused connections during normal SSH/HTTP use.
 #define MIN_HEAP_FOR_SUB 15000
 
-// Heap level at which the relay loop switches to OOM mode (shorter write
-// timeout in _write_all) and sleeps 50 ms per iteration to let lwIP's
-// tcpip_thread ACK and free in-flight pbufs.  The relay loop always drains
-// receive buffers regardless of heap level (stopping reads deadlocks: pbufs
-// are never freed so the heap never recovers).  Back-pressure on reads is
-// provided naturally by the pending_* buffers: once full, no new read happens.
-// At this level we do NOT evict subs — a sub idle for only a few ms is in a
-// burst gap (SSH is plain TCP), not a zombie.
-#define HEAP_OOM_FLOOR 14000
+// Heap level at which the relay loop switches to OOM mode and sleeps 50 ms
+// per iteration to let lwIP's tcpip_thread drain in-flight pbufs.
+// Set at 20 KB — well below the normal burst floor of ~28 KB observed with
+// 2 active sessions, so this only fires when heap is genuinely exhausted
+// (not during normal burst dips).  At this level lwIP struggles to allocate
+// pbufs; the 50 ms sleep gives tcpip_thread several ACK cycles to free them.
+#define HEAP_OOM_FLOOR 20000
 
-// Below this floor we will evict — but ONLY a sub that has been truly idle
-// for CRITICAL_MIN_IDLE_MS.  A sub that transferred data <30 s ago is not
-// a zombie; it is in a burst gap and its heap will be returned when lwIP
-// drains the in-flight pbufs.  Killing it wastes a TCP session for nothing.
-// At this level we always sleep 50 ms regardless of whether we evicted.
-#define HEAP_CRITICAL_LOW 12000
+// Below this floor evict the oldest active sub immediately (any idle time).
+// 15 KB is below lwIP's minimum viable allocation level — if we reach here
+// during data transfer, something is genuinely wrong and freeing a sub
+// (releasing 2 PCB descriptors + pending buffers ~3 KB) is the best option.
+#define HEAP_CRITICAL_LOW 15000
 
-// Minimum idle time (ms) before CRITICAL_LOW will evict a sub.
-// 30 s covers the longest normal inter-burst gap seen in SSH + HTTPS mux.
-// Subs idle longer than this are genuine zombies (hung keep-alive / lost FIN).
-#define CRITICAL_MIN_IDLE_MS 30000UL
+// Minimum idle time before CRITICAL_LOW evicts a sub.  0 = evict the oldest
+// active sub immediately regardless of recent activity — at ≤15 KB we cannot
+// afford to wait for a zombie.
+#define CRITICAL_MIN_IDLE_MS 0UL
 
 // OOM mode flag — set by the main relay loop when heap < HEAP_OOM_FLOOR,
 // read by _write_all() to use a shorter stall timeout so it bails quickly
@@ -1843,30 +1840,25 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
 
     // Heap-floor OOM management.
     //
-    // When free heap falls below HEAP_OOM_FLOOR (14 KB) we have two
-    // problems simultaneously:
-    //   1. lwIP can't allocate pbufs → write() returns EAGAIN for all subs
-    //   2. _write_all spins for up to 5 s per call, blocking the whole loop
+    // Only fires when heap is truly exhausted (< HEAP_OOM_FLOOR = 20 KB).
+    // Normal burst dips with 2-3 sessions (~28-36 KB floor) do NOT trigger
+    // this — those are temporary and self-resolve once pbufs drain.
     //
-    // Strategy:
-    //   HEAP_OOM_FLOOR (14 KB): pure back-pressure — set OOM mode (short
-    //     write timeout) and sleep 50 ms to let lwIP's tcpip_thread ACK and
-    //     free in-flight pbufs.  DO NOT evict: a pbuf burst that dips below
-    //     14 KB will self-resolve within a few 50ms sleeps once pbufs drain.
+    //   HEAP_OOM_FLOOR (20 KB): back-pressure — sleep 50 ms to let
+    //     tcpip_thread ACK and free in-flight pbufs.
     //
-    //   HEAP_CRITICAL_LOW (12 KB): same, but also evict a genuine zombie sub
-    //     (idle ≥ CRITICAL_MIN_IDLE_MS = 30 s).  A recently-active sub is just
-    //     in a burst gap; killing it is pointless.
+    //   HEAP_CRITICAL_LOW (15 KB): also evict the oldest active sub
+    //     immediately (any idle time) to free 2 PCB slots + pending buffers.
     {
       uint32_t cur_heap = esp_get_free_heap_size();
       if (cur_heap < HEAP_OOM_FLOOR) {
         _relay_oom_mode = true;
         if (cur_heap < HEAP_CRITICAL_LOW) {
-          // Evict only a genuine zombie (idle ≥ 30 s); otherwise back-pressure
+          // Evict oldest active sub regardless of idle time at CRITICAL_LOW
           int victim = _find_oldest_active_sub(subs, n_subs, CRITICAL_MIN_IDLE_MS);
           if (victim < 0) victim = _find_evictable_sub(subs, n_subs);
           if (victim >= 0) {
-            NOPORTS_LOGW(TAG, "CRITICAL evict Sub[%d] (heap=%u < %u, idle=%lums — zombie)",
+            NOPORTS_LOGW(TAG, "CRITICAL evict Sub[%d] (heap=%u < %u, idle=%lums — freeing for TLS)",
                          victim, (unsigned)cur_heap, HEAP_CRITICAL_LOW,
                          millis() - subs[victim].last_activity_ms);
             _close_relay_sub(&subs[victim], victim);
