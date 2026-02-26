@@ -264,7 +264,7 @@ static bool start_daemon() {
   {
     String ms = ui_load_string(NVS_KEY_MAX_RELAYS);
     uint8_t max_r = (ms.length() > 0 && ms.toInt() >= 1)
-                    ? (uint8_t)constrain(ms.toInt(), 1, 5) : 2;
+                    ? (uint8_t)constrain(ms.toInt(), 1, NOPORTS_MAX_RELAYS) : 2;
     npDaemon.setMaxRelays(max_r);
     Serial.printf("[main] Max TCP clients configured: %d\n", (int)max_r);
   }
@@ -733,7 +733,7 @@ static void _on_config_saved() {
 
     String ms = ui_load_string(NVS_KEY_MAX_RELAYS);
     uint8_t max_r = (ms.length() > 0 && ms.toInt() >= 1)
-                    ? (uint8_t)constrain(ms.toInt(), 1, 5) : 2;
+                    ? (uint8_t)constrain(ms.toInt(), 1, NOPORTS_MAX_RELAYS) : 2;
     npDaemon.setMaxRelays(max_r);
     Serial.printf("[main] Max TCP clients updated: %d\n", (int)max_r);
   }

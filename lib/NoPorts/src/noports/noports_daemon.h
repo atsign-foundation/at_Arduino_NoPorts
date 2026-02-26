@@ -20,8 +20,13 @@
 #include "noports_config.h"
 #include "noports_relay.h"
 
-// Maximum concurrent relays (limited by ESP32 memory/sockets)
+// Maximum concurrent relays (limited by memory/sockets)
+// S3 has more SRAM/PSRAM and a larger lwIP PCB pool (see sdkconfig.defaults.s3)
+#ifdef ESP32S3_2432S028R
+#define NOPORTS_MAX_RELAYS 6
+#else
 #define NOPORTS_MAX_RELAYS 5
+#endif
 
 /**
  * @brief NoPorts daemon states
@@ -140,7 +145,7 @@ public:
   // Max TCP session slots per relay task (1–4, default 2).
   // Each slot = one rvd socket + one local socket.
   // The relay PCB budget check enforces the hardware limit independently.
-  void setMaxRelays(uint8_t max) { _max_relays = (max >= 1 && max <= 5) ? max : 2; }
+  void setMaxRelays(uint8_t max) { _max_relays = (max >= 1 && max <= NOPORTS_MAX_RELAYS) ? max : 2; }
   uint8_t getMaxRelays() const { return _max_relays; }
 
 private:

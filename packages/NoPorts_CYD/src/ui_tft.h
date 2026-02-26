@@ -98,7 +98,7 @@ struct UiEvent {
 #define NVS_KEY_MANAGERS  "managers"   // comma-separated atSign list e.g. "@colin,@cconstab"
 #define NVS_KEY_PERMITOPEN "permitopen" // comma-separated host:port rules e.g. "localhost:22,localhost:80"
 #define NVS_KEY_WORKER_KEEPALIVE "worker_ka"  // worker TLS keepalive interval in minutes (0=off)
-#define NVS_KEY_MAX_RELAYS       "max_relays"  // max relay sub-connections per session (1-5)
+#define NVS_KEY_MAX_RELAYS       "max_relays"  // max relay sub-connections per session (1-5 on ESP32, 1-6 on S3)
 
 #define PERMITOPEN_PATH   "/permitopen.json"
 #define ATKEYS_PATH       "/atkeys.json"           // Arduino LittleFS API (auto-prepends /littlefs)

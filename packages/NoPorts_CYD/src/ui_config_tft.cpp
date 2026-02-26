@@ -117,7 +117,7 @@ static void _draw_rows() {
   y += 12;
 
   // ── Concurrent TCP sessions per relay ──
-  _draw_stepper(y, "TCP clients:", _max_subs, 1, 5);
+  _draw_stepper(y, "TCP clients:", _max_subs, 1, 6);
 }
 
 static void _draw_buttons() {
@@ -195,14 +195,14 @@ bool ui_config_handle_touch(int16_t tx, int16_t ty) {
     if (ui_touch_in_rect(tx, ty, STEP_MINUS_X, y, STEP_MINUS_W, ROW_H)) {
       if (_max_subs > 1) {
         _max_subs--;
-        _draw_stepper(y, "TCP clients:", _max_subs, 1, 5);
+        _draw_stepper(y, "TCP clients:", _max_subs, 1, 6);
       }
       return true;
     }
     if (ui_touch_in_rect(tx, ty, STEP_PLUS_X, y, STEP_PLUS_W, ROW_H)) {
-      if (_max_subs < 5) {
+      if (_max_subs < 6) {
         _max_subs++;
-        _draw_stepper(y, "TCP clients:", _max_subs, 1, 5);
+        _draw_stepper(y, "TCP clients:", _max_subs, 1, 6);
       }
       return true;
     }
@@ -214,7 +214,7 @@ bool ui_config_handle_touch(int16_t tx, int16_t ty) {
     String ka = ui_load_string(NVS_KEY_WORKER_KEEPALIVE);
     _keepalive_min = (ka.length() > 0) ? (int)ka.toInt() : 4;
     String ms = ui_load_string(NVS_KEY_MAX_RELAYS);
-    _max_subs = (ms.length() > 0) ? (int)constrain(ms.toInt(), 1, 5) : 2;
+    _max_subs = (ms.length() > 0) ? (int)constrain(ms.toInt(), 1, 6) : 2;
     Serial.println("[config] BACK — changes discarded");
     if (_on_save_cb) _on_save_cb();
     return true;
