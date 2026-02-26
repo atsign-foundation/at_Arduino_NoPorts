@@ -21,7 +21,7 @@
 #include "noports_relay.h"
 
 // Maximum concurrent relays (limited by ESP32 memory/sockets)
-#define NOPORTS_MAX_RELAYS 4
+#define NOPORTS_MAX_RELAYS 5
 
 /**
  * @brief NoPorts daemon states
@@ -119,7 +119,8 @@ public:
 
   /**
    * @brief Get relay task CPU busyness percentage (0-100).
-   *        Based on busy/idle iteration ratio over a 1-second window.
+   *        Time-weighted: measures fraction of wall-clock time where data was
+   *        actually forwarded, over a 1-second rolling window.
    *        Returns 0 when no relay session is active.
    */
   uint8_t getRelayCpuPct() const;
@@ -133,13 +134,13 @@ public:
   void setWorkerKeepaliveMs(uint32_t ms);
 
   /**
-   * @brief Set maximum concurrent relay sub-connections (1–4, default 2).
+   * @brief Set maximum concurrent relay sub-connections (1–5, default 2).
    *        Takes effect on the next NPT request; does not affect running sessions.
    */
   // Max TCP session slots per relay task (1–4, default 2).
   // Each slot = one rvd socket + one local socket.
   // The relay PCB budget check enforces the hardware limit independently.
-  void setMaxRelays(uint8_t max) { _max_relays = (max >= 1 && max <= 4) ? max : 2; }
+  void setMaxRelays(uint8_t max) { _max_relays = (max >= 1 && max <= 5) ? max : 2; }
   uint8_t getMaxRelays() const { return _max_relays; }
 
 private:
@@ -165,9 +166,15 @@ private:
   // Monitor regex
   char *_monitor_regex;
 
-  // Root server
-  char   _root_host[254];
+  // Root server (atDirectory)
+  char     _root_host[254];
   uint16_t _root_port;
+
+  // Resolved atServer address — populated once at startup via atdirectory_lookup_once().
+  // Subsequent pkam_authenticate calls use this directly, avoiding a root TLS
+  // connection on every monitor/worker reconnect.  Empty string = not yet resolved.
+  char     _atserver_host[254];
+  uint16_t _atserver_port;
 
   // Active relays
   NoPortsRelay _relays[NOPORTS_MAX_RELAYS];

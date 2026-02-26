@@ -30,6 +30,7 @@
 extern "C" {
   #include "atclient/atclient.h"
   #include "atclient/atclient_utils.h"
+  #include "atdirectory.h"
   #include "atclient/atkey.h"
   #include "atclient/atkeys.h"
   #include "atclient/monitor.h"
@@ -82,9 +83,11 @@ NoPortsDaemon::NoPortsDaemon()
   , _monitor_fail_streak(0)
   , _worker_keepalive_ms(NOPORTS_WORKER_KEEPALIVE_MS)
   , _worker_last_used_ms(0)
-  , _max_relays(2) {
+  , _max_relays(2)
+  , _atserver_port(0) {
   memset(_last_error, 0, sizeof(_last_error));
   memset(_root_host, 0, sizeof(_root_host));
+  memset(_atserver_host, 0, sizeof(_atserver_host));
   // Don't memset _relays — it contains WiFiClient C++ objects whose
   // constructors have already run.  Zero only the POD fields.
   for (int i = 0; i < NOPORTS_MAX_RELAYS; i++) {
@@ -214,6 +217,33 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
   }
 
   NOPORTS_LOGI(TAG, "Root server: %s:%d", _root_host, _root_port);
+
+  // ---- Resolve atServer address (once, cached for all reconnects) ----
+  // We do a single root-directory TLS lookup here and cache the result.
+  // All subsequent pkam_authenticate calls (monitor, worker, reconnects)
+  // use set_atserver_host/port directly — no further root TLS connections
+  // are needed, saving a transient PCB and ~36 KB of TLS handshake heap
+  // on every reconnect.
+  {
+    char *resolved_host = nullptr;
+    uint16_t resolved_port = 0;
+    int lookup_res = atdirectory_lookup_once(_root_host, _root_port,
+                                             _config.atsign,
+                                             &resolved_host, &resolved_port);
+    if (lookup_res == 0 && resolved_host && resolved_port > 0) {
+      snprintf(_atserver_host, sizeof(_atserver_host), "%s", resolved_host);
+      _atserver_port = resolved_port;
+      free(resolved_host);
+      NOPORTS_LOGI(TAG, "atServer resolved: %s:%d (cached for reconnects)",
+                   _atserver_host, _atserver_port);
+    } else {
+      // Lookup failed — leave _atserver_host empty; auth will fall back to
+      // setting atdirectory_host/port and do the lookup itself.
+      if (resolved_host) free(resolved_host);
+      NOPORTS_LOGW(TAG, "atServer lookup failed (%d) — auth will retry via root",
+                   lookup_res);
+    }
+  }
 
   // ---- Load atKeys ----
   _atkeys = calloc(1, sizeof(atclient_atkeys));
@@ -588,10 +618,18 @@ bool NoPortsDaemon::_authenticate() {
     return false;
   }
   atclient_authenticate_options_init((atclient_authenticate_options *)_monitor_options);
-  atclient_authenticate_options_set_atdirectory_host(
-    (atclient_authenticate_options *)_monitor_options, _root_host);
-  atclient_authenticate_options_set_atdirectory_port(
-    (atclient_authenticate_options *)_monitor_options, _root_port);
+  if (_atserver_host[0] != '\0') {
+    // Use cached atServer address — no root directory TLS connection needed.
+    atclient_authenticate_options_set_atserver_host(
+      (atclient_authenticate_options *)_monitor_options, _atserver_host);
+    atclient_authenticate_options_set_atserver_port(
+      (atclient_authenticate_options *)_monitor_options, _atserver_port);
+  } else {
+    atclient_authenticate_options_set_atdirectory_host(
+      (atclient_authenticate_options *)_monitor_options, _root_host);
+    atclient_authenticate_options_set_atdirectory_port(
+      (atclient_authenticate_options *)_monitor_options, _root_port);
+  }
 
   NOPORTS_LOGI(TAG, "Authenticating monitor client for %s...", _config.atsign);
   res = atclient_monitor_pkam_authenticate(
@@ -623,10 +661,17 @@ bool NoPortsDaemon::_authenticate() {
     return false;
   }
   atclient_authenticate_options_init((atclient_authenticate_options *)_worker_options);
-  atclient_authenticate_options_set_atdirectory_host(
-    (atclient_authenticate_options *)_worker_options, _root_host);
-  atclient_authenticate_options_set_atdirectory_port(
-    (atclient_authenticate_options *)_worker_options, _root_port);
+  if (_atserver_host[0] != '\0') {
+    atclient_authenticate_options_set_atserver_host(
+      (atclient_authenticate_options *)_worker_options, _atserver_host);
+    atclient_authenticate_options_set_atserver_port(
+      (atclient_authenticate_options *)_worker_options, _atserver_port);
+  } else {
+    atclient_authenticate_options_set_atdirectory_host(
+      (atclient_authenticate_options *)_worker_options, _root_host);
+    atclient_authenticate_options_set_atdirectory_port(
+      (atclient_authenticate_options *)_worker_options, _root_port);
+  }
 
   NOPORTS_LOGI(TAG, "Authenticating worker client for %s...", _config.atsign);
   res = atclient_pkam_authenticate(

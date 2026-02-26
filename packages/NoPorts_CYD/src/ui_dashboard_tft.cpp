@@ -193,7 +193,7 @@ static void _draw_stats_row2() {
   uint16_t cpu_color = COLOR_SUCCESS;  // green < 50%
   if (_cpu_pct >= 80) cpu_color = COLOR_ERROR;       // red >= 80%
   else if (_cpu_pct >= 50) cpu_color = COLOR_ACCENT;  // orange >= 50%
-  snprintf(buf, sizeof(buf), "CPU: %d%%", _cpu_pct);
+  snprintf(buf, sizeof(buf), "Relay: %d%%", _cpu_pct);
   tft.setTextColor(cpu_color, COLOR_BG_CARD);
   tft.setTextDatum(MC_DATUM);
   tft.drawString(buf, TFT_WIDTH / 2, y + 11, 2);

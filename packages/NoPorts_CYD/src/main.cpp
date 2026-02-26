@@ -16,6 +16,7 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <WiFi.h>
+#include <esp_wifi.h>   // esp_wifi_set_ps / WIFI_PS_NONE
 #include <NoPorts.h>
 #include "esp_bt.h"
 
@@ -263,7 +264,7 @@ static bool start_daemon() {
   {
     String ms = ui_load_string(NVS_KEY_MAX_RELAYS);
     uint8_t max_r = (ms.length() > 0 && ms.toInt() >= 1)
-                    ? (uint8_t)constrain(ms.toInt(), 1, 4) : 2;
+                    ? (uint8_t)constrain(ms.toInt(), 1, 5) : 2;
     npDaemon.setMaxRelays(max_r);
     Serial.printf("[main] Max TCP clients configured: %d\n", (int)max_r);
   }
@@ -571,6 +572,12 @@ static void _on_enrolled() {
 }
 
 static void on_wifi_connected() {
+  // Disable modem sleep: under heavy TCP relay traffic the radio can't
+  // maintain its periodic sleep schedule and triggers BEACON_TIMEOUT (reason 200),
+  // dropping the association.  WIFI_PS_NONE keeps the radio continuously active.
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  Serial.println("[main] WiFi power save disabled");
+
   TFT_eSPI &tft = ui_get_tft();
 
   // Show NTP sync status
@@ -629,6 +636,11 @@ static void _show_restart_status(const char *line1, const char *line2 = nullptr)
 }
 
 static void _on_wifi_reconnected() {
+  // Re-apply WIFI_PS_NONE: the reconnect path resets the WiFi stack and
+  // the power-save setting is lost on each new association.
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  Serial.println("[main] WiFi power save disabled (reconnect)");
+
   _show_restart_status("Syncing time...");
   sync_ntp_time();
 
@@ -721,7 +733,7 @@ static void _on_config_saved() {
 
     String ms = ui_load_string(NVS_KEY_MAX_RELAYS);
     uint8_t max_r = (ms.length() > 0 && ms.toInt() >= 1)
-                    ? (uint8_t)constrain(ms.toInt(), 1, 4) : 2;
+                    ? (uint8_t)constrain(ms.toInt(), 1, 5) : 2;
     npDaemon.setMaxRelays(max_r);
     Serial.printf("[main] Max TCP clients updated: %d\n", (int)max_r);
   }
@@ -1088,7 +1100,7 @@ void loop() {
           ui_dashboard_update(npDaemon.getActiveRelayCount(),
                             daemon_state_str(npDaemon.getState()),
                             _total_tunnels, _total_pings,
-                            tp_in, tp_out, _cpu_pct,
+                            tp_in, tp_out, npDaemon.getRelayCpuPct(),
                             npDaemon.getRelayPcbCount());
         }
       }

@@ -42,7 +42,7 @@
 static void (*_on_save_cb)() = nullptr;
 
 static int _keepalive_min = 4;   // 0 = off, 1-15 minutes
-static int _max_subs      = 2;   // 1-4 relay sub-connections per session
+static int _max_subs      = 2;   // 1-5 relay sub-connections per session
 
 // ---------------------------------------------------------------------------
 // Drawing helpers
@@ -117,7 +117,7 @@ static void _draw_rows() {
   y += 12;
 
   // ── Concurrent TCP sessions per relay ──
-  _draw_stepper(y, "TCP clients:", _max_subs, 1, 4);
+  _draw_stepper(y, "TCP clients:", _max_subs, 1, 5);
 }
 
 static void _draw_buttons() {
@@ -159,7 +159,7 @@ void ui_config_create(void (*on_save)()) {
   if (_keepalive_min > 15) _keepalive_min = 15;
 
   String ms = ui_load_string(NVS_KEY_MAX_RELAYS);
-  _max_subs = (ms.length() > 0) ? (int)constrain(ms.toInt(), 1, 4) : 2;
+  _max_subs = (ms.length() > 0) ? (int)constrain(ms.toInt(), 1, 5) : 2;
 
   _draw_screen();
 }
@@ -195,14 +195,14 @@ bool ui_config_handle_touch(int16_t tx, int16_t ty) {
     if (ui_touch_in_rect(tx, ty, STEP_MINUS_X, y, STEP_MINUS_W, ROW_H)) {
       if (_max_subs > 1) {
         _max_subs--;
-        _draw_stepper(y, "TCP clients:", _max_subs, 1, 4);
+        _draw_stepper(y, "TCP clients:", _max_subs, 1, 5);
       }
       return true;
     }
     if (ui_touch_in_rect(tx, ty, STEP_PLUS_X, y, STEP_PLUS_W, ROW_H)) {
-      if (_max_subs < 4) {
+      if (_max_subs < 5) {
         _max_subs++;
-        _draw_stepper(y, "TCP clients:", _max_subs, 1, 4);
+        _draw_stepper(y, "TCP clients:", _max_subs, 1, 5);
       }
       return true;
     }
@@ -214,7 +214,7 @@ bool ui_config_handle_touch(int16_t tx, int16_t ty) {
     String ka = ui_load_string(NVS_KEY_WORKER_KEEPALIVE);
     _keepalive_min = (ka.length() > 0) ? (int)ka.toInt() : 4;
     String ms = ui_load_string(NVS_KEY_MAX_RELAYS);
-    _max_subs = (ms.length() > 0) ? (int)constrain(ms.toInt(), 1, 4) : 2;
+    _max_subs = (ms.length() > 0) ? (int)constrain(ms.toInt(), 1, 5) : 2;
     Serial.println("[config] BACK — changes discarded");
     if (_on_save_cb) _on_save_cb();
     return true;
