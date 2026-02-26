@@ -1101,7 +1101,8 @@ void loop() {
                             daemon_state_str(npDaemon.getState()),
                             _total_tunnels, _total_pings,
                             tp_in, tp_out, npDaemon.getRelayCpuPct(),
-                            npDaemon.getRelayPcbCount());
+                            npDaemon.getRelayPcbCount(),
+                            npDaemon.getRelayPcbMax());
         }
       }
       break;

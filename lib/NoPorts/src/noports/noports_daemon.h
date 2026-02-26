@@ -123,6 +123,11 @@ public:
   int getRelayPcbCount() const;
 
   /**
+   * @brief Get the maximum number of relay TCP sockets allowed (platform-dependent)
+   */
+  int getRelayPcbMax() const;
+
+  /**
    * @brief Get relay task CPU busyness percentage (0-100).
    *        Time-weighted: measures fraction of wall-clock time where data was
    *        actually forwarded, over a 1-second rolling window.

@@ -39,6 +39,7 @@ static uint32_t _boot_ms = 0;
 static int _active_relays = 0;
 static uint32_t _total_tunnels = 0;
 static int _relay_tcp_count = 0;
+static int _relay_pcb_max = 11;
 static uint32_t _total_pings = 0;
 static char _daemon_state[32] = "init";
 static uint8_t _cpu_pct = 0;
@@ -181,8 +182,11 @@ static void _draw_stats_row2() {
   
   // --- TCP socket count (left zone) ---
   tft.fillRect(HEADER_PADDING + 4, y + 2, 105, 18, COLOR_BG_CARD);
-  snprintf(buf, sizeof(buf), "TCP: %d/13", _relay_tcp_count);
-  uint16_t tcp_color = _relay_tcp_count > 10 ? COLOR_ERROR : (_relay_tcp_count > 6 ? COLOR_ACCENT : COLOR_SUCCESS);
+  snprintf(buf, sizeof(buf), "TCP: %d/%d", _relay_tcp_count, _relay_pcb_max);
+  // warn at >85%, error at >90% of max
+  int tcp_warn  = (_relay_pcb_max * 85) / 100;
+  int tcp_error = (_relay_pcb_max * 90) / 100;
+  uint16_t tcp_color = _relay_tcp_count > tcp_error ? COLOR_ERROR : (_relay_tcp_count > tcp_warn ? COLOR_ACCENT : COLOR_SUCCESS);
   tft.setTextColor(tcp_color, COLOR_BG_CARD);
   tft.setTextDatum(ML_DATUM);
   tft.setTextSize(1);
@@ -467,7 +471,8 @@ void ui_dashboard_create(void (*on_reset)(), void (*on_settings)(), void (*on_wi
 void ui_dashboard_update(int active_relays, const char *daemon_state,
                          uint32_t total_tunnels, uint32_t total_pings,
                          uint32_t bytes_in, uint32_t bytes_out,
-                         uint8_t cpu_pct, int relay_tcp_count) {
+                         uint8_t cpu_pct, int relay_tcp_count,
+                         int relay_pcb_max) {
   // — — — screen-off early exit — — —
   // Still drain the event queue so log entries aren't lost, but skip
   // all TFT writes to save SPI bandwidth / CPU while backlight is off.
@@ -532,8 +537,9 @@ void ui_dashboard_update(int active_relays, const char *daemon_state,
     stats_changed = true;
   }
 
-  if (_relay_tcp_count != relay_tcp_count) {
+  if (_relay_tcp_count != relay_tcp_count || _relay_pcb_max != relay_pcb_max) {
     _relay_tcp_count = relay_tcp_count;
+    _relay_pcb_max    = relay_pcb_max;
     stats_changed = true;
   }
 

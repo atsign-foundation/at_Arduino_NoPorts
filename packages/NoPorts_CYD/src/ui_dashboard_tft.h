@@ -25,7 +25,8 @@ void ui_dashboard_create(void (*on_reset)() = nullptr, void (*on_settings)() = n
 void ui_dashboard_update(int active_relays, const char *daemon_state,
                          uint32_t total_tunnels, uint32_t total_pings,
                          uint32_t bytes_in = 0, uint32_t bytes_out = 0,
-                         uint8_t cpu_pct = 0, int relay_tcp_count = 0);
+                         uint8_t cpu_pct = 0, int relay_tcp_count = 0,
+                         int relay_pcb_max = 11);
 
 /**
  * @brief Handle touch input on dashboard

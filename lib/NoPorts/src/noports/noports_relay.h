@@ -131,6 +131,11 @@ bool noports_relay_is_running(const NoPortsRelay *relay);
 int noports_relay_get_pcb_count();
 
 /**
+ * @brief Get the maximum number of relay TCP sockets allowed (platform-dependent)
+ */
+int noports_relay_get_pcb_max();
+
+/**
  * @brief Get relay task CPU busyness (0-100%).
  *        Measured as the ratio of data-moving iterations to total iterations
  *        over a 1-second rolling window inside the relay FreeRTOS task.

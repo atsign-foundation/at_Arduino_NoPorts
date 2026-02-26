@@ -576,6 +576,10 @@ int NoPortsDaemon::getRelayPcbCount() const {
   return noports_relay_get_pcb_count();
 }
 
+int NoPortsDaemon::getRelayPcbMax() const {
+  return noports_relay_get_pcb_max();
+}
+
 uint8_t NoPortsDaemon::getRelayCpuPct() const {
   return noports_relay_get_cpu_pct();
 }

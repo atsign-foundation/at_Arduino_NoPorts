@@ -1766,20 +1766,32 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
       if (!subs[i].active) continue;
 
       // Peer-close detection using reliable recv(MSG_PEEK).
-      // When one side sends FIN (half-close), enter the non-blocking
-      // drain state.  The actual data forwarding happens at the TOP of
-      // this for-loop on subsequent iterations so all other active subs
-      // (SSH etc.) remain fully serviced during the drain.
+      // When EITHER side sends FIN, close both ends immediately so
+      // the opposite peer (NPT or local service) receives the FIN
+      // without any delay.
+      //
+      // Previously this entered a non-blocking drain state, but that
+      // caused the NPT to hang: when local (host service) closed its
+      // connection, the relay kept trying to forward buffered rvd→local
+      // data to the (CLOSE_WAIT) local socket.  Writes often succeeded
+      // because TCP still accepts the bytes, so `moved` stayed true for
+      // many iterations and the `done` condition was never reached until
+      // the 10s hard cap — leaving NPT waiting with no FIN for up to 10s.
+      //
+      // The pending_local / pending_rvd buffers only hold partial writes
+      // from the current iteration; at the point a FIN is detected
+      // local.available()==0 guarantees the receive buffer is empty, so
+      // there is nothing useful left to drain.  Closing both sides
+      // immediately is safe and matches the single-relay cleanup path.
       {
         bool rvd_closed   = !subs[i].rvd.available()   && _peer_closed(subs[i].rvd);
         bool local_closed = !subs[i].local.available() && _peer_closed(subs[i].local);
         if (rvd_closed || local_closed) {
-          subs[i].draining       = true;
-          subs[i].drain_start_ms = millis();
-          NOPORTS_LOGI(TAG, "Sub[%d] drain start (%s%s)", i,
-                       rvd_closed ? "rvd" : "",
+          NOPORTS_LOGI(TAG, "Sub[%d] closing immediately (%s%s closed)", i,
+                       rvd_closed   ? "rvd"   : "",
                        local_closed ? (rvd_closed ? "+local" : "local") : "");
-          continue; // handled next iteration at the top of the loop
+          _close_relay_sub(&subs[i], i);
+          continue;
         }
       }
 
@@ -2131,6 +2143,8 @@ void noports_relay_stop(NoPortsRelay *relay) {
 }
 
 int noports_relay_get_pcb_count() { return _relay_pcb_count; }
+
+int noports_relay_get_pcb_max() { return MAX_RELAY_PCBS; }
 
 uint8_t noports_relay_get_cpu_pct() { return _relay_cpu_pct; }
 
