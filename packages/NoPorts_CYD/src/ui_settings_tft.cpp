@@ -135,7 +135,7 @@ static void _draw_fields() {
 
   FieldInfo fields[] = {
     {"Managers:", "@alice,@bob", _managers},
-    {"Rules:", "localhost:22,*:80", _permitopen},
+    {"Rules:", "*:*", _permitopen},
   };
 
   int y = FIELD_Y_START;
@@ -395,6 +395,7 @@ void ui_settings_create(void (*on_save)()) {
 
   strncpy(_managers, mgr.c_str(), sizeof(_managers) - 1);
   _managers[sizeof(_managers) - 1] = '\0';
+  if (po.length() == 0) po = "*:*";
   strncpy(_permitopen, po.c_str(), sizeof(_permitopen) - 1);
   _permitopen[sizeof(_permitopen) - 1] = '\0';
 

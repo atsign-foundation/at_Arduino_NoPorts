@@ -264,7 +264,7 @@ static bool start_daemon() {
   {
     String ms = ui_load_string(NVS_KEY_MAX_RELAYS);
     uint8_t max_r = (ms.length() > 0 && ms.toInt() >= 1)
-                    ? (uint8_t)constrain(ms.toInt(), 1, NOPORTS_MAX_RELAYS) : 2;
+                    ? (uint8_t)constrain(ms.toInt(), 1, NOPORTS_MAX_RELAYS) : NOPORTS_MAX_RELAYS;
     npDaemon.setMaxRelays(max_r);
     Serial.printf("[main] Max TCP clients configured: %d\n", (int)max_r);
   }
@@ -563,6 +563,13 @@ static bool _auth_handle_touch(int16_t tx, int16_t ty) {
 }
 
 static void _on_enrolled() {
+  // The at-server needs a moment to finish propagating the newly-enrolled
+  // PKAM public key before PKAM auth can succeed.  Also gives the idle task
+  // time to reclaim the enrollment task's 32 KB stack.  3 s is enough in
+  // practice; the "Enrolled successfully!" message stays on screen during
+  // the wait.  delay() yields to the FreeRTOS scheduler so WiFi/TCP tasks
+  // continue uninterrupted.
+  delay(3000);
   if (start_daemon()) {
     current_screen = SCREEN_DASHBOARD;
     ui_dashboard_create(_do_reset, _show_settings, _show_wifi, _show_config);
@@ -733,7 +740,7 @@ static void _on_config_saved() {
 
     String ms = ui_load_string(NVS_KEY_MAX_RELAYS);
     uint8_t max_r = (ms.length() > 0 && ms.toInt() >= 1)
-                    ? (uint8_t)constrain(ms.toInt(), 1, NOPORTS_MAX_RELAYS) : 2;
+                    ? (uint8_t)constrain(ms.toInt(), 1, NOPORTS_MAX_RELAYS) : NOPORTS_MAX_RELAYS;
     npDaemon.setMaxRelays(max_r);
     Serial.printf("[main] Max TCP clients updated: %d\n", (int)max_r);
   }

@@ -1,0 +1,126 @@
+# =============================================================================
+# NoPorts CYD – Firmware builder + web flasher
+#
+# Build context must be the monorepo root (atArduino/) so both lib/ and
+# packages/NoPorts_CYD/ are accessible:
+#
+#   docker build -f packages/NoPorts_CYD/Dockerfile -t noports-cyd-flasher .
+#
+# Or use docker-compose (recommended):
+#   docker compose -f packages/NoPorts_CYD/docker-compose.yml up --build
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: build firmware
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim AS builder
+
+# System dependencies needed by PlatformIO / esptool
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install PlatformIO and esptool into the system Python
+RUN pip install --no-cache-dir platformio esptool
+
+WORKDIR /build
+
+# ---------------------------------------------------------------------------
+# Layer cache optimisation:
+#   Copy only what's needed to fetch registry packages first, so rebuilds
+#   that change only source code skip the slow framework download.
+# ---------------------------------------------------------------------------
+COPY packages/NoPorts_CYD/platformio.ini   packages/NoPorts_CYD/platformio.ini
+COPY packages/NoPorts_CYD/boards/          packages/NoPorts_CYD/boards/
+COPY packages/NoPorts_CYD/partitions.csv   packages/NoPorts_CYD/partitions.csv
+
+# Create a minimal stub so lib_extra_dirs path (../../lib) resolves during
+# package scan, but no source code is included yet (keeps this layer cached).
+RUN mkdir -p lib/NoPorts
+
+WORKDIR /build/packages/NoPorts_CYD
+
+# Fetch all registry packages + ESP32 toolchain (cached unless platformio.ini changes)
+RUN platformio pkg install -e cyd2usb -e cyd2usb_s3
+
+# ---------------------------------------------------------------------------
+# Now copy the full source and build
+# ---------------------------------------------------------------------------
+WORKDIR /build
+
+COPY lib/               lib/
+COPY packages/NoPorts_CYD/  packages/NoPorts_CYD/
+
+WORKDIR /build/packages/NoPorts_CYD
+
+RUN platformio run -e cyd2usb -e cyd2usb_s3
+
+# ---------------------------------------------------------------------------
+# Merge each environment into a single self-contained binary.
+#   ESP32  – bootloader at 0x1000
+#   ESP32-S3 – bootloader at 0x0
+# The merged binary can be written at offset 0x0 in one shot by ESPTool.js.
+# ---------------------------------------------------------------------------
+RUN BOOT=$(find /root/.platformio/packages -name "boot_app0.bin" | head -1) && \
+    echo "Using boot_app0: $BOOT" && \
+    \
+    esptool.py --chip esp32 merge_bin \
+        -o merged-cyd2usb.bin \
+        0x1000  .pio/build/cyd2usb/bootloader.bin \
+        0x8000  .pio/build/cyd2usb/partitions.bin \
+        0xe000  "$BOOT" \
+        0x10000 .pio/build/cyd2usb/firmware.bin && \
+    \
+    esptool.py --chip esp32s3 merge_bin \
+        -o merged-cyd2usb_s3.bin \
+        0x0     .pio/build/cyd2usb_s3/bootloader.bin \
+        0x8000  .pio/build/cyd2usb_s3/partitions.bin \
+        0xe000  "$BOOT" \
+        0x10000 .pio/build/cyd2usb_s3/firmware.bin
+
+# ---------------------------------------------------------------------------
+# Copy individual part binaries for the NVS-preserving "upgrade" manifests.
+# These are flashed at exact offsets, leaving the NVS region (0x9000–0xDFFF)
+# untouched so WiFi credentials and daemon config survive a firmware update.
+# The factory-reset manifests use the merged binaries above instead.
+# ---------------------------------------------------------------------------
+RUN BOOT=$(find /root/.platformio/packages -name "boot_app0.bin" | head -1) && \
+    cp .pio/build/cyd2usb/bootloader.bin     bootloader-cyd2usb.bin    && \
+    cp .pio/build/cyd2usb/partitions.bin     partitions-cyd2usb.bin    && \
+    cp .pio/build/cyd2usb/firmware.bin       firmware-cyd2usb.bin      && \
+    cp .pio/build/cyd2usb_s3/bootloader.bin  bootloader-cyd2usb_s3.bin && \
+    cp .pio/build/cyd2usb_s3/partitions.bin  partitions-cyd2usb_s3.bin && \
+    cp .pio/build/cyd2usb_s3/firmware.bin    firmware-cyd2usb_s3.bin   && \
+    cp "$BOOT" boot_app0.bin
+
+# ---------------------------------------------------------------------------
+# Stage 2: minimal nginx web server
+# ---------------------------------------------------------------------------
+FROM nginx:alpine
+
+# Remove default nginx config; replace with our own
+RUN rm /etc/nginx/conf.d/default.conf
+COPY packages/NoPorts_CYD/web/nginx.conf /etc/nginx/conf.d/noports.conf
+
+# Web assets (static HTML + manifests)
+COPY packages/NoPorts_CYD/web/ /usr/share/nginx/html/
+
+# Merged firmware binaries (used by factory-reset manifests)
+COPY --from=builder /build/packages/NoPorts_CYD/merged-cyd2usb.bin     /usr/share/nginx/html/
+COPY --from=builder /build/packages/NoPorts_CYD/merged-cyd2usb_s3.bin  /usr/share/nginx/html/
+
+# Individual part binaries (used by NVS-preserving upgrade manifests)
+COPY --from=builder /build/packages/NoPorts_CYD/bootloader-cyd2usb.bin    /usr/share/nginx/html/
+COPY --from=builder /build/packages/NoPorts_CYD/partitions-cyd2usb.bin    /usr/share/nginx/html/
+COPY --from=builder /build/packages/NoPorts_CYD/firmware-cyd2usb.bin      /usr/share/nginx/html/
+COPY --from=builder /build/packages/NoPorts_CYD/bootloader-cyd2usb_s3.bin /usr/share/nginx/html/
+COPY --from=builder /build/packages/NoPorts_CYD/partitions-cyd2usb_s3.bin /usr/share/nginx/html/
+COPY --from=builder /build/packages/NoPorts_CYD/firmware-cyd2usb_s3.bin   /usr/share/nginx/html/
+COPY --from=builder /build/packages/NoPorts_CYD/boot_app0.bin             /usr/share/nginx/html/
+
+EXPOSE 80
+
+LABEL org.opencontainers.image.title="NoPorts CYD Flasher" \
+      org.opencontainers.image.description="Browser-based firmware installer for NoPorts CYD / ESP32-S3 devices" \
+      org.opencontainers.image.source="https://github.com/atsign-foundation/noports"

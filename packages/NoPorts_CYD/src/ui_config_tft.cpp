@@ -9,6 +9,7 @@
 #include "ui_config_tft.h"
 #include "ui_tft.h"
 #include <Arduino.h>
+#include "noports/noports_daemon.h"  // NOPORTS_MAX_RELAYS
 
 // ---------------------------------------------------------------------------
 // Layout
@@ -42,7 +43,7 @@
 static void (*_on_save_cb)() = nullptr;
 
 static int _keepalive_min = 4;   // 0 = off, 1-15 minutes
-static int _max_subs      = 2;   // 1-5 relay sub-connections per session
+static int _max_subs      = NOPORTS_MAX_RELAYS;   // 1-NOPORTS_MAX_RELAYS relay sub-connections per session
 
 // ---------------------------------------------------------------------------
 // Drawing helpers
@@ -117,7 +118,7 @@ static void _draw_rows() {
   y += 12;
 
   // ── Concurrent TCP sessions per relay ──
-  _draw_stepper(y, "TCP clients:", _max_subs, 1, 6);
+  _draw_stepper(y, "TCP clients:", _max_subs, 1, NOPORTS_MAX_RELAYS);
 }
 
 static void _draw_buttons() {
@@ -159,7 +160,7 @@ void ui_config_create(void (*on_save)()) {
   if (_keepalive_min > 15) _keepalive_min = 15;
 
   String ms = ui_load_string(NVS_KEY_MAX_RELAYS);
-  _max_subs = (ms.length() > 0) ? (int)constrain(ms.toInt(), 1, 5) : 2;
+  _max_subs = (ms.length() > 0) ? (int)constrain(ms.toInt(), 1, NOPORTS_MAX_RELAYS) : NOPORTS_MAX_RELAYS;
 
   _draw_screen();
 }
@@ -195,14 +196,14 @@ bool ui_config_handle_touch(int16_t tx, int16_t ty) {
     if (ui_touch_in_rect(tx, ty, STEP_MINUS_X, y, STEP_MINUS_W, ROW_H)) {
       if (_max_subs > 1) {
         _max_subs--;
-        _draw_stepper(y, "TCP clients:", _max_subs, 1, 6);
+        _draw_stepper(y, "TCP clients:", _max_subs, 1, NOPORTS_MAX_RELAYS);
       }
       return true;
     }
     if (ui_touch_in_rect(tx, ty, STEP_PLUS_X, y, STEP_PLUS_W, ROW_H)) {
-      if (_max_subs < 6) {
+      if (_max_subs < NOPORTS_MAX_RELAYS) {
         _max_subs++;
-        _draw_stepper(y, "TCP clients:", _max_subs, 1, 6);
+        _draw_stepper(y, "TCP clients:", _max_subs, 1, NOPORTS_MAX_RELAYS);
       }
       return true;
     }
@@ -214,7 +215,7 @@ bool ui_config_handle_touch(int16_t tx, int16_t ty) {
     String ka = ui_load_string(NVS_KEY_WORKER_KEEPALIVE);
     _keepalive_min = (ka.length() > 0) ? (int)ka.toInt() : 4;
     String ms = ui_load_string(NVS_KEY_MAX_RELAYS);
-    _max_subs = (ms.length() > 0) ? (int)constrain(ms.toInt(), 1, 6) : 2;
+    _max_subs = (ms.length() > 0) ? (int)constrain(ms.toInt(), 1, NOPORTS_MAX_RELAYS) : NOPORTS_MAX_RELAYS;
     Serial.println("[config] BACK — changes discarded");
     if (_on_save_cb) _on_save_cb();
     return true;

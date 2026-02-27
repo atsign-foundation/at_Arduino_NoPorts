@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NoPorts CYD – Firmware Installer</title>
+
+  <!-- ESP Web Tools: browser-side ESPTool using the WebSerial API -->
+  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --brand:   #1b6ca8;
+      --accent:  #2196f3;
+      --bg:      #0f1117;
+      --card:    #1a1d27;
+      --border:  #2a2d3a;
+      --text:    #e2e8f0;
+      --muted:   #94a3b8;
+      --success: #22c55e;
+      --warn:    #f59e0b;
+      --radius:  10px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem 4rem;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 2.5rem;
+    }
+    header h1 {
+      font-size: 1.9rem;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+    header p {
+      color: var(--muted);
+      margin-top: 0.4rem;
+      font-size: 0.95rem;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.8rem 2rem;
+      width: 100%;
+      max-width: 520px;
+    }
+
+    .card + .card { margin-top: 1.2rem; }
+
+    .card h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 1rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-size: 0.8rem;
+    }
+
+    /* Board selector */
+    .board-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.75rem;
+    }
+    .board-btn {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.3rem;
+      padding: 0.9rem 0.5rem;
+      border-radius: var(--radius);
+      border: 2px solid var(--border);
+      background: transparent;
+      color: var(--text);
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+      font-size: 0.85rem;
+      line-height: 1.3;
+      text-align: center;
+    }
+    .board-btn span.icon { font-size: 1.6rem; }
+    .board-btn span.name { font-weight: 600; }
+    .board-btn span.chip { font-size: 0.75rem; color: var(--muted); }
+    .board-btn:hover { border-color: var(--accent); }
+    .board-btn.selected {
+      border-color: var(--accent);
+      background: rgba(33,150,243,0.1);
+    }
+
+    /* Install button wrapper */
+    .install-row {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 1rem;
+      margin-top: 1.2rem;
+    }
+
+    esp-web-install-button {
+      --esp-tools-button-color: var(--accent);
+      --esp-tools-button-text-color: #fff;
+    }
+
+    /* Steps */
+    ol.steps {
+      list-style: none;
+      counter-reset: steps;
+      display: flex;
+      flex-direction: column;
+      gap: 0.65rem;
+    }
+    ol.steps li {
+      counter-increment: steps;
+      display: flex;
+      align-items: flex-start;
+      gap: 0.8rem;
+      font-size: 0.9rem;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+    ol.steps li::before {
+      content: counter(steps);
+      flex-shrink: 0;
+      width: 1.5rem;
+      height: 1.5rem;
+      border-radius: 50%;
+      background: var(--brand);
+      color: #fff;
+      font-size: 0.75rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-top: 0.05rem;
+    }
+    ol.steps li b { color: var(--text); }
+
+    .notice {
+      display: flex;
+      gap: 0.7rem;
+      font-size: 0.85rem;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+    .notice .icon { flex-shrink: 0; font-size: 1.1rem; margin-top: 0.05rem; }
+
+    footer {
+      margin-top: 2rem;
+      font-size: 0.8rem;
+      color: var(--muted);
+      text-align: center;
+    }
+    footer a { color: var(--accent); text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+
+    /* Factory reset toggle */
+    .factory-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.75rem;
+      padding: 0.75rem 0.9rem;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      cursor: pointer;
+      margin-bottom: 1.1rem;
+      user-select: none;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .factory-row:has(input:checked) {
+      border-color: var(--warn);
+      background: rgba(245,158,11,0.08);
+    }
+    .factory-row input[type=checkbox] {
+      flex-shrink: 0;
+      margin-top: 0.2rem;
+      width: 1rem;
+      height: 1rem;
+      accent-color: var(--warn);
+      cursor: pointer;
+    }
+    .factory-text { display: flex; flex-direction: column; gap: 0.2rem; }
+    .factory-title { font-weight: 600; font-size: 0.9rem; }
+    .factory-desc  { font-size: 0.78rem; color: var(--muted); }
+    .factory-row:has(input:checked) .factory-title { color: var(--warn); }
+    .factory-row:has(input:checked) .factory-desc  { color: var(--warn); opacity: 0.8; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>NoPorts CYD Installer</h1>
+  <p>Flash your device directly from the browser — no drivers or tools required.</p>
+</header>
+
+<!-- Board selection -->
+<div class="card">
+  <h2>1 · Select your board</h2>
+  <div class="board-grid">
+    <button class="board-btn selected"
+            data-manifest="manifest-cyd2usb.json"
+            onclick="selectBoard(this)">
+      <span class="icon">📟</span>
+      <span class="name">CYD2USB</span>
+      <span class="chip">ESP32 · micro-USB + USB-C</span>
+    </button>
+    <button class="board-btn"
+            data-manifest="manifest-cyd2usb_s3.json"
+            onclick="selectBoard(this)">
+      <span class="icon">🚀</span>
+      <span class="name">CYD2USB S3</span>
+      <span class="chip">ESP32-S3 · Freenove FNK0104</span>
+    </button>
+  </div>
+</div>
+
+<!-- Install -->
+<div class="card">
+  <h2>2 · Connect &amp; install</h2>
+
+  <label class="factory-row">
+    <input type="checkbox" id="factory-cb" onchange="_updateManifest()">
+    <span class="factory-text">
+      <span class="factory-title">⚠️ Factory reset</span>
+      <span class="factory-desc">Erase everything — WiFi credentials, daemon config <em>and</em> enrolled atSign keys. Use for first-time setup or when switching atSigns.</span>
+    </span>
+  </label>
+
+  <div class="install-row">
+    <esp-web-install-button id="install-btn"
+                            manifest="manifest-cyd2usb.json">
+      <button slot="activate">
+        ⚡ Connect &amp; Flash
+      </button>
+      <span slot="unsupported">
+        ⚠️ WebSerial is not supported in this browser.
+        Use Chrome or Edge (desktop).
+      </span>
+    </esp-web-install-button>
+  </div>
+</div>
+
+<!-- How-to -->
+<div class="card">
+  <h2>Instructions</h2>
+  <ol class="steps">
+    <li>Select the board above that matches your hardware.</li>
+    <li>Plug the device into this computer via <b>USB</b>.</li>
+    <li>Click <b>Connect &amp; Flash</b>, then choose the correct COM/serial port.</li>
+    <li>Wait for the flash to complete (~30-60 s).</li>
+    <li id="step-reset-s3" style="display:none">
+      <span><b>CYD2USB S3 only:</b> After flashing completes, press the physical
+      <b>RST</b> button on the device once to reboot. The S3's native USB does not
+      auto-reset after a web flash.</span>
+    </li>
+    <li>Follow the on-screen setup wizard on the device display.</li>
+  </ol>
+</div>
+
+<!-- WebSerial note -->
+<div class="card">
+  <div class="notice">
+    <span class="icon">🔒</span>
+    <span>
+      WebSerial requires a <b>secure context</b>.
+      This page works on <code>localhost</code> automatically.
+      To flash over a local network, front this container with HTTPS
+      (e.g. Caddy, Nginx reverse proxy, or Tailscale Funnel).
+    </span>
+  </div>
+</div>
+
+<footer>
+  Powered by <a href="https://esphome.github.io/esp-web-tools/" target="_blank" rel="noopener">ESP Web Tools</a>
+  &nbsp;·&nbsp;
+  <a href="https://noports.com" target="_blank" rel="noopener">noports.com</a>
+</footer>
+
+<script>
+  function _updateManifest() {
+    const btn      = document.querySelector('.board-btn.selected');
+    const factory  = document.getElementById('factory-cb').checked;
+    const base     = btn.dataset.manifest;  // e.g. "manifest-cyd2usb.json"
+    // factory variant: "manifest-cyd2usb-factory.json"
+    document.getElementById('install-btn').manifest =
+      factory ? base.replace('.json', '-factory.json') : base;
+  }
+
+  function selectBoard(btn) {
+    document.querySelectorAll('.board-btn').forEach(b => b.classList.remove('selected'));
+    btn.classList.add('selected');
+    _updateManifest();
+    // Show the manual RST step only for the S3 (native USB, no auto-reset after flash)
+    const isS3 = btn.dataset.manifest.includes('_s3');
+    document.getElementById('step-reset-s3').style.display = isS3 ? '' : 'none';
+  }
+</script>
+
+</body>
+</html>

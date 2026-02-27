@@ -150,7 +150,7 @@ public:
   // Max TCP session slots per relay task (1–4, default 2).
   // Each slot = one rvd socket + one local socket.
   // The relay PCB budget check enforces the hardware limit independently.
-  void setMaxRelays(uint8_t max) { _max_relays = (max >= 1 && max <= NOPORTS_MAX_RELAYS) ? max : 2; }
+  void setMaxRelays(uint8_t max) { _max_relays = (max >= 1 && max <= NOPORTS_MAX_RELAYS) ? max : NOPORTS_MAX_RELAYS; }
   uint8_t getMaxRelays() const { return _max_relays; }
 
 private:
