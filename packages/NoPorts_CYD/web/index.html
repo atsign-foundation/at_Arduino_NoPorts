@@ -262,11 +262,6 @@
     <li>Plug the device into this computer via <b>USB</b>.</li>
     <li>Click <b>Connect &amp; Flash</b>, then choose the correct COM/serial port.</li>
     <li>Wait for the flash to complete (~30-60 s).</li>
-    <li id="step-reset-s3" style="display:none">
-      <span><b>CYD2USB S3 only:</b> After flashing completes, press the physical
-      <b>RST</b> button on the device once to reboot. The S3's native USB does not
-      auto-reset after a web flash.</span>
-    </li>
     <li>Follow the on-screen setup wizard on the device display.</li>
   </ol>
 </div>
@@ -304,9 +299,6 @@
     document.querySelectorAll('.board-btn').forEach(b => b.classList.remove('selected'));
     btn.classList.add('selected');
     _updateManifest();
-    // Show the manual RST step only for the S3 (native USB, no auto-reset after flash)
-    const isS3 = btn.dataset.manifest.includes('_s3');
-    document.getElementById('step-reset-s3').style.display = isS3 ? '' : 'none';
   }
 </script>
 
