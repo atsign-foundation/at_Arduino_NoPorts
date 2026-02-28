@@ -80,19 +80,47 @@ RUN BOOT=$(find /root/.platformio/packages -name "boot_app0.bin" | head -1) && \
         0x10000 .pio/build/cyd2usb_s3/firmware.bin
 
 # ---------------------------------------------------------------------------
-# Copy individual part binaries for the NVS-preserving "upgrade" manifests.
-# These are flashed at exact offsets, leaving the NVS region (0x9000–0xDFFF)
-# untouched so WiFi credentials and daemon config survive a firmware update.
-# The factory-reset manifests use the merged binaries above instead.
+# Build NVS-preserving "upgrade" split binaries using Python.
+# Two writes per board skip the NVS region (0x9000–0xDFFF) entirely:
+#   upgrade1 = bootloader + gap + partitions  (file starts at bootloader offset,
+#              ends at ~0x82xx — well before NVS at 0x9000)
+#   upgrade2 = boot_app0 + gap + firmware     (file starts at 0xe000)
+# Each file is manually concatenated so it begins at exactly the flash address
+# the manifest specifies — no merge_bin 0x0-padding issues.
 # ---------------------------------------------------------------------------
 RUN BOOT=$(find /root/.platformio/packages -name "boot_app0.bin" | head -1) && \
-    cp .pio/build/cyd2usb/bootloader.bin     bootloader-cyd2usb.bin    && \
-    cp .pio/build/cyd2usb/partitions.bin     partitions-cyd2usb.bin    && \
-    cp .pio/build/cyd2usb/firmware.bin       firmware-cyd2usb.bin      && \
-    cp .pio/build/cyd2usb_s3/bootloader.bin  bootloader-cyd2usb_s3.bin && \
-    cp .pio/build/cyd2usb_s3/partitions.bin  partitions-cyd2usb_s3.bin && \
-    cp .pio/build/cyd2usb_s3/firmware.bin    firmware-cyd2usb_s3.bin   && \
-    cp "$BOOT" boot_app0.bin
+    python3 - "$BOOT" << 'PYEOF'
+import sys, pathlib
+
+BOOT  = sys.argv[1]
+BUILD = pathlib.Path('.pio/build')
+
+def pad(data, size):
+    return data + b'\xff' * (size - len(data))
+
+def write(name, data):
+    pathlib.Path(name).write_bytes(data)
+    print(f'{name}: {len(data)} bytes (0x{len(data):X})')
+
+for chip, env, bl_off in [('esp32', 'cyd2usb', 0x1000), ('esp32s3', 'cyd2usb_s3', 0x0)]:
+    d = BUILD / env
+    bl = d.joinpath('bootloader.bin').read_bytes()
+    pt = d.joinpath('partitions.bin').read_bytes()
+    ba = pathlib.Path(BOOT).read_bytes()
+    fw = d.joinpath('firmware.bin').read_bytes()
+
+    # upgrade1: [bootloader padded to 0x8000 from bl_off] + partitions
+    # written at flash offset bl_off  →  ends at bl_off + pad_size + len(pt)
+    pad_size = 0x8000 - bl_off - len(bl)
+    up1 = bl + b'\xff' * pad_size + pt
+    write(f'upgrade1-{env}.bin', up1)
+
+    # upgrade2: [boot_app0 padded to 0x2000] + firmware
+    # written at flash offset 0xe000  →  starts well past NVS (0x9000)
+    gap = 0x10000 - 0xe000 - len(ba)
+    up2 = ba + b'\xff' * gap + fw
+    write(f'upgrade2-{env}.bin', up2)
+PYEOF
 
 # ---------------------------------------------------------------------------
 # Stage 2: minimal nginx web server
@@ -110,14 +138,11 @@ COPY packages/NoPorts_CYD/web/ /usr/share/nginx/html/
 COPY --from=builder /build/packages/NoPorts_CYD/merged-cyd2usb.bin     /usr/share/nginx/html/
 COPY --from=builder /build/packages/NoPorts_CYD/merged-cyd2usb_s3.bin  /usr/share/nginx/html/
 
-# Individual part binaries (used by NVS-preserving upgrade manifests)
-COPY --from=builder /build/packages/NoPorts_CYD/bootloader-cyd2usb.bin    /usr/share/nginx/html/
-COPY --from=builder /build/packages/NoPorts_CYD/partitions-cyd2usb.bin    /usr/share/nginx/html/
-COPY --from=builder /build/packages/NoPorts_CYD/firmware-cyd2usb.bin      /usr/share/nginx/html/
-COPY --from=builder /build/packages/NoPorts_CYD/bootloader-cyd2usb_s3.bin /usr/share/nginx/html/
-COPY --from=builder /build/packages/NoPorts_CYD/partitions-cyd2usb_s3.bin /usr/share/nginx/html/
-COPY --from=builder /build/packages/NoPorts_CYD/firmware-cyd2usb_s3.bin   /usr/share/nginx/html/
-COPY --from=builder /build/packages/NoPorts_CYD/boot_app0.bin             /usr/share/nginx/html/
+# Split-merged upgrade binaries (used by NVS-preserving upgrade manifests)
+COPY --from=builder /build/packages/NoPorts_CYD/upgrade1-cyd2usb.bin    /usr/share/nginx/html/
+COPY --from=builder /build/packages/NoPorts_CYD/upgrade2-cyd2usb.bin    /usr/share/nginx/html/
+COPY --from=builder /build/packages/NoPorts_CYD/upgrade1-cyd2usb_s3.bin /usr/share/nginx/html/
+COPY --from=builder /build/packages/NoPorts_CYD/upgrade2-cyd2usb_s3.bin /usr/share/nginx/html/
 
 EXPOSE 80
 
