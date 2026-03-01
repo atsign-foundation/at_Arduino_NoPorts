@@ -1,12 +1,15 @@
 {
   "name": "NoPorts CYD (ESP32)",
   "version": "1.0",
+  "new_install_prompt_erase": true,
   "builds": [
     {
       "chipFamily": "ESP32",
       "parts": [
-        { "path": "upgrade1-cyd2usb.bin", "offset": 4096 },
-        { "path": "upgrade2-cyd2usb.bin", "offset": 57344 }
+        { "path": "bootloader-cyd2usb.bin",  "offset": 4096  },
+        { "path": "partitions-cyd2usb.bin", "offset": 32768 },
+        { "path": "boot_app0.bin",          "offset": 57344 },
+        { "path": "firmware-cyd2usb.bin",   "offset": 65536 }
       ]
     }
   ]

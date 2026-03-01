@@ -213,6 +213,7 @@
   <div class="board-grid">
     <button class="board-btn selected"
             data-manifest="manifest-cyd2usb.json"
+            data-factory-default="false"
             onclick="selectBoard(this)">
       <span class="icon">📟</span>
       <span class="name">CYD2USB</span>
@@ -220,6 +221,7 @@
     </button>
     <button class="board-btn"
             data-manifest="manifest-cyd2usb_s3.json"
+            data-factory-default="false"
             onclick="selectBoard(this)">
       <span class="icon">🚀</span>
       <span class="name">CYD2USB S3</span>
@@ -236,7 +238,7 @@
     <input type="checkbox" id="factory-cb" onchange="_updateManifest()">
     <span class="factory-text">
       <span class="factory-title">⚠️ Factory reset</span>
-      <span class="factory-desc">Erase everything — WiFi credentials, daemon config <em>and</em> enrolled atSign keys. Use for first-time setup or when switching atSigns.</span>
+      <span class="factory-desc" id="factory-desc">Erase everything — WiFi credentials, daemon config <em>and</em> enrolled atSign keys. Use for first-time setup or if the device won't boot.</span>
     </span>
   </label>
 
@@ -258,11 +260,41 @@
 <div class="card">
   <h2>Instructions</h2>
   <ol class="steps">
-    <li>Select the board above that matches your hardware.</li>
+    <li>Select your board above.</li>
     <li>Plug the device into this computer via <b>USB</b>.</li>
-    <li>Click <b>Connect &amp; Flash</b>, then choose the correct COM/serial port.</li>
-    <li>Wait for the flash to complete (~30-60 s).</li>
-    <li>Follow the on-screen setup wizard on the device display.</li>
+    <li>
+      <b>Hold the BOOT button</b> on the back of the board, click
+      <b>Connect &amp; Flash</b>, select the serial port, then release BOOT.
+    </li>
+    <li>Wait for the flash to complete (~30–60 s).</li>
+    <li>Follow the on-screen setup wizard on the device display after a factory reset,
+      or resume normal use after an upgrade.</li>
+  </ol>
+</div>
+
+<!-- Troubleshooting -->
+<div class="card">
+  <h2>Troubleshooting</h2>
+  <ol class="steps">
+    <li>
+      <b>"Failed to initialize"</b> — hold the <b>BOOT button</b> on the back of
+      the board before clicking Connect &amp; Flash, then release after selecting
+      the port.
+    </li>
+    <li>
+      <b>Device stuck in a boot loop</b> (screen blank / resets every few seconds)
+      — ensure Factory Reset is ticked, then flash using the BOOT-button method.
+    </li>
+    <li>
+      <b>No serial port appears</b> — try a different USB cable (some are
+      charge-only), or close any other app using the port (Arduino IDE,
+      PlatformIO monitor).
+    </li>
+    <li>
+      <b>No serial port appears</b> — try a different USB cable (some are
+      charge-only), or close any other app using the port (Arduino IDE,
+      PlatformIO monitor).
+    </li>
   </ol>
 </div>
 
@@ -298,6 +330,14 @@
   function selectBoard(btn) {
     document.querySelectorAll('.board-btn').forEach(b => b.classList.remove('selected'));
     btn.classList.add('selected');
+    const factoryDefault = btn.dataset.factoryDefault === 'true';
+    const cb = document.getElementById('factory-cb');
+    cb.checked  = factoryDefault;
+    cb.disabled = false;
+    const row = cb.closest('.factory-row');
+    row.style.cursor = 'pointer';
+    const desc = document.getElementById('factory-desc');
+    desc.innerHTML = 'Erase everything — WiFi credentials, daemon config <em>and</em> enrolled atSign keys. Use for first-time setup or switching atSigns.';
     _updateManifest();
   }
 </script>
