@@ -413,6 +413,17 @@ static void _draw_bottom_row() {
                  RESET_BTN_X + BTN_W / 2, BTN_Y + BTN_H / 2, 2);
 }
 
+// Version label drawn in the gap between the graph and the button row.
+static void _draw_version_badge() {
+  TFT_eSPI &tft = ui_get_tft();
+  tft.setTextColor(COLOR_TEXT_GREY);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(1);
+  // Vertically centred between graph bottom (GRAPH_TOP_Y+GRAPH_HEIGHT) and BTN_Y
+  tft.drawString("v" CYD_APP_VERSION, TFT_WIDTH / 2,
+                 GRAPH_TOP_Y + GRAPH_HEIGHT + (BTN_Y - GRAPH_TOP_Y - GRAPH_HEIGHT) / 2, 1);
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -464,7 +475,8 @@ void ui_dashboard_create(void (*on_reset)(), void (*on_settings)(), void (*on_wi
   _draw_log();
   _draw_graph();
   _draw_bottom_row();
-  
+  _draw_version_badge();
+
   Serial.println("[ui_dashboard] Created");
 }
 
@@ -514,6 +526,7 @@ void ui_dashboard_update(int active_relays, const char *daemon_state,
     _draw_log();
     _draw_graph();
     _draw_bottom_row();
+    _draw_version_badge();
   }
 
   _cpu_pct = cpu_pct;

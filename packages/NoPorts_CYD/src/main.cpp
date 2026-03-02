@@ -131,6 +131,7 @@ static void _show_wifi();
 static void _show_config();
 static void _on_settings_saved();
 static void _on_config_saved();
+static void _draw_page_header();
 
 // Check if managers and permitopen rules are configured
 static bool _rules_valid() {
@@ -371,16 +372,13 @@ static void _auth_update_error() {
   }
 }
 
-// Clean first-attempt screen: title + atSign + "Authenticating..."
+// Clean first-attempt screen: title + version + atSign + "Authenticating..."
 static void _show_auth_screen() {
   TFT_eSPI &tft = ui_get_tft();
   tft.fillScreen(COLOR_BG_DARK);
 
-  // Title
-  tft.setTextColor(COLOR_PRIMARY);
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextSize(1);
-  tft.drawString("NoPorts CYD", TFT_WIDTH / 2, 15, 4);
+  // Title + version
+  _draw_page_header();
 
   // atSign
   String atsign = ui_load_string(NVS_KEY_ATSIGN);
@@ -402,11 +400,8 @@ static void _show_auth_retry_screen() {
   TFT_eSPI &tft = ui_get_tft();
   tft.fillScreen(COLOR_BG_DARK);
 
-  // Title
-  tft.setTextColor(COLOR_PRIMARY);
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextSize(1);
-  tft.drawString("NoPorts CYD", TFT_WIDTH / 2, 15, 4);
+  // Title + version
+  _draw_page_header();
 
   // atSign
   String atsign = ui_load_string(NVS_KEY_ATSIGN);
@@ -630,11 +625,9 @@ static void on_wifi_connected() {
 static void _show_restart_status(const char *line1, const char *line2 = nullptr) {
   TFT_eSPI &tft = ui_get_tft();
   tft.fillScreen(COLOR_BG_DARK);
-  tft.setTextColor(COLOR_PRIMARY);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextSize(1);
-  tft.drawString("NoPorts CYD", TFT_WIDTH / 2, TFT_HEIGHT / 2 - 40, 4);
+  _draw_page_header();
   tft.setTextColor(COLOR_ACCENT);
+  tft.setTextDatum(MC_DATUM);
   tft.drawString(line1, TFT_WIDTH / 2, TFT_HEIGHT / 2 + 5, 2);
   if (line2) {
     tft.setTextColor(COLOR_TEXT_GREY);
@@ -764,20 +757,29 @@ static void _show_wifi() {
   ui_wifi_create(_on_wifi_reconnected);
 }
 
+// Draw consistent page header (title + version) at the top of any full screen.
+// y=15 TC_DATUM font4 for title, y=38 font2 for version — same on every screen.
+static void _draw_page_header() {
+  TFT_eSPI &tft = ui_get_tft();
+  tft.setTextColor(COLOR_PRIMARY);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextSize(1);
+  tft.drawString("NoPorts CYD", TFT_WIDTH / 2, 15, 4);
+  tft.setTextColor(COLOR_TEXT_GREY);
+  tft.drawString("v" CYD_APP_VERSION, TFT_WIDTH / 2, 38, 2);
+}
+
 static void show_splash() {
   TFT_eSPI &tft = ui_get_tft();
   tft.fillScreen(COLOR_BG_DARK);
-  
-  // Show NoPorts logo/title
-  tft.setTextColor(COLOR_PRIMARY);
+
+  _draw_page_header();
+
+  tft.setTextColor(COLOR_TEXT_GREY);
   tft.setTextDatum(MC_DATUM);
   tft.setTextSize(1);
-  tft.drawString("NoPorts CYD", TFT_WIDTH / 2, TFT_HEIGHT / 2 - 30, 4);
-  
-  tft.setTextColor(COLOR_TEXT_GREY);
-  tft.setTextSize(1);
   tft.drawString("Initializing...", TFT_WIDTH / 2, TFT_HEIGHT / 2 + 20, 2);
-  
+
   delay(1500);
 }
 
@@ -824,11 +826,8 @@ void setup() {
     TFT_eSPI &tft = ui_get_tft();
     tft.fillScreen(COLOR_BG_DARK);
 
-    // Title
-    tft.setTextColor(COLOR_PRIMARY);
-    tft.setTextDatum(TC_DATUM);
-    tft.setTextSize(1);
-    tft.drawString("NoPorts CYD", TFT_WIDTH / 2, 20, 4);
+    // Title + version
+    _draw_page_header();
 
     // SSID
     tft.setTextColor(COLOR_TEXT_WHITE);
@@ -930,11 +929,9 @@ void setup() {
 
       // Show status while NTP + daemon start (these can take several seconds)
       tft.fillScreen(COLOR_BG_DARK);
-      tft.setTextColor(COLOR_PRIMARY);
-      tft.setTextDatum(MC_DATUM);
-      tft.setTextSize(1);
-      tft.drawString("NoPorts CYD", TFT_WIDTH / 2, TFT_HEIGHT / 2 - 40, 4);
+      _draw_page_header();
       tft.setTextColor(COLOR_TEXT_WHITE);
+      tft.setTextDatum(MC_DATUM);
       tft.drawString(WiFi.localIP().toString().c_str(), TFT_WIDTH / 2, TFT_HEIGHT / 2 - 5, 2);
       tft.setTextColor(COLOR_ACCENT);
       tft.drawString("Syncing time...", TFT_WIDTH / 2, TFT_HEIGHT / 2 + 20, 2);
@@ -957,11 +954,9 @@ void setup() {
         ui_set_led(false, false, true);
 
         tft.fillScreen(COLOR_BG_DARK);
-        tft.setTextColor(COLOR_PRIMARY);
-        tft.setTextDatum(MC_DATUM);
-        tft.setTextSize(1);
-        tft.drawString("NoPorts CYD", TFT_WIDTH / 2, TFT_HEIGHT / 2 - 40, 4);
+        _draw_page_header();
         tft.setTextColor(COLOR_TEXT_WHITE);
+        tft.setTextDatum(MC_DATUM);
         tft.drawString(WiFi.localIP().toString().c_str(), TFT_WIDTH / 2, TFT_HEIGHT / 2 - 5, 2);
         tft.setTextColor(COLOR_ACCENT);
         tft.drawString("Syncing time...", TFT_WIDTH / 2, TFT_HEIGHT / 2 + 20, 2);
