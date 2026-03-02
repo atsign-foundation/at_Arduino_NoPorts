@@ -922,6 +922,19 @@ void NoPortsDaemon::_handlePing(void *msg) {
     return;
   }
 
+  // Check that the pinging atSign is in the authorized manager list
+  bool ping_authorized = false;
+  for (uint8_t i = 0; i < _config.manager_count; i++) {
+    if (strcmp(message->notification->from, _config.manager_list[i]) == 0) {
+      ping_authorized = true;
+      break;
+    }
+  }
+  if (!ping_authorized) {
+    NOPORTS_LOGW(TAG, "Ping: rejected from unauthorized atSign: %s", message->notification->from);
+    return;
+  }
+
   atclient_atkey pingkey;
   atclient_atkey_init(&pingkey);
 
@@ -996,6 +1009,20 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
     return;
   }
 
+  // Check that the requesting atSign is in the authorized manager list
+  bool manager_authorized = false;
+  for (uint8_t i = 0; i < _config.manager_count; i++) {
+    if (strcmp(requesting_atsign, _config.manager_list[i]) == 0) {
+      manager_authorized = true;
+      break;
+    }
+  }
+  if (!manager_authorized) {
+    NOPORTS_LOGW(TAG, "NPT: rejected request from unauthorized atSign: %s", requesting_atsign);
+    cJSON_Delete(envelope);
+    return;
+  }
+
   // Verify contents
   if (!_verifyEnvelopeContents(envelope, 1 /* payload_type_npt */)) {
     NOPORTS_LOGE(TAG, "NPT: invalid envelope contents");
@@ -1005,11 +1032,17 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
 
   cJSON *payload = cJSON_GetObjectItem(envelope, "payload");
 
-  // Check permitopen
+  // Check permitopen — requestedHost and requestedPort are mandatory
   cJSON *requested_host = cJSON_GetObjectItem(payload, "requestedHost");
   cJSON *requested_port = cJSON_GetObjectItem(payload, "requestedPort");
 
-  if (requested_host && requested_port && _config.permitopen_count > 0) {
+  if (!requested_host || !requested_port) {
+    NOPORTS_LOGE(TAG, "NPT: missing requestedHost/requestedPort");
+    cJSON_Delete(envelope);
+    return;
+  }
+
+  {
     const char *rhost = cJSON_GetStringValue(requested_host);
     uint16_t rport = (uint16_t)cJSON_GetNumberValue(requested_port);
 
