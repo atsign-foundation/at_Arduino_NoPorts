@@ -1545,6 +1545,57 @@ void NoPortsDaemon::_cleanupFinishedRelays() {
 // Private: Reconnection
 // ============================================================================
 
+// Re-run root-directory lookup and update cached atServer address.
+// Returns true if a new host/port was discovered (both options structs updated).
+bool NoPortsDaemon::_refreshAtServerCache() {
+  char *resolved_host = nullptr;
+  uint16_t resolved_port = 0;
+
+  NOPORTS_LOGI(TAG, "Re-looking up atServer for %s via %s:%d ...",
+               _config.atsign, _root_host, _root_port);
+
+  int res = atdirectory_lookup_once(_root_host, _root_port,
+                                    _config.atsign,
+                                    &resolved_host, &resolved_port);
+  if (res != 0 || !resolved_host || resolved_port == 0) {
+    if (resolved_host) free(resolved_host);
+    NOPORTS_LOGW(TAG, "atServer re-lookup failed (%d) — keeping cached address", res);
+    return false;
+  }
+
+  bool changed = (strcmp(_atserver_host, resolved_host) != 0) ||
+                 (_atserver_port != resolved_port);
+
+  if (!changed) {
+    free(resolved_host);
+    NOPORTS_LOGI(TAG, "atServer address unchanged: %s:%d",
+                 _atserver_host, _atserver_port);
+    return false;
+  }
+
+  NOPORTS_LOGI(TAG, "atServer address changed: %s:%d -> %s:%d",
+               _atserver_host, _atserver_port, resolved_host, resolved_port);
+
+  snprintf(_atserver_host, sizeof(_atserver_host), "%s", resolved_host);
+  _atserver_port = resolved_port;
+  free(resolved_host);
+
+  // Push new address into both options structs so the next auth uses it
+  if (_monitor_options) {
+    atclient_authenticate_options_set_atserver_host(
+      (atclient_authenticate_options *)_monitor_options, _atserver_host);
+    atclient_authenticate_options_set_atserver_port(
+      (atclient_authenticate_options *)_monitor_options, _atserver_port);
+  }
+  if (_worker_options) {
+    atclient_authenticate_options_set_atserver_host(
+      (atclient_authenticate_options *)_worker_options, _atserver_host);
+    atclient_authenticate_options_set_atserver_port(
+      (atclient_authenticate_options *)_worker_options, _atserver_port);
+  }
+  return true;
+}
+
 bool NoPortsDaemon::_reconnectMonitor() {
   // Too many consecutive failures — likely memory fragmentation preventing
   // mbedTLS from allocating contiguous blocks for TLS handshake.
@@ -1618,8 +1669,24 @@ bool NoPortsDaemon::_reconnectMonitor() {
 
   if (res != 0) {
     NOPORTS_LOGE(TAG, "Monitor reconnect auth failed: %d", res);
-    if (_reconnect_failures < 255) _reconnect_failures++;
-    return false;
+    // Re-lookup the atServer address — it may have moved (e.g. infrastructure
+    // change).  If a new address is found, retry auth once before giving up.
+    if (_refreshAtServerCache()) {
+      NOPORTS_LOGI(TAG, "Retrying monitor auth with refreshed atServer address");
+      atclient_monitor_free(monitor);
+      atclient_monitor_init(monitor);
+      res = atclient_monitor_pkam_authenticate(
+        monitor, _config.atsign, keys,
+        (atclient_authenticate_options *)_monitor_options);
+      if (res != 0) {
+        NOPORTS_LOGE(TAG, "Monitor reconnect auth failed again with new address: %d", res);
+      }
+    }
+    if (res != 0) {
+      if (_reconnect_failures < 255) _reconnect_failures++;
+      return false;
+    }
+    NOPORTS_LOGI(TAG, "Monitor reconnect succeeded after atServer address refresh");
   }
 
   res = atclient_monitor_start(monitor, _monitor_regex);
@@ -1684,8 +1751,24 @@ bool NoPortsDaemon::_reconnectWorker() {
   if (res != 0) {
     NOPORTS_LOGE(TAG, "Worker reconnect auth failed: %d (heap: %u)", res,
                  (unsigned)esp_get_free_heap_size());
-    if (_reconnect_failures < 255) _reconnect_failures++;
-    return false;
+    // Re-lookup the atServer address — it may have moved.
+    // If a new address is found, retry auth once before giving up.
+    if (_refreshAtServerCache()) {
+      NOPORTS_LOGI(TAG, "Retrying worker auth with refreshed atServer address");
+      atclient_free(worker);
+      atclient_init(worker);
+      res = atclient_pkam_authenticate(
+        worker, _config.atsign, keys,
+        (atclient_authenticate_options *)_worker_options, NULL);
+      if (res != 0) {
+        NOPORTS_LOGE(TAG, "Worker reconnect auth failed again with new address: %d", res);
+      }
+    }
+    if (res != 0) {
+      if (_reconnect_failures < 255) _reconnect_failures++;
+      return false;
+    }
+    NOPORTS_LOGI(TAG, "Worker reconnect succeeded after atServer address refresh");
   }
 
   NOPORTS_LOGI(TAG, "Worker reconnected");

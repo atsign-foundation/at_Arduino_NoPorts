@@ -222,6 +222,10 @@ private:
   // Reconnection
   bool _reconnectMonitor();
   bool _reconnectWorker();
+  // Re-runs the root-directory lookup and refreshes _atserver_host/_atserver_port
+  // and both options structs if the address has changed.  Returns true if a new
+  // address was discovered and cached, false if unchanged or the lookup failed.
+  bool _refreshAtServerCache();
 
   // Notify with automatic worker reconnect on failure
   int _notifyWithRetry(void *worker, void *notify_params, char **notification_id);
