@@ -1,0 +1,19 @@
+# docker compose up --build
+#
+# The build context is set to the monorepo root (atArduino/) so that the
+# Dockerfile can access both lib/ and packages/NoPorts_CYD/.
+#
+# WebSerial (used for in-browser flashing) requires a secure context.
+# On the same machine: http://localhost:8080 works fine.
+# Over a local network: either use HTTPS (add a reverse proxy with TLS) or
+# install the browser flag "chrome://flags/#unsafely-treat-insecure-origin-as-secure"
+# for quick testing.
+
+services:
+  flasher:
+    build:
+      context: ../..
+      dockerfile: packages/NoPorts_CYD/Dockerfile
+    ports:
+      - "8080:80"
+    restart: unless-stopped

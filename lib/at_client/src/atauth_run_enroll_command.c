@@ -219,15 +219,33 @@ int atauth_enroll_command(const char *atsign, const char *root_domain, const cha
     goto free_self_enc_key;
   }
 
+  // Disconnect TLS before writing atKeys file – frees ~16KB of mbedTLS heap
+  // which is needed by cJSON_PrintUnformatted on memory-constrained devices.
+  atclient_connection_disconnect(&atclient.atserver_connection);
+
+  // Also free crypto keys early – they're no longer needed after populating atkeys
+  free(self_encryption_key);
+  self_encryption_key = NULL;
+  free(encrypt_private_key);
+  encrypt_private_key = NULL;
+  free_enroll_response(&response);
+  enroll_namespace_free(&ns);
+  atauth_generated_apkam_enrollment_keys_free(&apkam_keys);
+  free(default_encryption_public_key);
+  default_encryption_public_key = NULL;
+
   // write atKeys to atKeys file
   ret = atclient_atkeys_write_to_path(&atkeys, resolved_atkeys_path);
   if (ret != 0) {
     atlogger_log(TAG, ATLOGGER_LOGGING_LEVEL_ERROR, "Failed to write the atkeys file\n");
-    goto free_self_enc_key;
+    // Jump past the frees we already did
+    goto free_enc_pub_key;
   }
 
   atlogger_log(TAG, ATLOGGER_LOGGING_LEVEL_INFO, "Enrollment complete, keys have been written to %s\n",
                resolved_atkeys_path);
+  // Skip cleanup labels for resources we already freed above
+  goto free_enc_pub_key;
 free_self_enc_key:
   free(self_encryption_key);
 free_priv_key:

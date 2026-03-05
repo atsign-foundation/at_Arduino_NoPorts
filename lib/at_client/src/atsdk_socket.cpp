@@ -12,7 +12,13 @@
 #include "atclient/cacerts.h"
 #include "atlogger/atlogger.h"
 
-// Concatenate the bundled CA certificates into a single PEM string
+// Concatenate the bundled CA certificates into a single PEM string.
+// Define ATSDK_TLS_MINIMAL_CERTS on memory-constrained devices (e.g. ESP32 with
+// display) to use only the Let's Encrypt root, saving ~10KB heap.
+#ifdef ATSDK_TLS_MINIMAL_CERTS
+static const char atclient_cacerts_pem[] =
+  LETS_ENCRYPT_ROOT;
+#else
 static const char atclient_cacerts_pem[] =
   LETS_ENCRYPT_ROOT
   GOOGLE_GLOBAL_SIGN
@@ -21,6 +27,7 @@ static const char atclient_cacerts_pem[] =
   GOOGLE_GTS_ROOT_R3
   GOOGLE_GTS_ROOT_R4
   ZEROSSL_INTERMEDIATE;
+#endif
 
 #include <WiFiClientSecure.h>
 #include <cstring>
@@ -46,6 +53,7 @@ void atclient_tls_socket_init(struct atclient_tls_socket *socket) {
   socket->read_timeout_ms = DEFAULT_READ_TIMEOUT_MS;
   socket->configured = 0;
   socket->connected = 0;
+  socket->read_buf = NULL;
 }
 
 int atclient_tls_socket_configure(struct atclient_tls_socket *socket,
@@ -58,14 +66,38 @@ int atclient_tls_socket_configure(struct atclient_tls_socket *socket,
     return 1;
   }
 
-  // Use provided CA or the built-in atclient certs
+  // Certificate verification setup.
+  // On memory-constrained devices (ESP32 with display/DMA), PEM cert parsing
+  // fragments the heap and causes mbedtls_ssl_setup() to fail.
+  // Define ATSDK_USE_CERT_BUNDLE to use the ESP-IDF built-in cert bundle
+  // which verifies from flash without heap allocation.
+#ifdef ATSDK_USE_CERT_BUNDLE
+  extern const uint8_t x509_crt_bundle_start[] asm("_binary_x509_crt_bundle_start");
+  client->setCACertBundle(x509_crt_bundle_start);
+#else
+  // Use provided CA or the built-in atclient PEM certs
   if (ca_pem != NULL && ca_pem_len > 0) {
     client->setCACert((const char *)ca_pem);
   } else {
     client->setCACert((const char *)atclient_cacerts_pem);
   }
+#endif
 
   client->setTimeout(socket->read_timeout_ms / 1000);
+
+  // Pre-allocate the read buffer once so atclient_tls_socket_read never
+  // needs to malloc on every call.  Per-read malloc was the root cause of
+  // spurious monitor/worker reconnects: when relay pbufs fragment the heap
+  // the 4 KB malloc failed, the SDK returned a read error, and the daemon
+  // tore down a perfectly healthy TLS connection to reconnect.
+  if (socket->read_buf == NULL) {
+    socket->read_buf = malloc(READ_BUF_SIZE);
+    if (socket->read_buf == NULL) {
+      atlogger_log(TAG, ATLOGGER_LOGGING_LEVEL_ERROR, "Failed to pre-allocate read buffer\n");
+      delete client;
+      return 1;
+    }
+  }
 
   socket->wifi_client = client;
   socket->configured = 1;
@@ -74,6 +106,10 @@ int atclient_tls_socket_configure(struct atclient_tls_socket *socket,
 
 void atclient_tls_socket_free(struct atclient_tls_socket *socket) {
   if (socket == NULL) return;
+  if (socket->read_buf != NULL) {
+    free(socket->read_buf);
+    socket->read_buf = NULL;
+  }
   if (socket->wifi_client != nullptr) {
     WiFiClientSecure *client = (WiFiClientSecure *)socket->wifi_client;
     if (client->connected()) {
@@ -152,10 +188,12 @@ int atclient_tls_socket_read(struct atclient_tls_socket *socket,
 
   WiFiClientSecure *client = (WiFiClientSecure *)socket->wifi_client;
 
-  // Allocate read buffer
-  unsigned char *buf = (unsigned char *)malloc(READ_BUF_SIZE);
+  // Use the pre-allocated persistent read buffer (allocated once at configure
+  // time) instead of malloc/free on every call.  This prevents spurious read
+  // failures when the heap is fragmented by relay TCP pbufs.
+  unsigned char *buf = (unsigned char *)socket->read_buf;
   if (buf == NULL) {
-    atlogger_log(TAG, ATLOGGER_LOGGING_LEVEL_ERROR, "Failed to allocate read buffer\n");
+    atlogger_log(TAG, ATLOGGER_LOGGING_LEVEL_ERROR, "Read buffer not allocated\n");
     return 1;
   }
 
@@ -181,8 +219,7 @@ int atclient_tls_socket_read(struct atclient_tls_socket *socket,
         unsigned long effective_timeout = have_data ? (timeout_ms * 3) : timeout_ms;
         if ((millis() - start) > effective_timeout) {
           if (pos == 0) {
-            // No data at all — clean timeout
-            free(buf);
+            // No data at all — clean timeout (buf is persistent, don't free)
             if (value != NULL) *value = NULL;
             if (value_len != NULL) *value_len = 0;
             return ATCLIENT_SSL_TIMEOUT_EXITCODE;
@@ -205,7 +242,7 @@ int atclient_tls_socket_read(struct atclient_tls_socket *socket,
       } else {
         if ((millis() - start) > timeout_ms) {
           if (pos == 0) {
-            free(buf);
+            // No data at all — clean timeout (buf is persistent, don't free)
             if (value != NULL) *value = NULL;
             if (value_len != NULL) *value_len = 0;
             return ATCLIENT_SSL_TIMEOUT_EXITCODE;
@@ -218,24 +255,27 @@ int atclient_tls_socket_read(struct atclient_tls_socket *socket,
   }
 
   if (pos == 0) {
-    free(buf);
+    // No data (buf is persistent, don't free)
     if (value != NULL) *value = NULL;
     if (value_len != NULL) *value_len = 0;
     return ATCLIENT_SSL_TIMEOUT_EXITCODE;
   }
 
-  // If caller doesn't want the data, just discard it
+  // If caller doesn't want the data, just discard it (buf is persistent)
   if (value == NULL) {
-    free(buf);
     if (value_len != NULL) *value_len = pos;
     return 0;
   }
 
-  // Trim the buffer to actual size
-  *value = (unsigned char *)realloc(buf, pos + 1);
+  // buf is the persistent workspace — copy result into a caller-owned allocation.
+  // The at-protocol response is typically small (<200 bytes), so this malloc
+  // is tiny and succeeds even under heap fragmentation.  The caller frees *value.
+  *value = (unsigned char *)malloc(pos + 1);
   if (*value == NULL) {
-    *value = buf; // realloc failed, use original
+    if (value_len != NULL) *value_len = 0;
+    return 1;
   }
+  memcpy(*value, buf, pos);
   (*value)[pos] = '\0';
   if (value_len != NULL) *value_len = pos;
 

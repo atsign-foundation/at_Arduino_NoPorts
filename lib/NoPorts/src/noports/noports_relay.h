@@ -65,6 +65,9 @@ struct NoPortsRelayConfig {
 
   // Session ID for tracking
   char session_id[64];
+
+  // Max sub-connections per relay session (0 = use MAX_RELAY_SUBS default)
+  uint8_t max_subs;
 };
 
 /**
@@ -80,6 +83,14 @@ struct NoPortsRelay {
   WiFiClient         rvd_client;    // connection to RVD
   WiFiClient         local_client;  // connection to local service
   volatile bool      should_run;
+
+  // Live byte counters (updated from relay task, read from main loop)
+  volatile uint32_t  bytes_in;      // RVD → local
+  volatile uint32_t  bytes_out;     // local → RVD
+  volatile uint32_t  start_ms;      // millis() when relay entered RUNNING
+
+  // Active sub-connection count (multi mode: 0..MAX_RELAY_SUBS)
+  volatile uint8_t   active_sessions;
 
   // AES-CTR state for encryption (if enabled)
   // Uses mbedtls_aes_context from ESP-IDF's built-in mbedTLS
@@ -113,5 +124,34 @@ void noports_relay_stop(NoPortsRelay *relay);
  * @brief Check if a relay is still running
  */
 bool noports_relay_is_running(const NoPortsRelay *relay);
+
+/**
+ * @brief Get current number of relay TCP sockets in use
+ */
+int noports_relay_get_pcb_count();
+
+/**
+ * @brief Get the maximum number of relay TCP sockets allowed (platform-dependent)
+ */
+int noports_relay_get_pcb_max();
+
+/**
+ * @brief Get relay task CPU busyness (0-100%).
+ *        Measured as the ratio of data-moving iterations to total iterations
+ *        over a 1-second rolling window inside the relay FreeRTOS task.
+ *        Returns 0 when no relay session is active.
+ */
+uint8_t noports_relay_get_cpu_pct();
+
+/**
+ * @brief Return the maximum number of sub-connections each relay session
+ *        should be allowed, given @p n_clients simultaneous relay sessions.
+ *
+ * Derived from the total relay PCB budget so that
+ *   n_clients × (1 ctrl + n_subs×2 data) ≤ MAX_RELAY_PCBS
+ * Clamped to [1, MAX_RELAY_SUBS].
+ * n_clients is the number of concurrent TCP clients being relayed.
+ */
+uint8_t noports_relay_subs_for_clients(uint8_t n_clients);
 
 #endif // NOPORTS_RELAY_H

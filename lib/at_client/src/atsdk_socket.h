@@ -23,6 +23,7 @@ struct atclient_tls_socket {
   int read_timeout_ms;    // Read timeout in milliseconds
   int configured;         // Whether CA certs have been loaded
   int connected;          // Connection state
+  void *read_buf;         // Persistent read buffer (READ_BUF_SIZE), allocated once
 };
 
 /**
