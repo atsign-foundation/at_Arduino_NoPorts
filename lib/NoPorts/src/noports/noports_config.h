@@ -115,6 +115,11 @@ struct NoPortsConfig {
   bool        verbose;
   bool        hide;            // if true, don't publish device info
 
+  // Policy service – if non-NULL, authorisation is delegated via RPC to this
+  // atSign instead of checking manager_list.  Set either manager_count > 0 OR
+  // policy_atsign, not both.
+  const char *policy_atsign;   // e.g. "@mypolicyservice"
+
   // PermitOpen – which host:port combinations the device is willing to relay
   NoPortsPermitOpen permitopen[NOPORTS_MAX_PERMITOPEN];
   uint8_t           permitopen_count;
@@ -148,6 +153,7 @@ inline void noports_config_init(NoPortsConfig *cfg) {
   cfg->verbose         = false;
   cfg->hide            = false;
   cfg->manager_count   = 0;
+  cfg->policy_atsign   = NULL;
   cfg->permitopen_count = 0;
   cfg->on_tunnel_open  = NULL;
   cfg->on_tunnel_close = NULL;

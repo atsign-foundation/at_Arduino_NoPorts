@@ -28,6 +28,33 @@
 #define NOPORTS_MAX_RELAYS 5
 #endif
 
+// ---------------------------------------------------------------------------
+// Policy-service RPC pending state
+// ---------------------------------------------------------------------------
+
+/** Type of request pending policy authorization */
+enum NoPortsPolicyPendingType {
+  NOPORTS_POLICY_NONE = 0,
+  NOPORTS_POLICY_PING,   ///< awaiting auth for a ping response
+  NOPORTS_POLICY_NPT,    ///< awaiting auth for an NPT tunnel request
+};
+
+/**
+ * @brief Holds the state of a single in-flight policy authorisation check.
+ *
+ * Only one check can be outstanding at a time on the ESP32.
+ * The request is sent via the worker; the response arrives on the monitor
+ * (key pattern: @device:<type>.<reqId>.auth_checks.__rpcs.sshnp@policy_atsign).
+ */
+struct NoPortsPolicyPending {
+  bool                     in_use;
+  NoPortsPolicyPendingType type;
+  uint32_t                 req_id;
+  uint32_t                 sent_at_ms;  ///< millis() when the RPC was sent
+  char                     requesting_atsign[64];
+  void                    *envelope;   ///< cJSON* for NPT, nullptr for ping
+};
+
 /**
  * @brief NoPorts daemon states
  */
@@ -202,6 +229,9 @@ private:
   // Max relay sub-connections per session (default 2, range 1-NOPORTS_MAX_RELAYS)
   uint8_t _max_relays;
 
+  // Policy-service RPC — single in-flight pending slot
+  NoPortsPolicyPending _policy_pending;
+
   // Internal methods (mirror the C sshnpd functions)
   void _freeResources();  // free all allocated SDK objects
   bool _authenticate();
@@ -214,6 +244,26 @@ private:
   void _handlePing(void *message);
   void _handleNptRequest(void *message);
   void _handleGracefulShutdown();
+
+  // Policy-service RPC helpers
+  // Called when policy_atsign is configured: sends auth-check RPC via worker,
+  // saves context in _policy_pending, and defers processing until the response
+  // notification arrives on the monitor.
+  void _sendPolicyRpcRequest(const char *client_atsign);
+  void _handlePolicyResponse(void *message);
+  void _cleanupPolicyPending();
+  // Extracts post-auth ping response logic (called directly in manager mode,
+  // or from _handlePolicyResponse after a successful policy RPC).
+  void _handlePingAuthorized(const char *from_atsign);
+  // Contains all post-auth NPT processing (permit-open, key gen, relay launch).
+  // Takes ownership of envelope (always calls cJSON_Delete before returning).
+  // policy_po/policy_po_count are the permitOpen rules returned by the policy
+  // service (nullptr + 0 in manager mode → falls back to config.permitopen).
+  void _continueNptRequest(void *envelope, const char *requesting_atsign,
+                            const char **policy_po, int policy_po_count);
+  // Sends a signed error notification back to the requesting npt client.
+  // Key: <session_id>.<device_name>.sshnp@daemon_atsign, shared with to_atsign.
+  void _sendNptError(const char *to_atsign, const char *session_id, const char *error_msg);
 
   // Relay management
   int  _findFreeRelaySlot();

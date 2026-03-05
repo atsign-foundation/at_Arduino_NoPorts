@@ -135,6 +135,21 @@ static void _draw_page_header();
 
 // Check if managers and permitopen rules are configured
 static bool _rules_valid() {
+  String rules_mode = ui_load_string(NVS_KEY_RULES_MODE);
+  bool policy_mode  = (rules_mode == "1");
+
+  if (policy_mode) {
+    // Policy mode: only the policy atSign is required.
+    // The policy server owns all permitOpen decisions; no local config needed.
+    String policy_at = ui_load_string(NVS_KEY_POLICY_AT);
+    if (policy_at.length() == 0) {
+      Serial.println("[main] Rules invalid: policy mode but no policy atSign configured");
+      return false;
+    }
+    return true;
+  }
+
+  // Manager mode: need at least one manager and a permitopen rule
   String managers = ui_load_string(NVS_KEY_MANAGERS);
   if (managers.length() == 0) {
     managers = ui_load_string(NVS_KEY_MANAGER);
@@ -178,18 +193,31 @@ static bool start_daemon() {
   static String device;
   static String managers_raw;
   static String manager_items[NOPORTS_MAX_MANAGERS];
+  static String policy_at;
   static String permitopen_raw;
   static String po_items[NOPORTS_MAX_PERMITOPEN];
 
   atsign  = ui_load_string(NVS_KEY_ATSIGN);
   device  = ui_load_string(NVS_KEY_DEVICE);
 
-  // Load managers: prefer the new comma-separated key, fall back to single
-  managers_raw = ui_load_string(NVS_KEY_MANAGERS);
-  if (managers_raw.length() == 0) {
-    managers_raw = ui_load_string(NVS_KEY_MANAGER);
+  // Determine authorisation mode
+  String rules_mode_str = ui_load_string(NVS_KEY_RULES_MODE);
+  bool policy_mode = (rules_mode_str == "1");
+
+  if (policy_mode) {
+    // Policy mode: a single policy-service atSign handles authorisation via RPC
+    policy_at = ui_load_string(NVS_KEY_POLICY_AT);
+    Serial.printf("[main] Policy mode: atSign=%s\n",
+                  policy_at.length() ? policy_at.c_str() : "(none)");
+  } else {
+    // Managers mode: load the comma-separated manager list (with legacy fallback)
+    managers_raw = ui_load_string(NVS_KEY_MANAGERS);
+    if (managers_raw.length() == 0) {
+      managers_raw = ui_load_string(NVS_KEY_MANAGER);
+    }
   }
-  int mgr_count = _parse_csv(managers_raw, manager_items, NOPORTS_MAX_MANAGERS);
+  int mgr_count = policy_mode ? 0
+                               : _parse_csv(managers_raw, manager_items, NOPORTS_MAX_MANAGERS);
 
   // Load permitopen rules
   permitopen_raw = ui_load_string(NVS_KEY_PERMITOPEN);
@@ -205,12 +233,17 @@ static bool start_daemon() {
   config.atsign      = atsign.c_str();
   config.device_name = device.c_str();
 
-  // Populate manager list
-  for (int i = 0; i < mgr_count; i++) {
-    config.manager_list[i] = manager_items[i].c_str();
+  if (policy_mode) {
+    // Delegate authorisation to the policy service
+    config.policy_atsign = policy_at.length() ? policy_at.c_str() : nullptr;
+  } else {
+    // Populate manager list
+    for (int i = 0; i < mgr_count; i++) {
+      config.manager_list[i] = manager_items[i].c_str();
+    }
+    config.manager_count = mgr_count;
+    Serial.printf("[main] %d manager(s) configured\n", mgr_count);
   }
-  config.manager_count = mgr_count;
-  Serial.printf("[main] %d manager(s) configured\n", mgr_count);
 
   // Populate permitopen rules
   static String po_hosts[NOPORTS_MAX_PERMITOPEN]; // keep alive

@@ -20,7 +20,6 @@
       --text:    #e2e8f0;
       --muted:   #94a3b8;
       --success: #22c55e;
-      --warn:    #f59e0b;
       --radius:  10px;
     }
 
@@ -167,37 +166,6 @@
     }
     footer a { color: var(--accent); text-decoration: none; }
     footer a:hover { text-decoration: underline; }
-
-    /* Factory reset toggle */
-    .factory-row {
-      display: flex;
-      align-items: flex-start;
-      gap: 0.75rem;
-      padding: 0.75rem 0.9rem;
-      border-radius: var(--radius);
-      border: 1px solid var(--border);
-      cursor: pointer;
-      margin-bottom: 1.1rem;
-      user-select: none;
-      transition: border-color 0.15s, background 0.15s;
-    }
-    .factory-row:has(input:checked) {
-      border-color: var(--warn);
-      background: rgba(245,158,11,0.08);
-    }
-    .factory-row input[type=checkbox] {
-      flex-shrink: 0;
-      margin-top: 0.2rem;
-      width: 1rem;
-      height: 1rem;
-      accent-color: var(--warn);
-      cursor: pointer;
-    }
-    .factory-text { display: flex; flex-direction: column; gap: 0.2rem; }
-    .factory-title { font-weight: 600; font-size: 0.9rem; }
-    .factory-desc  { font-size: 0.78rem; color: var(--muted); }
-    .factory-row:has(input:checked) .factory-title { color: var(--warn); }
-    .factory-row:has(input:checked) .factory-desc  { color: var(--warn); opacity: 0.8; }
   </style>
 </head>
 <body>
@@ -213,7 +181,6 @@
   <div class="board-grid">
     <button class="board-btn selected"
             data-manifest="manifest-cyd2usb.json"
-            data-factory-default="false"
             onclick="selectBoard(this)">
       <span class="icon">📟</span>
       <span class="name">CYD2USB</span>
@@ -221,7 +188,6 @@
     </button>
     <button class="board-btn"
             data-manifest="manifest-cyd2usb_s3.json"
-            data-factory-default="false"
             onclick="selectBoard(this)">
       <span class="icon">🚀</span>
       <span class="name">CYD2USB S3</span>
@@ -233,14 +199,6 @@
 <!-- Install -->
 <div class="card">
   <h2>2 · Connect &amp; install</h2>
-
-  <label class="factory-row">
-    <input type="checkbox" id="factory-cb" onchange="_updateManifest()">
-    <span class="factory-text">
-      <span class="factory-title">⚠️ Factory reset</span>
-      <span class="factory-desc" id="factory-desc">Erase everything — WiFi credentials, daemon config <em>and</em> enrolled atSign keys. Use for first-time setup or if the device won't boot.</span>
-    </span>
-  </label>
 
   <div class="install-row">
     <esp-web-install-button id="install-btn"
@@ -283,7 +241,7 @@
     </li>
     <li>
       <b>Device stuck in a boot loop</b> (screen blank / resets every few seconds)
-      — ensure Factory Reset is ticked, then flash using the BOOT-button method.
+      — use the <b>Erase device</b> option inside the flash dialog, then flash using the BOOT-button method.
     </li>
     <li>
       <b>No serial port appears</b> — try a different USB cable (some are
@@ -318,27 +276,10 @@
 </footer>
 
 <script>
-  function _updateManifest() {
-    const btn      = document.querySelector('.board-btn.selected');
-    const factory  = document.getElementById('factory-cb').checked;
-    const base     = btn.dataset.manifest;  // e.g. "manifest-cyd2usb.json"
-    // factory variant: "manifest-cyd2usb-factory.json"
-    document.getElementById('install-btn').manifest =
-      factory ? base.replace('.json', '-factory.json') : base;
-  }
-
   function selectBoard(btn) {
     document.querySelectorAll('.board-btn').forEach(b => b.classList.remove('selected'));
     btn.classList.add('selected');
-    const factoryDefault = btn.dataset.factoryDefault === 'true';
-    const cb = document.getElementById('factory-cb');
-    cb.checked  = factoryDefault;
-    cb.disabled = false;
-    const row = cb.closest('.factory-row');
-    row.style.cursor = 'pointer';
-    const desc = document.getElementById('factory-desc');
-    desc.innerHTML = 'Erase everything — WiFi credentials, daemon config <em>and</em> enrolled atSign keys. Use for first-time setup or switching atSigns.';
-    _updateManifest();
+    document.getElementById('install-btn').manifest = btn.dataset.manifest;
   }
 </script>
 

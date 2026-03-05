@@ -30,6 +30,7 @@
 extern "C" {
   #include "atclient/atclient.h"
   #include "atclient/atclient_utils.h"
+  #include "atclient/rpc.h"
   #include "atdirectory.h"
   #include "atclient/atkey.h"
   #include "atclient/atkeys.h"
@@ -47,6 +48,17 @@ extern "C" {
 }
 
 #define TAG "noports"
+
+// Policy-service RPC settings (used in loop(), _startMonitor(), and helpers)
+#define NOPORTS_POLICY_DOMAIN_NS   "auth_checks"
+// ATCLIENT_RPC_NS_RPCS ("__rpcs") is defined in atclient/rpc.h
+// Milliseconds to wait for a policy-service response before aborting.
+#define NOPORTS_POLICY_TIMEOUT_MS  30000
+
+// Monotonically increasing counter shared across all policy RPC requests.
+// Each ping AND npt check must use a unique reqId so the Dart AtRpc server's
+// per-request mutex (keyed on reqId, TTL=30 s) does not block the next check.
+static uint32_t s_policy_req_counter = 0;
 
 // Notification key string mapping (from daemon.c)
 static const struct {
@@ -101,6 +113,7 @@ NoPortsDaemon::NoPortsDaemon()
     _relays[i].encrypter = NULL;
     _relays[i].decrypter = NULL;
   }
+  memset(&_policy_pending, 0, sizeof(_policy_pending));
 }
 
 void NoPortsDaemon::_freeResources() {
@@ -172,8 +185,9 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
     _state = DAEMON_ERROR;
     return false;
   }
-  if (_config.manager_count == 0) {
-    _setError("At least one manager atSign is required");
+  if (_config.manager_count == 0 &&
+      (!_config.policy_atsign || _config.policy_atsign[0] == '\0')) {
+    _setError("At least one manager atSign is required (or set a policy atSign)");
     _state = DAEMON_ERROR;
     return false;
   }
@@ -372,6 +386,27 @@ void NoPortsDaemon::loop() {
   // Clean up finished relays
   _cleanupFinishedRelays();
 
+  // Policy RPC timeout: if we sent an auth-check request and got no response
+  // within the timeout window, clean up the pending slot so the next request
+  // is not blocked indefinitely.
+  if (_policy_pending.in_use &&
+      (millis() - _policy_pending.sent_at_ms) > NOPORTS_POLICY_TIMEOUT_MS) {
+    NOPORTS_LOGW(TAG, "Policy RPC: timeout waiting for response "
+                      "(reqId=%lu, pending=%s) — clearing",
+                 (unsigned long)_policy_pending.req_id,
+                 _policy_pending.requesting_atsign);
+    if (_policy_pending.type == NOPORTS_POLICY_NPT && _policy_pending.envelope) {
+      cJSON *env_j  = (cJSON *)_policy_pending.envelope;
+      cJSON *env_pl = cJSON_GetObjectItem(env_j, "payload");
+      const char *sid = env_pl
+          ? cJSON_GetStringValue(cJSON_GetObjectItem(env_pl, "sessionId"))
+          : nullptr;
+      _sendNptError(_policy_pending.requesting_atsign, sid,
+                    "Policy server did not respond in time");
+    }
+    _cleanupPolicyPending();
+  }
+
   // Worker TLS keep-alive: send a heartbeat if the worker connection has
   // been idle for longer than the configured interval.  This prevents NAT/
   // firewall tables from expiring the session between tunnel requests.
@@ -424,9 +459,20 @@ void NoPortsDaemon::loop() {
 
     if (message.type == ATCLIENT_MONITOR_ERROR_DECRYPT_NOTIFICATION) {
       // Decrypt failed — the worker's shared-key cache may be stale.
-      // Reconnect the worker but leave the monitor stream intact.
+      // Reconnect the worker (which refreshes the key cache) but leave the
+      // monitor stream intact.
       NOPORTS_LOGW(TAG, "Monitor: decrypt failed, reconnecting worker");
       _reconnectWorker();
+      // If a policy RPC is in-flight, the response notification was just
+      // dropped.  Now that the worker has refreshed its key cache the next
+      // exchange WILL decrypt, so re-send the request immediately.
+      if (_policy_pending.in_use) {
+        NOPORTS_LOGI(TAG, "Policy RPC: re-sending request after decrypt failure "
+                         "(reqId=%lu, key cache refreshed)",
+                    (unsigned long)_policy_pending.req_id);
+        _policy_pending.sent_at_ms = millis();
+        _sendPolicyRpcRequest(_policy_pending.requesting_atsign);
+      }
       atclient_monitor_message_free(&message);
       return;
     }
@@ -518,6 +564,14 @@ void NoPortsDaemon::loop() {
       _reconnectWorker();
       // Don't force monitor reconnect — the monitor stream is fine,
       // only the worker (used for key lookup) was stale.
+      // Same recovery as above: re-send a pending policy request.
+      if (_policy_pending.in_use) {
+        NOPORTS_LOGI(TAG, "Policy RPC: re-sending request after decrypt failure "
+                         "(reqId=%lu, key cache refreshed)",
+                    (unsigned long)_policy_pending.req_id);
+        _policy_pending.sent_at_ms = millis();
+        _sendPolicyRpcRequest(_policy_pending.requesting_atsign);
+      }
       break;
 
     default:
@@ -696,16 +750,40 @@ bool NoPortsDaemon::_authenticate() {
 // ============================================================================
 
 bool NoPortsDaemon::_startMonitor() {
-  // Build regex: "device.sshnp@"
-  size_t regexlen = strlen(_config.device_name) + strlen(NOPORTS_NS) + 3;
-  _monitor_regex = (char *)malloc(regexlen);
+  // Build monitor regex.
+  //
+  // The atProtocol monitor command does a substring match against notification
+  // keys — it does NOT interpret '|' as regex alternation.
+  //
+  //   Manager-only mode:
+  //     Inbound NoPorts requests:  "@device:npt_request.<id>.device.sshnp@client"
+  //     → anchor: ".sshnp@"
+  //
+  //   Policy mode:
+  //     Same inbound NoPorts requests plus policy-service RPC responses.
+  //     The Dart AtRpc server sets namespaceAware=false on response keys, so
+  //     the response key received has NO namespace suffix:
+  //       "@device:success.<id>.auth_checks.__rpcs@policy"
+  //     This does NOT contain ".sshnp@".
+  //
+  //     Solution: in policy mode send "monitor\r\n" (no filter) by using an
+  //     empty regex string.  atclient_monitor_start("") → "monitor\r\n"
+  //     which delivers ALL notifications addressed to this atsign.  Since
+  //     the device is a dedicated IoT node the traffic is minimal, so the
+  //     broader filter is safe.
+  //
+  const bool policy_mode = (_config.policy_atsign && _config.policy_atsign[0] != '\0');
+  const char *regex = policy_mode ? "" : "." NOPORTS_NS "@";
+  _monitor_regex = (char *)malloc(strlen(regex) + 1);
   if (!_monitor_regex) {
     _setError("Failed to allocate monitor regex");
     return false;
   }
-  snprintf(_monitor_regex, regexlen, "%s.%s@", _config.device_name, NOPORTS_NS);
+  strcpy(_monitor_regex, regex);
 
-  NOPORTS_LOGI(TAG, "Starting monitor with regex: %s", _monitor_regex);
+  NOPORTS_LOGI(TAG, "Starting monitor with regex: '%s' (%s)",
+               _monitor_regex,
+               policy_mode ? "policy mode — no filter" : "manager mode");
 
   int res = atclient_monitor_start((atclient *)_monitor_ctx, _monitor_regex);
   if (res != 0) {
@@ -808,6 +886,21 @@ bool NoPortsDaemon::_publishDeviceInfo() {
 
 void NoPortsDaemon::_handleNotification(void *msg) {
   atclient_monitor_message *message = (atclient_monitor_message *)msg;
+
+  // -----------------------------------------------------------------------
+  // Fast-path: policy-service RPC response
+  // These notifications have keys like:
+  //   @device:<type>.<reqId>.auth_checks.__rpcs.sshnp@policy_atsign
+  // They do NOT match the "device.sshnp@" tail pattern used by the rest of
+  // the dispatch, so we intercept them here before that logic runs.
+  // -----------------------------------------------------------------------
+  if (_config.policy_atsign && _config.policy_atsign[0] != '\0' &&
+      message->notification->key &&
+      atclient_rpc_is_response_key(message->notification->key,
+                                     NOPORTS_NS, NOPORTS_POLICY_DOMAIN_NS)) {
+    _handlePolicyResponse(msg);
+    return;
+  }
 
   bool is_init = atclient_atnotification_is_decrypted_value_initialized(message->notification);
   bool has_key = atclient_atnotification_is_key_initialized(message->notification);
@@ -915,67 +1008,47 @@ void NoPortsDaemon::_handleNotification(void *msg) {
 
 void NoPortsDaemon::_handlePing(void *msg) {
   atclient_monitor_message *message = (atclient_monitor_message *)msg;
-  atclient *worker = (atclient *)_worker_ctx;
 
   if (!_ping_response) {
     NOPORTS_LOGE(TAG, "Ping response not built");
     return;
   }
 
-  // Check that the pinging atSign is in the authorized manager list
+  const char *from = message->notification->from;
+
+  // Authorise the pinging atSign.
+  // Two modes: manager-list check (default) or policy-service RPC.
+  if (_config.policy_atsign && _config.policy_atsign[0] != '\0') {
+    // Policy mode — async RPC to the policy service.
+    if (_policy_pending.in_use) {
+      NOPORTS_LOGW(TAG, "Ping: policy check in flight, ignoring ping from %s", from);
+      return;
+    }
+    _policy_pending.in_use          = true;
+    _policy_pending.type            = NOPORTS_POLICY_PING;
+    _policy_pending.req_id          = ++s_policy_req_counter;
+    _policy_pending.sent_at_ms      = millis();
+    _policy_pending.envelope        = nullptr;
+    strncpy(_policy_pending.requesting_atsign, from,
+            sizeof(_policy_pending.requesting_atsign) - 1);
+    _policy_pending.requesting_atsign[sizeof(_policy_pending.requesting_atsign) - 1] = '\0';
+    _sendPolicyRpcRequest(from);
+    return;
+  }
+
   bool ping_authorized = false;
   for (uint8_t i = 0; i < _config.manager_count; i++) {
-    if (strcmp(message->notification->from, _config.manager_list[i]) == 0) {
+    if (strcmp(from, _config.manager_list[i]) == 0) {
       ping_authorized = true;
       break;
     }
   }
   if (!ping_authorized) {
-    NOPORTS_LOGW(TAG, "Ping: rejected from unauthorized atSign: %s", message->notification->from);
+    NOPORTS_LOGW(TAG, "Ping: rejected from unauthorized atSign: %s", from);
     return;
   }
 
-  atclient_atkey pingkey;
-  atclient_atkey_init(&pingkey);
-
-  size_t keynamelen = strlen("heartbeat") + strlen(_config.device_name) + 2;
-  char keyname[keynamelen];
-  snprintf(keyname, keynamelen, "heartbeat.%s", _config.device_name);
-
-  int res = atclient_atkey_create_shared_key(&pingkey, keyname,
-                                             _config.atsign,
-                                             message->notification->from,
-                                             NOPORTS_NS);
-  if (res != 0) {
-    NOPORTS_LOGE(TAG, "Failed to create ping key");
-    atclient_atkey_free(&pingkey);
-    return;
-  }
-
-  atclient_atkey_metadata *metadata = &pingkey.metadata;
-  atclient_atkey_metadata_set_is_public(metadata, false);
-  atclient_atkey_metadata_set_is_encrypted(metadata, true);
-  atclient_atkey_metadata_set_ttl(metadata, 10000);
-
-  atclient_notify_params notify_params;
-  atclient_notify_params_init(&notify_params);
-  atclient_notify_params_set_atkey(&notify_params, &pingkey);
-  atclient_notify_params_set_operation(&notify_params, ATCLIENT_NOTIFY_OPERATION_UPDATE);
-  atclient_notify_params_set_value(&notify_params, _ping_response);
-
-  res = _notifyWithRetry(worker, &notify_params, NULL);
-  if (res != 0) {
-    NOPORTS_LOGE(TAG, "Failed to send ping response to %s", message->notification->from);
-  } else {
-    NOPORTS_LOGI(TAG, "Sent ping response to %s", message->notification->from);
-  }
-
-  if (_config.on_ping) {
-    _config.on_ping(message->notification->from);
-  }
-
-  atclient_notify_params_free(&notify_params);
-  atclient_atkey_free(&pingkey);
+  _handlePingAuthorized(from);
 }
 
 // ============================================================================
@@ -1009,7 +1082,29 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
     return;
   }
 
-  // Check that the requesting atSign is in the authorized manager list
+  // Authorise the requesting atSign.
+  // Two modes: manager-list check (default) or policy-service RPC.
+  if (_config.policy_atsign && _config.policy_atsign[0] != '\0') {
+    // Policy mode: defer auth to the policy service via async RPC.
+    // Continuation runs in _handlePolicyResponse → _continueNptRequest.
+    if (_policy_pending.in_use) {
+      NOPORTS_LOGW(TAG, "NPT: policy check in flight — ignoring request from %s",
+                   requesting_atsign);
+      cJSON_Delete(envelope);
+      return;
+    }
+    _policy_pending.in_use          = true;
+    _policy_pending.type            = NOPORTS_POLICY_NPT;
+    _policy_pending.req_id          = ++s_policy_req_counter;
+    _policy_pending.sent_at_ms      = millis();
+    _policy_pending.envelope        = envelope;  // ownership transferred
+    strncpy(_policy_pending.requesting_atsign, requesting_atsign,
+            sizeof(_policy_pending.requesting_atsign) - 1);
+    _policy_pending.requesting_atsign[sizeof(_policy_pending.requesting_atsign) - 1] = '\0';
+    _sendPolicyRpcRequest(requesting_atsign);
+    return;
+  }
+
   bool manager_authorized = false;
   for (uint8_t i = 0; i < _config.manager_count; i++) {
     if (strcmp(requesting_atsign, _config.manager_list[i]) == 0) {
@@ -1018,10 +1113,308 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
     }
   }
   if (!manager_authorized) {
-    NOPORTS_LOGW(TAG, "NPT: rejected request from unauthorized atSign: %s", requesting_atsign);
+    NOPORTS_LOGW(TAG, "NPT: rejected request from unauthorized atSign: %s",
+                 requesting_atsign);
     cJSON_Delete(envelope);
     return;
   }
+
+  // Continue NPT processing — envelope ownership transferred.
+  _continueNptRequest(envelope, requesting_atsign, nullptr, 0);
+}
+
+// ============================================================================
+// Private: Policy-service RPC helpers
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// Send a signed error response notification to the npt client.
+// Matches the Dart sshnpd error format so npt shows the correct error string.
+// ---------------------------------------------------------------------------
+void NoPortsDaemon::_sendNptError(const char *to_atsign,
+                                   const char *session_id,
+                                   const char *error_msg) {
+  atclient *worker = (atclient *)_worker_ctx;
+
+  if (!to_atsign || !session_id || !error_msg) {
+    NOPORTS_LOGW(TAG, "NPT error: missing args for error response");
+    return;
+  }
+
+  NOPORTS_LOGW(TAG, "NPT: sending error to %s: %s", to_atsign, error_msg);
+
+  // SshnpdDefaultPayloadHandler.handleSshnpdPayload() checks whether the
+  // notification value starts with '{'.  If it does, it parses it as a signed
+  // JSON envelope and returns SshnpdAck.acknowledged — the npt client then
+  // proceeds as if the tunnel is up.  If it does NOT start with '{', the
+  // handler sets errorReceived = value and returns SshnpdAck.acknowledgedWithErrors,
+  // which causes npt to throw SshnpError("Error response from device daemon: ...").
+  // So we must send a plain string (no JSON wrapping), exactly as the Dart
+  // sshnpd_impl.dart does for permit-open denials.
+
+  // Key: <sessionId>.<deviceName>.sshnp@daemon  shared with to_atsign
+  atclient_atkey err_atkey;
+  atclient_atkey_init(&err_atkey);
+  size_t klen = strlen(session_id) + strlen(_config.device_name) + 2;
+  char *kname = (char *)malloc(klen);
+  if (kname) {
+    snprintf(kname, klen, "%s.%s", session_id, _config.device_name);
+    atclient_atkey_create_shared_key(&err_atkey, kname,
+                                      _config.atsign, to_atsign, NOPORTS_NS);
+    atclient_atkey_metadata_set_is_public(&err_atkey.metadata,    false);
+    atclient_atkey_metadata_set_is_encrypted(&err_atkey.metadata, true);
+    atclient_atkey_metadata_set_ttl(&err_atkey.metadata,          10000);
+
+    atclient_notify_params nparams;
+    atclient_notify_params_init(&nparams);
+    atclient_notify_params_set_atkey(&nparams, &err_atkey);
+    atclient_notify_params_set_value(&nparams, error_msg);  // plain string, not JSON
+    atclient_notify_params_set_operation(&nparams, ATCLIENT_NOTIFY_OPERATION_UPDATE);
+
+    int nret = _notifyWithRetry(worker, &nparams, NULL);
+    if (nret != 0) {
+      NOPORTS_LOGE(TAG, "NPT: failed to send error response to %s (%d)", to_atsign, nret);
+    }
+    atclient_notify_params_free(&nparams);
+    free(kname);
+  }
+  atclient_atkey_free(&err_atkey);
+}
+
+void NoPortsDaemon::_cleanupPolicyPending() {
+  if (_policy_pending.envelope) {
+    cJSON_Delete((cJSON *)_policy_pending.envelope);
+    _policy_pending.envelope = nullptr;
+  }
+  memset(&_policy_pending, 0, sizeof(_policy_pending));
+}
+
+void NoPortsDaemon::_sendPolicyRpcRequest(const char *client_atsign) {
+  atclient *worker = (atclient *)_worker_ctx;
+  uint32_t req_id  = _policy_pending.req_id;
+
+  // Build the NoPorts-specific NPAAuthCheckRequest payload JSON.
+  // atclient_rpc_send_request wraps it in the AtRpcReq envelope:
+  //   {"reqId":<n>,"payload":<payload_json>}
+  cJSON *pl = cJSON_CreateObject();
+  cJSON_AddStringToObject(pl, "daemonAtsign",          _config.atsign);
+  cJSON_AddStringToObject(pl, "daemonDeviceName",      _config.device_name);
+  cJSON_AddStringToObject(pl, "daemonDeviceGroupName", "");
+  cJSON_AddStringToObject(pl, "clientAtsign",          client_atsign);
+  char *payload_json = cJSON_PrintUnformatted(pl);
+  cJSON_Delete(pl);
+
+  if (!payload_json) {
+    NOPORTS_LOGE(TAG, "Policy RPC: OOM building payload JSON");
+    _cleanupPolicyPending();
+    return;
+  }
+
+  NOPORTS_LOGI(TAG, "Policy RPC: requesting auth for %s from %s (reqId=%lu)",
+               client_atsign, _config.policy_atsign, (unsigned long)req_id);
+
+  int res = atclient_rpc_send_request(worker,
+                                       _config.atsign,
+                                       _config.policy_atsign,
+                                       NOPORTS_NS,
+                                       NOPORTS_POLICY_DOMAIN_NS,
+                                       req_id,
+                                       payload_json,
+                                       30000);
+  free(payload_json);
+
+  if (res != 0) {
+    NOPORTS_LOGE(TAG, "Policy RPC: send failed (%d) — cancelling check", res);
+    _cleanupPolicyPending();
+  }
+}
+
+void NoPortsDaemon::_handlePolicyResponse(void *msg) {
+  atclient_monitor_message *message = (atclient_monitor_message *)msg;
+
+  if (!message->notification->key) {
+    NOPORTS_LOGW(TAG, "Policy RPC: response with no key");
+    return;
+  }
+
+  // Use the library to parse resp_type and req_id from the key.
+  atclient_rpc_resp rpc_resp;
+  if (atclient_rpc_parse_response_key(message->notification, &rpc_resp) != 0) {
+    NOPORTS_LOGW(TAG, "Policy RPC: failed to parse response key: %s",
+                 message->notification->key);
+    return;
+  }
+
+  NOPORTS_LOGI(TAG, "Policy RPC: type=%d reqId=%lu from=%s",
+               (int)rpc_resp.resp_type, (unsigned long)rpc_resp.req_id,
+               message->notification->from ? message->notification->from : "?");
+
+  if (!_policy_pending.in_use) {
+    NOPORTS_LOGW(TAG, "Policy RPC: no pending request (ignoring reqId=%lu)",
+                 (unsigned long)rpc_resp.req_id);
+    return;
+  }
+  if (_policy_pending.req_id != rpc_resp.req_id) {
+    NOPORTS_LOGW(TAG, "Policy RPC: reqId mismatch (pending=%lu got=%lu) — ignoring",
+                 (unsigned long)_policy_pending.req_id, (unsigned long)rpc_resp.req_id);
+    return;
+  }
+
+  // ACK = server received the request; reset timeout and wait for the decision.
+  if (rpc_resp.resp_type == ATCLIENT_RPC_RESP_ACK) {
+    NOPORTS_LOGI(TAG, "Policy RPC: ack received — waiting for decision");
+    _policy_pending.sent_at_ms = millis();
+    return;
+  }
+
+  // Any other type (success / error / nack) finalises the check.
+  bool authorized = false;
+  char        po_buf[16][64];
+  const char *po_ptrs[16];
+  int         po_count = 0;
+
+  if (rpc_resp.resp_type == ATCLIENT_RPC_RESP_SUCCESS) {
+    if (!atclient_atnotification_is_decrypted_value_initialized(message->notification) ||
+        !message->notification->decrypted_value) {
+      NOPORTS_LOGE(TAG, "Policy RPC: success but no decrypted value");
+    } else {
+      cJSON *resp = cJSON_Parse(message->notification->decrypted_value);
+      if (resp) {
+        cJSON *pl = cJSON_GetObjectItem(resp, "payload");
+        if (pl) {
+          authorized = cJSON_IsTrue(cJSON_GetObjectItem(pl, "authorized"));
+          const char *ms = cJSON_GetStringValue(cJSON_GetObjectItem(pl, "message"));
+          NOPORTS_LOGI(TAG, "Policy RPC: authorized=%d msg='%s'",
+                       authorized, ms ? ms : "");
+          cJSON *po_arr = cJSON_GetObjectItem(pl, "permitOpen");
+          NOPORTS_LOGI(TAG, "Policy RPC: permitOpen is %s, size=%d",
+                       po_arr ? (cJSON_IsArray(po_arr) ? "array" : "non-array") : "NULL",
+                       po_arr && cJSON_IsArray(po_arr) ? cJSON_GetArraySize(po_arr) : -1);
+          if (cJSON_IsArray(po_arr)) {
+            int n = cJSON_GetArraySize(po_arr);
+            for (int i = 0; i < n && po_count < 16; i++) {
+              cJSON *item = cJSON_GetArrayItem(po_arr, i);
+              const char *s = cJSON_GetStringValue(item);
+              NOPORTS_LOGI(TAG, "Policy RPC: permitOpen[%d] type=%d val='%s'",
+                           i, item ? item->type : -1, s ? s : "(null)");
+              if (s) {
+                strncpy(po_buf[po_count], s, 63);
+                po_buf[po_count][63] = '\0';
+                po_ptrs[po_count]    = po_buf[po_count];
+                po_count++;
+              }
+            }
+          }
+        } else {
+          NOPORTS_LOGE(TAG, "Policy RPC: success response has no 'payload' field");
+          NOPORTS_LOGI(TAG, "Policy RPC: raw decrypted_value: %s",
+                       message->notification->decrypted_value);
+        }
+        cJSON_Delete(resp);
+      } else {
+        NOPORTS_LOGE(TAG, "Policy RPC: failed to parse response JSON");
+      }
+    }
+  } else {
+    NOPORTS_LOGW(TAG, "Policy RPC: type=%d response — rejecting", (int)rpc_resp.resp_type);
+  }
+
+  if (!authorized) {
+    NOPORTS_LOGW(TAG, "Policy RPC: access denied for %s",
+                 _policy_pending.requesting_atsign);
+    // For NPT requests, notify the client so npt shows the error immediately
+    if (_policy_pending.type == NOPORTS_POLICY_NPT && _policy_pending.envelope) {
+      cJSON *env_j  = (cJSON *)_policy_pending.envelope;
+      cJSON *env_pl = cJSON_GetObjectItem(env_j, "payload");
+      const char *sid = env_pl
+          ? cJSON_GetStringValue(cJSON_GetObjectItem(env_pl, "sessionId"))
+          : nullptr;
+      _sendNptError(_policy_pending.requesting_atsign, sid,
+                    "Access denied by policy server");
+    }
+    _cleanupPolicyPending();
+    return;
+  }
+
+  if (_policy_pending.type == NOPORTS_POLICY_PING) {
+    _handlePingAuthorized(_policy_pending.requesting_atsign);
+    _cleanupPolicyPending();
+
+  } else if (_policy_pending.type == NOPORTS_POLICY_NPT) {
+    cJSON *env = (cJSON *)_policy_pending.envelope;
+    _policy_pending.envelope = nullptr;  // transfer ownership before cleanup
+    char req_at[64];
+    strncpy(req_at, _policy_pending.requesting_atsign, sizeof(req_at) - 1);
+    req_at[sizeof(req_at) - 1] = '\0';
+    NOPORTS_LOGI(TAG, "Policy RPC: passing %d permitOpen entries to continueNptRequest",
+                 po_count);
+    _cleanupPolicyPending();  // free the slot before the long relay setup
+    _continueNptRequest(env, req_at, po_count > 0 ? po_ptrs : nullptr, po_count);
+  }
+}
+
+// ============================================================================
+// Private: Ping authorized — send the heartbeat notification
+// ============================================================================
+
+void NoPortsDaemon::_handlePingAuthorized(const char *from_atsign) {
+  atclient *worker = (atclient *)_worker_ctx;
+
+  atclient_atkey pingkey;
+  atclient_atkey_init(&pingkey);
+
+  size_t keynamelen = strlen("heartbeat") + strlen(_config.device_name) + 2;
+  char keyname[keynamelen];
+  snprintf(keyname, keynamelen, "heartbeat.%s", _config.device_name);
+
+  int res = atclient_atkey_create_shared_key(&pingkey, keyname,
+                                             _config.atsign, from_atsign,
+                                             NOPORTS_NS);
+  if (res != 0) {
+    NOPORTS_LOGE(TAG, "Ping: failed to create heartbeat key (%d)", res);
+    atclient_atkey_free(&pingkey);
+    return;
+  }
+
+  atclient_atkey_metadata_set_is_public(&pingkey.metadata, false);
+  atclient_atkey_metadata_set_is_encrypted(&pingkey.metadata, true);
+  atclient_atkey_metadata_set_ttl(&pingkey.metadata, 10000);
+
+  atclient_notify_params notify_params;
+  atclient_notify_params_init(&notify_params);
+  atclient_notify_params_set_atkey(&notify_params, &pingkey);
+  atclient_notify_params_set_operation(&notify_params, ATCLIENT_NOTIFY_OPERATION_UPDATE);
+  atclient_notify_params_set_value(&notify_params, _ping_response);
+
+  res = _notifyWithRetry(worker, &notify_params, NULL);
+  if (res != 0) {
+    NOPORTS_LOGE(TAG, "Ping: failed to send response to %s", from_atsign);
+  } else {
+    NOPORTS_LOGI(TAG, "Ping: sent response to %s", from_atsign);
+  }
+
+  if (_config.on_ping) {
+    _config.on_ping(from_atsign);
+  }
+}
+
+// ============================================================================
+// Private: Continue NPT request after authorization
+// ============================================================================
+// Takes ownership of |env| — always calls cJSON_Delete before returning.
+// policy_po / policy_po_count: the permitOpen list from the policy service.
+//   nullptr + 0  → manager mode, checks config.permitopen.
+//   non-null     → policy mode, checks the policy-provided list.
+// ============================================================================
+
+void NoPortsDaemon::_continueNptRequest(void *env,
+                                         const char *requesting_atsign,
+                                         const char **policy_po,
+                                         int policy_po_count) {
+  cJSON *envelope = (cJSON *)env;
+  atclient *worker = (atclient *)_worker_ctx;
+  atchops_rsa_key_private_key *skey = (atchops_rsa_key_private_key *)_signing_key;
+  int res = 0;
 
   // Verify contents
   if (!_verifyEnvelopeContents(envelope, 1 /* payload_type_npt */)) {
@@ -1031,6 +1424,9 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
   }
 
   cJSON *payload = cJSON_GetObjectItem(envelope, "payload");
+  // Extract sessionId early so all error-response paths can key the notification
+  const char *session_id_str =
+      cJSON_GetStringValue(cJSON_GetObjectItem(payload, "sessionId"));
 
   // Check permitopen — requestedHost and requestedPort are mandatory
   cJSON *requested_host = cJSON_GetObjectItem(payload, "requestedHost");
@@ -1047,19 +1443,84 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
     uint16_t rport = (uint16_t)cJSON_GetNumberValue(requested_port);
 
     bool permitted = false;
-    for (uint8_t i = 0; i < _config.permitopen_count; i++) {
-      bool host_match = (strcmp(_config.permitopen[i].host, "*") == 0) ||
-                        (strcmp(_config.permitopen[i].host, rhost) == 0);
-      bool port_match = (_config.permitopen[i].port == 0) ||
-                        (_config.permitopen[i].port == rport);
-      if (host_match && port_match) {
-        permitted = true;
-        break;
+    const bool in_policy_mode = (_config.policy_atsign && _config.policy_atsign[0] != '\0');
+    if (in_policy_mode) {
+      // Policy mode: the policy server's permitOpen list is authoritative.
+      // An empty list means the device is not configured in the policy server.
+      if (policy_po_count == 0) {
+        NOPORTS_LOGW(TAG, "NPT: policy returned empty permitOpen — device not configured in policy server, denying %s:%d",
+                     rhost, rport);
+        // permitted stays false → connection will be denied below
+      } else {
+        NOPORTS_LOGI(TAG, "NPT: checking policy permitOpen (%d entries) for %s:%u",
+                     policy_po_count, rhost, (unsigned)rport);
+        for (int i = 0; i < policy_po_count && !permitted; i++) {
+          const char *entry = policy_po[i];
+          NOPORTS_LOGI(TAG, "NPT: policy permitOpen[%d]='%s'", i, entry ? entry : "(null)");
+          const char *colon = strrchr(entry, ':');
+          if (!colon) continue;
+          size_t hlen = (size_t)(colon - entry);
+          char h[128];
+          if (hlen >= sizeof(h)) continue;
+          memcpy(h, entry, hlen); h[hlen] = '\0';
+          const char *port_str = colon + 1;
+          uint16_t p = (uint16_t)strtoul(port_str, nullptr, 10);
+          bool hm = (strcmp(h, "*") == 0) || (strcmp(h, rhost) == 0);
+          bool pm = (strcmp(port_str, "*") == 0) || (p == 0) || (p == rport);
+          NOPORTS_LOGI(TAG, "NPT: compare h='%s' p=%u hm=%d pm=%d (rport=%u p=%u)",
+                       h, (unsigned)p, (int)hm, (int)pm, (unsigned)rport, (unsigned)p);
+          if (hm && pm) {
+            NOPORTS_LOGW(TAG, "NPT: POLICY PERMIT — %s:%u matched rule '%s'", rhost, (unsigned)rport, entry);
+            permitted = true;
+          }
+        }
+      }
+    } else {
+      // Manager mode: check static device config.
+      for (uint8_t i = 0; i < _config.permitopen_count; i++) {
+        bool host_match = (strcmp(_config.permitopen[i].host, "*") == 0) ||
+                          (strcmp(_config.permitopen[i].host, rhost) == 0);
+        bool port_match = (_config.permitopen[i].port == 0) ||
+                          (_config.permitopen[i].port == rport);
+        if (host_match && port_match) {
+          permitted = true;
+          break;
+        }
       }
     }
 
     if (!permitted) {
-      NOPORTS_LOGW(TAG, "NPT: request to %s:%d not permitted", rhost, rport);
+      // Build a human-readable permit-open list for the error message
+      NOPORTS_LOGW(TAG, "NPT: POLICY DENY — %s:%u not in policy permitOpen list", rhost, (unsigned)rport);
+      char po_list[128] = "(none)";
+      if (in_policy_mode && policy_po_count > 0) {
+        size_t off = 0;
+        for (int i = 0; i < policy_po_count && off + 2 < sizeof(po_list); i++) {
+          if (i > 0 && off + 1 < sizeof(po_list)) po_list[off++] = ',';
+          size_t n = strlen(policy_po[i]);
+          if (off + n >= sizeof(po_list)) n = sizeof(po_list) - off - 1;
+          memcpy(po_list + off, policy_po[i], n);
+          off += n;
+        }
+        po_list[off] = '\0';
+      } else if (!in_policy_mode) {
+        size_t off = 0;
+        for (uint8_t i = 0; i < _config.permitopen_count && off + 2 < sizeof(po_list); i++) {
+          if (i > 0 && off + 1 < sizeof(po_list)) po_list[off++] = ',';
+          int n = snprintf(po_list + off, sizeof(po_list) - off,
+                           "%s:%u", _config.permitopen[i].host,
+                           (unsigned)_config.permitopen[i].port);
+          if (n > 0) off += (size_t)n;
+        }
+      }
+      char err_msg[256];
+      snprintf(err_msg, sizeof(err_msg),
+               "Connection to %s:%d denied based on %s --permit-open [%s]",
+               rhost, rport,
+               in_policy_mode ? "POLICY" : "MANAGER",
+               po_list);
+      NOPORTS_LOGW(TAG, "NPT: %s", err_msg);
+      _sendNptError(requesting_atsign, session_id_str, err_msg);
       cJSON_Delete(envelope);
       return;
     }
@@ -1072,6 +1533,8 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
 
   if (!rvd_host || !rvd_port || !session_id) {
     NOPORTS_LOGE(TAG, "NPT: missing rvdHost/rvdPort/sessionId");
+    _sendNptError(requesting_atsign, session_id_str,
+                  "Malformed session request: missing rvdHost, rvdPort or sessionId");
     cJSON_Delete(envelope);
     return;
   }
@@ -1080,6 +1543,10 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
   int slot = _findFreeRelaySlot();
   if (slot < 0) {
     NOPORTS_LOGE(TAG, "NPT: no free relay slots (max %d)", NOPORTS_MAX_RELAYS);
+    char err_msg[64];
+    snprintf(err_msg, sizeof(err_msg), "No relay slots available (max %d active)",
+             NOPORTS_MAX_RELAYS);
+    _sendNptError(requesting_atsign, session_id_str, err_msg);
     cJSON_Delete(envelope);
     return;
   }

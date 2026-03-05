@@ -98,8 +98,10 @@ struct UiEvent {
 #define NVS_KEY_MANAGER   "manager"
 #define NVS_KEY_LED_COLOR "led_color"
 #define NVS_KEY_CONFIGURED "configured"
-#define NVS_KEY_MANAGERS  "managers"   // comma-separated atSign list e.g. "@colin,@cconstab"
-#define NVS_KEY_PERMITOPEN "permitopen" // comma-separated host:port rules e.g. "localhost:22,localhost:80"
+#define NVS_KEY_MANAGERS   "managers"    // comma-separated atSign list e.g. "@colin,@cconstab"
+#define NVS_KEY_PERMITOPEN  "permitopen"  // comma-separated host:port rules e.g. "localhost:22,localhost:80"
+#define NVS_KEY_RULES_MODE  "rules_mode"  // "0" = managers list, "1" = policy atSign
+#define NVS_KEY_POLICY_AT   "policy_at"   // single policy-service atSign e.g. "@mypolicy"
 #define NVS_KEY_WORKER_KEEPALIVE "worker_ka"  // worker TLS keepalive interval in minutes (0=off)
 #define NVS_KEY_MAX_RELAYS       "max_relays"  // max relay sub-connections per session (1-5 on ESP32, 1-6 on S3)
 

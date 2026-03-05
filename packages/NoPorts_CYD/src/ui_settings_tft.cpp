@@ -1,12 +1,12 @@
 /**
  * @file ui_settings_tft.cpp
- * @brief Settings screen for editing managers and connection rules
+ * @brief Settings screen for editing managers/policy and connection rules
  *
- * Two editable fields:
- *   1. Managers  – comma-separated atSign list (e.g. "@colin,@cconstab")
- *   2. PermitOpen – comma-separated host:port rules (e.g. "localhost:22,localhost:80")
+ * Mode toggle selects how authorisation works:
+ *   MANAGERS – comma-separated list of allowed manager atSigns
+ *   POLICY   – single policy-service atSign (RPC-based authorisation)
  *
- * WiFi SSID is shown read-only. A "Change WiFi" button triggers a rescan.
+ * Field 0 changes meaning based on mode; Field 1 is always PermitOpen.
  */
 
 #include "ui_settings_tft.h"
@@ -18,10 +18,15 @@
 // Layout
 // ---------------------------------------------------------------------------
 #define HEADER_HEIGHT     28
-#define FIELD_Y_START     34
-#define FIELD_HEIGHT      20
-#define FIELD_GAP         4
-#define KEYBOARD_TOP_Y    120
+// Mode-toggle bar (drawn just below header)
+#define TOGGLE_Y          34
+#define TOGGLE_H          28
+// Fields start below the toggle bar
+#define FIELD_Y_START     (TOGGLE_Y + TOGGLE_H + 2)
+#define FIELD_HEIGHT      16
+#define FIELD_GAP         2
+// Keyboard pushed down slightly to fit the extra toggle bar
+#define KEYBOARD_TOP_Y    132
 #define KEYS_PER_ROW      10
 #define KEY_WIDTH         30
 #define KEY_HEIGHT        18
@@ -32,10 +37,14 @@
 // ---------------------------------------------------------------------------
 static void (*_on_save_cb)() = nullptr;
 
-// Field 0 = Managers, Field 1 = PermitOpen
+// rules_mode: 0 = managers list, 1 = policy atSign
+static int  _rules_mode   = 0;
+// Field 0 = Managers -or- Policy atSign depending on _rules_mode
+// Field 1 = PermitOpen (always)
 static int  _active_field = 0;
-static char _managers[256]   = "";
-static char _permitopen[256] = "";
+static char _managers[256]    = "";
+static char _policy_at[128]   = "";
+static char _permitopen[256]  = "";
 
 // Keyboard mode: 0=lowercase, 1=uppercase, 2=symbols
 static int _kb_mode = 0;
@@ -92,7 +101,9 @@ static int _scroll_offset[2] = {0, 0};
 // ---------------------------------------------------------------------------
 static void _draw_screen();
 static void _draw_fields();
+static void _draw_mode_toggle();
 static void _draw_keyboard();
+static bool _check_mode_toggle_tap(int16_t tx, int16_t ty);
 static bool _check_keyboard_press(int16_t tx, int16_t ty);
 
 // ---------------------------------------------------------------------------
@@ -100,11 +111,15 @@ static bool _check_keyboard_press(int16_t tx, int16_t ty);
 // ---------------------------------------------------------------------------
 
 static char* _get_active_buffer() {
-  return (_active_field == 0) ? _managers : _permitopen;
+  if (_active_field == 0)
+    return (_rules_mode == 1) ? _policy_at : _managers;
+  return _permitopen;
 }
 
 static size_t _get_active_maxlen() {
-  return (_active_field == 0) ? sizeof(_managers) - 1 : sizeof(_permitopen) - 1;
+  if (_active_field == 0)
+    return (_rules_mode == 1) ? sizeof(_policy_at) - 1 : sizeof(_managers) - 1;
+  return sizeof(_permitopen) - 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +139,43 @@ static void _draw_header() {
   tft.drawString("Rules", 10, 3 + HEADER_HEIGHT / 2, 4);
 }
 
+// ---------------------------------------------------------------------------
+// Mode toggle bar: [Managers]  [Policy]
+// ---------------------------------------------------------------------------
+static void _draw_mode_toggle() {
+  TFT_eSPI &tft = ui_get_tft();
+  tft.fillRect(0, TOGGLE_Y, TFT_WIDTH, TOGGLE_H, COLOR_BG_DARK);
+
+  int half    = TFT_WIDTH / 2;
+  int gap     = 3;
+  int btn_w   = half - gap - 2;
+  int btn_h   = TOGGLE_H - 4;
+  int btn_y   = TOGGLE_Y + 2;
+  int mid_y   = btn_y + btn_h / 2;
+
+  // Left: Managers
+  uint16_t mgr_bg = (_rules_mode == 0) ? COLOR_PRIMARY : COLOR_BUTTON_BG;
+  ui_draw_rounded_rect(2, btn_y, btn_w, btn_h, 4, mgr_bg);
+  // Radio-dot indicator
+  int mgr_dot_x = 11;
+  tft.drawCircle(mgr_dot_x, mid_y, 4, COLOR_TEXT_WHITE);
+  if (_rules_mode == 0) tft.fillCircle(mgr_dot_x, mid_y, 2, COLOR_TEXT_WHITE);
+  tft.setTextColor(COLOR_TEXT_WHITE);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextSize(1);
+  tft.drawString("Managers", mgr_dot_x + 7, mid_y, 2);
+
+  // Right: Policy
+  uint16_t pol_bg = (_rules_mode == 1) ? COLOR_PRIMARY : COLOR_BUTTON_BG;
+  ui_draw_rounded_rect(half + gap, btn_y, btn_w, btn_h, 4, pol_bg);
+  // Radio-dot indicator
+  int pol_dot_x = half + gap + 11;
+  tft.drawCircle(pol_dot_x, mid_y, 4, COLOR_TEXT_WHITE);
+  if (_rules_mode == 1) tft.fillCircle(pol_dot_x, mid_y, 2, COLOR_TEXT_WHITE);
+  tft.setTextDatum(ML_DATUM);
+  tft.drawString("Policy", pol_dot_x + 7, mid_y, 2);
+}
+
 static void _draw_fields() {
   TFT_eSPI &tft = ui_get_tft();
 
@@ -134,13 +186,18 @@ static void _draw_fields() {
   };
 
   FieldInfo fields[] = {
-    {"Managers:", "@alice,@bob", _managers},
-    {"Rules:", "*:*", _permitopen},
+    (_rules_mode == 1)
+      ? FieldInfo{"Policy at:", "@policyservice", _policy_at}
+      : FieldInfo{"Managers:",  "@alice,@bob",    _managers},
+    {"Permit:", "*:*", _permitopen},
   };
 
   int y = FIELD_Y_START;
+  // In policy mode only one field is needed (the policy atSign);
+  // the policy server owns all permitOpen decisions.
+  int field_count = (_rules_mode == 1) ? 1 : 2;
 
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < field_count; i++) {
     // Label row
     tft.setTextColor(COLOR_TEXT_GREY);
     tft.setTextDatum(TL_DATUM);
@@ -256,6 +313,7 @@ static void _draw_screen() {
   TFT_eSPI &tft = ui_get_tft();
   tft.fillScreen(COLOR_BG_DARK);
   _draw_header();
+  _draw_mode_toggle();
   _draw_fields();
   _draw_keyboard();
 }
@@ -264,10 +322,38 @@ static void _draw_screen() {
 // Touch handling
 // ---------------------------------------------------------------------------
 
+static bool _check_mode_toggle_tap(int16_t tx, int16_t ty) {
+  int half  = TFT_WIDTH / 2;
+  int gap   = 3;
+  int btn_w = half - gap - 2;
+
+  // Expand hit area: from just below the header to the top of the first field.
+  // This makes the tap zone ~30px tall rather than the 22px drawn height.
+  int hit_y = HEADER_HEIGHT + 3;           // just below header bottom
+  int hit_h = FIELD_Y_START - hit_y;       // down to first field
+
+  int new_mode = -1;
+  if (ui_touch_in_rect(tx, ty, 2,        hit_y, btn_w, hit_h)) new_mode = 0; // Managers
+  if (ui_touch_in_rect(tx, ty, half+gap, hit_y, btn_w, hit_h)) new_mode = 1; // Policy
+
+  if (new_mode >= 0 && new_mode != _rules_mode) {
+    _rules_mode = new_mode;
+    // Switching mode makes field 0 change meaning; keep the active field
+    TFT_eSPI &tft = ui_get_tft();
+    tft.fillRect(0, TOGGLE_Y, TFT_WIDTH, KEYBOARD_TOP_Y - TOGGLE_Y, COLOR_BG_DARK);
+    _draw_mode_toggle();
+    _draw_fields();
+    return true;
+  }
+  // Consume the tap even if same mode (don't let it fall through to field checks)
+  return (new_mode >= 0);
+}
+
 static bool _check_field_tap(int16_t tx, int16_t ty) {
   int y0 = FIELD_Y_START;
+  int field_count = (_rules_mode == 1) ? 1 : 2;
 
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < field_count; i++) {
     int label_y = y0;
     int field_y = label_y + 16;
 
@@ -338,20 +424,24 @@ static bool _check_keyboard_press(int16_t tx, int16_t ty) {
     return true;
   }
 
-  // SPACE (comma separator)
+  // SPACE inserts a comma separator for multi-entry fields.
+  // In policy-atSign field (single value) a comma makes no sense — ignore it.
   if (ui_touch_in_rect(tx, ty, BROW_SPC_X, brow_y, BROW_SPC_W, KEY_HEIGHT)) {
-    char *buf = _get_active_buffer();
-    int len = strlen(buf);
-    size_t maxlen = _get_active_maxlen();
-    if (len > 0 && len < (int)maxlen && buf[len - 1] != ',') {
-      buf[len] = ',';
-      buf[len + 1] = '\0';
+    bool comma_ok = !(_rules_mode == 1 && _active_field == 0);
+    if (comma_ok) {
+      char *buf = _get_active_buffer();
+      int len = strlen(buf);
+      size_t maxlen = _get_active_maxlen();
+      if (len > 0 && len < (int)maxlen && buf[len - 1] != ',') {
+        buf[len] = ',';
+        buf[len + 1] = '\0';
+      }
+      TFT_eSPI &tft = ui_get_tft();
+      tft.fillRect(0, FIELD_Y_START,
+                   TFT_WIDTH, KEYBOARD_TOP_Y - FIELD_Y_START,
+                   COLOR_BG_DARK);
+      _draw_fields();
     }
-    TFT_eSPI &tft = ui_get_tft();
-    tft.fillRect(0, FIELD_Y_START,
-                 TFT_WIDTH, KEYBOARD_TOP_Y - FIELD_Y_START,
-                 COLOR_BG_DARK);
-    _draw_fields();
     return true;
   }
 
@@ -364,10 +454,17 @@ static bool _check_keyboard_press(int16_t tx, int16_t ty) {
 
   // SAVE
   if (ui_touch_in_rect(tx, ty, BROW_SAVE_X, brow_y, BROW_SAVE_W, KEY_HEIGHT)) {
-    ui_save_string(NVS_KEY_MANAGERS, _managers);
+    // Persist mode selection + both possible auth values + permitopen
+    char mode_str[4];
+    snprintf(mode_str, sizeof(mode_str), "%d", _rules_mode);
+    ui_save_string(NVS_KEY_RULES_MODE, mode_str);
+    ui_save_string(NVS_KEY_MANAGERS,   _managers);
+    ui_save_string(NVS_KEY_POLICY_AT,  _policy_at);
     ui_save_string(NVS_KEY_PERMITOPEN, _permitopen);
-    Serial.printf("[settings] Saved managers: %s\n", _managers);
-    Serial.printf("[settings] Saved permitopen: %s\n", _permitopen);
+    Serial.printf("[settings] Saved rules_mode: %d\n",    _rules_mode);
+    Serial.printf("[settings] Saved managers:   %s\n",    _managers);
+    Serial.printf("[settings] Saved policy_at:  %s\n",    _policy_at);
+    Serial.printf("[settings] Saved permitopen: %s\n",    _permitopen);
     if (_on_save_cb) {
       _on_save_cb();
     }
@@ -384,17 +481,25 @@ static bool _check_keyboard_press(int16_t tx, int16_t ty) {
 void ui_settings_create(void (*on_save)()) {
   _on_save_cb = on_save;
 
-  // Load current values from NVS
-  String mgr = ui_load_string(NVS_KEY_MANAGERS);
-  String po  = ui_load_string(NVS_KEY_PERMITOPEN);
+  // Load mode (0=managers, 1=policy)
+  String mode_str = ui_load_string(NVS_KEY_RULES_MODE);
+  _rules_mode = (mode_str == "1") ? 1 : 0;
 
-  // If managers is empty, fall back to the single manager key (migration)
+  // Load managers (with legacy fallback)
+  String mgr = ui_load_string(NVS_KEY_MANAGERS);
   if (mgr.length() == 0) {
     mgr = ui_load_string(NVS_KEY_MANAGER);
   }
-
   strncpy(_managers, mgr.c_str(), sizeof(_managers) - 1);
   _managers[sizeof(_managers) - 1] = '\0';
+
+  // Load policy atSign
+  String pol = ui_load_string(NVS_KEY_POLICY_AT);
+  strncpy(_policy_at, pol.c_str(), sizeof(_policy_at) - 1);
+  _policy_at[sizeof(_policy_at) - 1] = '\0';
+
+  // Load permitopen (default *:*)
+  String po = ui_load_string(NVS_KEY_PERMITOPEN);
   if (po.length() == 0) po = "*:*";
   strncpy(_permitopen, po.c_str(), sizeof(_permitopen) - 1);
   _permitopen[sizeof(_permitopen) - 1] = '\0';
@@ -409,6 +514,9 @@ void ui_settings_update() {
 }
 
 bool ui_settings_handle_touch(int16_t tx, int16_t ty) {
+  // Mode toggle (Managers / Policy buttons)
+  if (_check_mode_toggle_tap(tx, ty)) return true;
+
   // Check field taps
   if (_check_field_tap(tx, ty)) return true;
 
