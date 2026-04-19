@@ -9,7 +9,7 @@ This allows an ESP32 to register on the atProtocol network and accept
 inbound ports, without a public IP address, and without traditional VPN
 infrastructure.
 
-**Depends on:** [at_client](../at_client/) (atSDK for ESP32)
+**Depends on:** [at_client_arduino](https://github.com/atsign-foundation/at_client_arduino) (atSDK for ESP32)
 
 ---
 
@@ -47,10 +47,11 @@ infrastructure.
 
 ### Arduino IDE
 
-Copy both library folders into your Arduino libraries directory:
+1. Install `at_client` — download from [at_client_arduino releases](https://github.com/atsign-foundation/at_client_arduino/releases)
+   or search for **at_client** in the Arduino Library Manager.
+2. Copy this library into your Arduino libraries directory:
 
 ```bash
-cp -r lib/at_client ~/Documents/Arduino/libraries/
 cp -r lib/NoPorts   ~/Documents/Arduino/libraries/
 ```
 
@@ -68,7 +69,9 @@ board_build.filesystem = littlefs
 monitor_speed = 115200
 build_flags = -DARDUINO_LOOP_STACK_SIZE=32768
 lib_extra_dirs = ../../lib
-lib_deps = NoPorts
+lib_deps =
+  atsign-foundation/at_client
+  NoPorts
 ```
 
 ---
@@ -84,7 +87,7 @@ lib_deps = NoPorts
 
 ### Method 2: Onboard directly on ESP32
 
-Use the `at_authenticate` example from the at_client library to activate a
+Use the `at_authenticate` example from the [at_client_arduino](https://github.com/atsign-foundation/at_client_arduino) library to activate a
 brand-new atSign directly on the ESP32.
 
 ### Method 3: Hardcode keys

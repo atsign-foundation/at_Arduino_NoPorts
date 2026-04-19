@@ -1,4 +1,4 @@
-# atArduino
+# at_Arduino_NoPorts
 
 **An experimental monorepo bringing the [atProtocol](https://atsign.com) and [NoPorts](https://noports.com) to ESP32 microcontrollers.**
 
@@ -10,7 +10,7 @@
 
 ## What Is This?
 
-atArduino is a collection of Arduino/PlatformIO libraries and ready-to-flash
+at_Arduino_NoPorts is a collection of Arduino/PlatformIO libraries and ready-to-flash
 packages that let ESP32 devices participate in the atProtocol network. The
 headline application is **NoPorts on ESP32** — an encrypted TCP relay daemon
 (`sshnpd`) that lets you SSH into machines on your local network *through* an
@@ -24,9 +24,8 @@ All tunnel traffic is **end-to-end encrypted** (AES-256-CTR) and
 ## Repository Structure
 
 ```
-atArduino/
+at_Arduino_NoPorts/
 ├── lib/                        # Reusable Arduino libraries
-│   ├── at_client/              # atSDK for ESP32 — auth, keys, monitor, notify, crypto
 │   └── NoPorts/                # NoPorts daemon library (sshnpd for ESP32)
 │
 ├── packages/                   # Ready-to-build PlatformIO projects
@@ -36,12 +35,15 @@ atArduino/
 └── images/                     # Screenshots and reference images
 ```
 
+> **Note:** The `at_client` Arduino library (atSDK for ESP32) now lives in its own repository:
+> [github.com/atsign-foundation/at_client_arduino](https://github.com/atsign-foundation/at_client_arduino)
+
 ### Libraries (`lib/`)
 
 | Library | Description |
 |---|---|
-| **[at_client](lib/at_client/)** | Full ESP32 port of the [at_c SDK](https://github.com/atsign-foundation/at_c) — PKAM/CRAM auth, put/get/delete keys, monitor notifications, AES-256, RSA-2048, base64, and more. |
 | **[NoPorts](lib/NoPorts/)** | NoPorts daemon (`sshnpd`) library — registers on the atProtocol network, accepts encrypted tunnel requests, and relays TCP traffic to local network services. |
+| **[at_client](https://github.com/atsign-foundation/at_client_arduino)** *(external)* | Full ESP32 port of the [at_c SDK](https://github.com/atsign-foundation/at_c) — PKAM/CRAM auth, put/get/delete keys, monitor notifications, AES-256, RSA-2048, base64, and more. Required dependency of NoPorts, now in its own repo. |
 
 ### Packages (`packages/`)
 
@@ -78,8 +80,8 @@ to let us know how it went!
 
 1. Clone the repo:
    ```bash
-   git clone https://github.com/atsign-foundation/atArduino.git
-   cd atArduino
+   git clone https://github.com/atsign-foundation/at_Arduino_NoPorts.git
+   cd at_Arduino_NoPorts
    ```
 
 2. Pick a package:

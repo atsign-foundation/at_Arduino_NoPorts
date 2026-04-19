@@ -157,13 +157,15 @@ monitor_speed = 115200
 build_flags =
   -DARDUINO_LOOP_STACK_SIZE=32768      # Larger loop stack for crypto ops
 lib_extra_dirs =
-  ../../lib                            # Shared at_client + NoPorts libraries
+  ../../lib                            # Local NoPorts library
 lib_deps =
-  NoPorts                              # Pulls in NoPorts → at_client
+  atsign-foundation/at_client          # atSDK for ESP32 (external repo)
+  NoPorts                              # Pulls in NoPorts daemon
 ```
 
-The `lib_extra_dirs` path points to the shared libraries at the repo root.
-`NoPorts` depends on `at_client`, so both are built automatically.
+The `lib_extra_dirs` path points to the local NoPorts library.
+`at_client` is fetched from the [at_client_arduino](https://github.com/atsign-foundation/at_client_arduino)
+repository via the PlatformIO registry.
 
 ---
 
@@ -296,7 +298,7 @@ npt client ──TLS──→ atProtocol ──notify──→ ESP32 daemon   �
 ## Related
 
 - [NoPorts library reference](../../lib/NoPorts/README.md) — API docs, architecture, examples
-- [at_client library reference](../../lib/at_client/README.md) — atSDK API, additional examples
+- [at_client_arduino](https://github.com/atsign-foundation/at_client_arduino) — atSDK for ESP32 (external repo)
 - [Top-level README](../../README.md) — Repository overview
 - [NoPorts project](https://github.com/atsign-foundation/noports) — Upstream project
 - [atSign](https://atsign.com) — Get free atSigns
