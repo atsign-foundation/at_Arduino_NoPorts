@@ -10,3 +10,9 @@
 # Without this change, browsers that open 6 parallel connections per origin
 # saturate the 5-sub limit and stall additional requests.
 CONFIG_LWIP_MAX_ACTIVE_TCP=24
+# lwIP TCP buffer sizing (same rationale as sdkconfig.defaults for ESP32)
+CONFIG_LWIP_TCP_WND_DEFAULT=1460
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=1460
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=12
+# TIME_WAIT duration: cut from 60 s to 5 s for fast PCB slot recycling.
+CONFIG_LWIP_TCP_MSL=5000

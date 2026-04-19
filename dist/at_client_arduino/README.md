@@ -38,20 +38,26 @@ complete sketches.
 
 ### Arduino IDE
 
-```bash
-cp -r lib/at_client ~/Documents/Arduino/libraries/
-```
+1. Download the latest release `.zip` from the [Releases](https://github.com/atsign-foundation/at_client_arduino/releases) page.
+2. In Arduino IDE: **Sketch → Include Library → Add .ZIP Library…** and select the downloaded file.
+
+Alternatively, search for **at_client** in the **Library Manager** (**Tools → Manage Libraries…**).
 
 ### PlatformIO
 
 Add to your `platformio.ini`:
 
 ```ini
-lib_extra_dirs = ../../lib
-lib_deps = at_client
+lib_deps =
+  atsign-foundation/at_client
 ```
 
-Or if using NoPorts, it pulls in at_client automatically.
+Or clone this repo locally and reference it directly:
+
+```ini
+lib_extra_dirs = /path/to/at_client_arduino
+lib_deps = at_client
+```
 
 ## Quick Start — Authenticate & Put/Get
 

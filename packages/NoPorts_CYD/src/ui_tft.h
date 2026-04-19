@@ -29,7 +29,9 @@
 #define CYD_APP_VERSION "1.0.0"
 
 // XPT2046 Touch pins (standard CYD configuration)
+#ifndef TOUCH_CS
 #define TOUCH_CS   33
+#endif
 #define TOUCH_IRQ  36
 
 // RGB LED pins (active low) — standard CYD (ESP32) only
