@@ -1,6 +1,6 @@
 # docker compose up --build
 #
-# The build context is set to the monorepo root (atArduino/) so that the
+# The build context is set to the repo root (at_Arduino_NoPorts/) so that the
 # Dockerfile can access both lib/ and packages/NoPorts_CYD/.
 #
 # WebSerial (used for in-browser flashing) requires a secure context.

@@ -1,6 +1,6 @@
 # at_Arduino_NoPorts
 
-**An experimental monorepo bringing the [atProtocol](https://atsign.com) and [NoPorts](https://noports.com) to ESP32 microcontrollers.**
+**An experimental repository bringing the [atProtocol](https://atsign.com) and [NoPorts](https://noports.com) to ESP32 microcontrollers.**
 
 > **Status: Experimental** — This project is under active development and
 > should be considered experimental. It *is* working on real hardware, but

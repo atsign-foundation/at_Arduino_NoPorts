@@ -1,7 +1,7 @@
 # =============================================================================
 # NoPorts CYD – Firmware builder + web flasher
 #
-# Build context must be the monorepo root (atArduino/) so both lib/ and
+# Build context must be the repo root (at_Arduino_NoPorts/) so both lib/ and
 # packages/NoPorts_CYD/ are accessible:
 #
 #   docker build -f packages/NoPorts_CYD/Dockerfile -t noports-cyd-flasher .
