@@ -1,0 +1,20 @@
+.pio/build/esp32p4/FrameworkArduino/MD5Builder.cpp.o: \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32/cores/esp32/MD5Builder.cpp \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32/cores/esp32/HEXBuilder.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32/cores/esp32/WString.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32/cores/esp32/pgmspace.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/newlib/platform_include/ctype.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32/cores/esp32/Stream.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32/cores/esp32/Print.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/newlib/platform_include/stdio.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32/cores/esp32/WString.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32/cores/esp32/Printable.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32/cores/esp32/MD5Builder.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/esp_system/include/esp_system.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/esp_common/include/esp_err.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/esp_common/include/esp_compiler.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/esp_common/include/esp_attr.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/esp_common/include/esp_bit_defs.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/esp_common/include/esp_idf_version.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/esp_rom/include/esp_rom_md5.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32/cores/esp32/HashBuilder.h

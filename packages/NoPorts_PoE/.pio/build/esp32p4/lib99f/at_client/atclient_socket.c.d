@@ -1,0 +1,26 @@
+.pio/build/esp32p4/lib99f/at_client/atclient_socket.c.o: \
+ .pio/libdeps/esp32p4/at_client/src/atclient_socket.c \
+ .pio/libdeps/esp32p4/at_client/src/atchops/platform.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/mbedtls/mbedtls/include/mbedtls/version.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/mbedtls/mbedtls/include/mbedtls/build_info.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/mbedtls/port/include/mbedtls/esp_config.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/qio_qspi/include/sdkconfig.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/mbedtls/mbedtls/include/mbedtls/mbedtls_config.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/soc/esp32p4/include/soc/soc_caps.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/mbedtls/port/include/esp_mem.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/mbedtls/mbedtls/include/mbedtls/config_psa.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/mbedtls/mbedtls/include/psa/crypto_legacy.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/mbedtls/mbedtls/include/psa/crypto_adjust_config_synonyms.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/mbedtls/mbedtls/include/psa/crypto_adjust_config_dependencies.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/mbedtls/mbedtls/include/mbedtls/config_adjust_psa_superset_legacy.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/mbedtls/mbedtls/include/mbedtls/config_adjust_psa_from_legacy.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/mbedtls/mbedtls/include/psa/crypto_adjust_config_key_pair_types.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/mbedtls/mbedtls/include/psa/crypto_adjust_auto_enabled.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/mbedtls/mbedtls/include/mbedtls/config_adjust_legacy_crypto.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/mbedtls/mbedtls/include/mbedtls/config_adjust_x509.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/mbedtls/mbedtls/include/mbedtls/config_adjust_ssl.h \
+ /Users/cconstab/.platformio/packages/framework-arduinoespressif32-libs/esp32p4_es/include/mbedtls/mbedtls/include/mbedtls/check_config.h \
+ .pio/libdeps/esp32p4/at_client/src/atclient/socket.h \
+ .pio/libdeps/esp32p4/at_client/src/atclient/../atchops/platform.h \
+ .pio/libdeps/esp32p4/at_client/src/atclient/socket_shared.h \
+ .pio/libdeps/esp32p4/at_client/src/atclient/../atsdk_socket.h
