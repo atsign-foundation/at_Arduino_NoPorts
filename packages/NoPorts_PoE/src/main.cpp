@@ -76,12 +76,12 @@ static uint32_t g_last_eth_check = 0;
 static void on_tunnel_open(const char *host, uint16_t port, const char *) {
   g_stats.total_tunnels++;
   led_on_tunnel_event();
-  Serial.printf("[np] Tunnel %s:%u\n", host, port);
+  Serial.printf("[np] Tunnel open %s:%u  free=%u\n", host, port, ESP.getFreeHeap());
 }
 
 static void on_tunnel_close(const char *) {
   led_on_tunnel_event();
-  Serial.println("[np] Tunnel closed");
+  Serial.printf("[np] Tunnel closed  free=%u\n", ESP.getFreeHeap());
 }
 
 static void on_ping(const char *from) {
@@ -367,6 +367,16 @@ void loop() {
       g_stats.pcb_count     = npDaemon.getRelayPcbCount();
       g_stats.pcb_max       = npDaemon.getRelayPcbMax();
       npDaemon.getThroughput(g_stats.bytes_in, g_stats.bytes_out);
+    }
+  }
+
+  // Heap monitor — logs every 10 s so we can see pressure during heavy relay traffic
+  {
+    static uint32_t _last_heap_ms = 0;
+    if (millis() - _last_heap_ms > 10000) {
+      _last_heap_ms = millis();
+      Serial.printf("[mem] free=%u min=%u largest=%u\n",
+                    ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
     }
   }
 
