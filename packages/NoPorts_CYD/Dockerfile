@@ -13,7 +13,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1: build firmware
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS builder
+FROM --platform=linux/amd64 python:3.11-slim AS builder
 
 # System dependencies needed by PlatformIO / esptool
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -21,7 +21,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install PlatformIO and esptool into the system Python
 RUN pip install --no-cache-dir platformio esptool
 
 WORKDIR /build
@@ -101,7 +100,7 @@ RUN cp .pio/build/cyd2usb/firmware.bin      firmware-cyd2usb.bin       && \
 # ---------------------------------------------------------------------------
 # Stage 2: minimal nginx web server
 # ---------------------------------------------------------------------------
-FROM nginx:alpine
+FROM nginx:1.28-alpine
 
 # Remove default nginx config; replace with our own
 RUN rm /etc/nginx/conf.d/default.conf

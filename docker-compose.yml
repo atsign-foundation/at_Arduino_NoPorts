@@ -1,0 +1,39 @@
+# NoPorts firmware flasher — all variants
+#
+#   docker compose up --build
+#
+# Then browse to http://localhost:8080
+#
+# The router nginx serves a landing page and proxies:
+#   /cyd/  →  NoPorts CYD (ESP32 / ESP32-S3 display variants)
+#   /poe/  →  NoPorts PoE (ESP32-P4 headless Ethernet variant)
+
+services:
+
+  cyd-flasher:
+    build:
+      context: .
+      dockerfile: packages/NoPorts_CYD/Dockerfile
+    expose:
+      - "80"
+    restart: unless-stopped
+
+  poe-flasher:
+    build:
+      context: .
+      dockerfile: packages/NoPorts_PoE/Dockerfile
+    expose:
+      - "80"
+    restart: unless-stopped
+
+  router:
+    image: nginx:1.28-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./web/nginx-router.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./web/index.html:/usr/share/nginx/html/index.html:ro
+    depends_on:
+      - cyd-flasher
+      - poe-flasher
+    restart: unless-stopped

@@ -1,0 +1,17 @@
+# docker compose -f packages/NoPorts_PoE/docker-compose.yml up --build
+#
+# Build context is the repo root so the Dockerfile can access lib/ and
+# packages/NoPorts_PoE/.
+#
+# WebSerial requires a secure context.  On the same machine http://localhost:8080
+# works fine.  Over a local network use HTTPS or set the browser flag
+# chrome://flags/#unsafely-treat-insecure-origin-as-secure for quick testing.
+
+services:
+  flasher:
+    build:
+      context: ../..
+      dockerfile: packages/NoPorts_PoE/Dockerfile
+    ports:
+      - "8080:80"
+    restart: unless-stopped
