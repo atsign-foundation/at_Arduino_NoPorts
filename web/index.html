@@ -55,10 +55,9 @@
       border-color: var(--accent);
       background: rgba(33,150,243,0.07);
     }
-    a.card img {
+    a.card svg {
       width: 140px;
       height: 105px;
-      object-fit: contain;
     }
     a.card .name { font-size: 1rem; font-weight: 700; text-align: center; }
     a.card .chip { font-size: 0.78rem; color: var(--muted); text-align: center; }
@@ -82,19 +81,142 @@
 </header>
 
 <div class="grid">
+
+  <!-- CYD (ESP32-2432S028R) -->
   <a class="card" href="/cyd/">
-    <img src="/cyd/board-cyd.svg" alt="NoPorts CYD board">
+    <!-- CYD board: red PCB, 2.8" ILI9341 TFT, micro-USB + USB-C -->
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 140 105" role="img" aria-label="NoPorts CYD board">
+      <!-- PCB body — red soldermask -->
+      <rect x="2" y="2" width="136" height="101" rx="4" fill="#8b1a1a" stroke="#5a0a0a" stroke-width="1.5"/>
+      <!-- PCB edge highlights -->
+      <rect x="2" y="2" width="136" height="101" rx="4" fill="none" stroke="#c04040" stroke-width="0.5" opacity="0.4"/>
+
+      <!-- TFT display area (2.8" ILI9341, portrait) -->
+      <rect x="22" y="10" width="96" height="72" rx="2" fill="#111" stroke="#333" stroke-width="1"/>
+      <!-- Display bezel -->
+      <rect x="24" y="12" width="92" height="68" rx="1" fill="#0a0a1a"/>
+      <!-- Screen content — NoPorts UI mockup -->
+      <rect x="24" y="12" width="92" height="12" fill="#1a2a4a"/>
+      <text x="70" y="21" font-family="monospace" font-size="5.5" fill="#60a0e0" text-anchor="middle" font-weight="bold">NoPorts</text>
+      <!-- Status bars -->
+      <rect x="28" y="28" width="84" height="6" rx="2" fill="#1e3a1e"/>
+      <rect x="28" y="28" width="56" height="6" rx="2" fill="#22c55e" opacity="0.8"/>
+      <rect x="28" y="38" width="84" height="6" rx="2" fill="#1a1a3a"/>
+      <rect x="28" y="38" width="38" height="6" rx="2" fill="#2196f3" opacity="0.8"/>
+      <!-- IP / status text lines -->
+      <rect x="28" y="50" width="50" height="3" rx="1" fill="#2a3a5a" opacity="0.7"/>
+      <rect x="28" y="57" width="36" height="3" rx="1" fill="#2a3a5a" opacity="0.5"/>
+      <rect x="28" y="64" width="42" height="3" rx="1" fill="#2a3a5a" opacity="0.5"/>
+      <!-- Touch indicator dots -->
+      <circle cx="96" cy="57" r="3" fill="#2196f3" opacity="0.6"/>
+      <circle cx="106" cy="57" r="3" fill="#94a3b8" opacity="0.4"/>
+
+      <!-- Micro-USB port (bottom-left) -->
+      <rect x="8" y="94" width="18" height="8" rx="2" fill="#888" stroke="#aaa" stroke-width="0.8"/>
+      <rect x="10" y="95.5" width="14" height="5" rx="1" fill="#444"/>
+      <text x="17" y="109" font-family="sans-serif" font-size="4" fill="#94a3b8" text-anchor="middle">USB</text>
+
+      <!-- USB-C port (bottom-right) -->
+      <rect x="114" y="94" width="18" height="8" rx="2" fill="#888" stroke="#aaa" stroke-width="0.8"/>
+      <rect x="116" y="95.5" width="14" height="5" rx="1.5" fill="#444"/>
+      <text x="123" y="109" font-family="sans-serif" font-size="4" fill="#94a3b8" text-anchor="middle">USB-C</text>
+
+      <!-- Reset button -->
+      <rect x="5" y="50" width="10" height="7" rx="1" fill="#333" stroke="#555" stroke-width="0.8"/>
+      <circle cx="10" cy="53.5" r="2.5" fill="#555"/>
+
+      <!-- RGB LED -->
+      <circle cx="10" cy="34" r="3" fill="#22c55e" opacity="0.95"/>
+      <circle cx="10" cy="34" r="1.5" fill="#86efac"/>
+
+      <!-- Mounting holes -->
+      <circle cx="8"   cy="8"   r="2.5" fill="none" stroke="#5a0a0a" stroke-width="1"/>
+      <circle cx="132" cy="8"   r="2.5" fill="none" stroke="#5a0a0a" stroke-width="1"/>
+      <circle cx="8"   cy="97"  r="2.5" fill="none" stroke="#5a0a0a" stroke-width="1"/>
+      <circle cx="132" cy="97"  r="2.5" fill="none" stroke="#5a0a0a" stroke-width="1"/>
+    </svg>
     <span class="name">NoPorts CYD</span>
     <span class="chip">ESP32 / ESP32-S3</span>
     <span class="desc">Display-based device with touch UI. WiFi connectivity.</span>
   </a>
 
+  <!-- M5Stack Unit PoE-P4 -->
   <a class="card" href="/poe/">
-    <img src="/poe/board-poe.svg" alt="NoPorts PoE board">
+    <!-- M5Stack Unit PoE-P4: white/grey compact module, RJ45 + USB-C, ESP32-P4 -->
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 140 105" role="img" aria-label="NoPorts PoE board">
+      <!-- PCB body — M5Stack white/light-grey -->
+      <rect x="15" y="8" width="110" height="82" rx="5" fill="#d8dde6" stroke="#aab0bc" stroke-width="1.5"/>
+      <!-- PCB inner area (slightly darker) -->
+      <rect x="18" y="11" width="104" height="76" rx="3" fill="#c8cdd8" opacity="0.5"/>
+
+      <!-- M5Stack logo band (top) -->
+      <rect x="15" y="8" width="110" height="14" rx="5" fill="#e8ecf2"/>
+      <rect x="15" y="16" width="110" height="6" fill="#e8ecf2"/>
+      <text x="70" y="19" font-family="sans-serif" font-size="6" fill="#444" text-anchor="middle" font-weight="bold">M5Stack  Unit PoE-P4</text>
+
+      <!-- ESP32-P4 SoC (large central chip) -->
+      <rect x="42" y="28" width="56" height="44" rx="2" fill="#1a1a2e" stroke="#334" stroke-width="1"/>
+      <rect x="44" y="30" width="52" height="40" rx="1" fill="#0f0f20"/>
+      <!-- Chip markings -->
+      <text x="70" y="47" font-family="monospace" font-size="6.5" fill="#5080c0" text-anchor="middle">ESP32</text>
+      <text x="70" y="56" font-family="monospace" font-size="6.5" fill="#5080c0" text-anchor="middle">-P4</text>
+      <!-- Pin dots around chip -->
+      <line x1="42" y1="33" x2="38" y2="33" stroke="#888" stroke-width="1.2"/>
+      <line x1="42" y1="38" x2="38" y2="38" stroke="#888" stroke-width="1.2"/>
+      <line x1="42" y1="43" x2="38" y2="43" stroke="#888" stroke-width="1.2"/>
+      <line x1="42" y1="48" x2="38" y2="48" stroke="#888" stroke-width="1.2"/>
+      <line x1="42" y1="53" x2="38" y2="53" stroke="#888" stroke-width="1.2"/>
+      <line x1="42" y1="58" x2="38" y2="58" stroke="#888" stroke-width="1.2"/>
+      <line x1="42" y1="63" x2="38" y2="63" stroke="#888" stroke-width="1.2"/>
+      <line x1="98" y1="33" x2="102" y2="33" stroke="#888" stroke-width="1.2"/>
+      <line x1="98" y1="38" x2="102" y2="38" stroke="#888" stroke-width="1.2"/>
+      <line x1="98" y1="43" x2="102" y2="43" stroke="#888" stroke-width="1.2"/>
+      <line x1="98" y1="48" x2="102" y2="48" stroke="#888" stroke-width="1.2"/>
+      <line x1="98" y1="53" x2="102" y2="53" stroke="#888" stroke-width="1.2"/>
+      <line x1="98" y1="58" x2="102" y2="58" stroke="#888" stroke-width="1.2"/>
+      <line x1="98" y1="63" x2="102" y2="63" stroke="#888" stroke-width="1.2"/>
+
+      <!-- RJ45 Ethernet port (right side, tall) -->
+      <rect x="107" y="26" width="18" height="34" rx="2" fill="#3a3a3a" stroke="#555" stroke-width="1"/>
+      <rect x="109" y="28" width="14" height="28" rx="1" fill="#1a1a1a"/>
+      <!-- RJ45 contact pins (8 pins) -->
+      <line x1="110.5" y1="30" x2="110.5" y2="54" stroke="#c0a020" stroke-width="1"/>
+      <line x1="112"   y1="30" x2="112"   y2="54" stroke="#c0a020" stroke-width="1"/>
+      <line x1="113.5" y1="30" x2="113.5" y2="54" stroke="#c0a020" stroke-width="1"/>
+      <line x1="115"   y1="30" x2="115"   y2="54" stroke="#c0a020" stroke-width="1"/>
+      <line x1="116.5" y1="30" x2="116.5" y2="54" stroke="#c0a020" stroke-width="1"/>
+      <line x1="118"   y1="30" x2="118"   y2="54" stroke="#c0a020" stroke-width="1"/>
+      <line x1="119.5" y1="30" x2="119.5" y2="54" stroke="#c0a020" stroke-width="1"/>
+      <line x1="121"   y1="30" x2="121"   y2="54" stroke="#c0a020" stroke-width="1"/>
+      <!-- RJ45 LEDs -->
+      <circle cx="110" cy="62" r="2" fill="#22c55e" opacity="0.9"/>
+      <circle cx="116" cy="62" r="2" fill="#f59e0b" opacity="0.8"/>
+      <text x="116" y="72" font-family="monospace" font-size="4.5" fill="#555" text-anchor="middle">RJ45</text>
+
+      <!-- USB-C port (bottom centre) -->
+      <rect x="57" y="84" width="26" height="8" rx="3" fill="#555" stroke="#777" stroke-width="0.8"/>
+      <rect x="60" y="85.5" width="20" height="5" rx="2" fill="#333"/>
+      <text x="70" y="98" font-family="sans-serif" font-size="4.5" fill="#666" text-anchor="middle">USB-C</text>
+
+      <!-- PoE badge -->
+      <rect x="20" y="64" width="18" height="9" rx="2" fill="#1e4a2b"/>
+      <text x="29" y="71" font-family="monospace" font-size="5.5" fill="#4ade80" text-anchor="middle" font-weight="bold">PoE</text>
+
+      <!-- RGB LED (status) -->
+      <circle cx="25" cy="50" r="3.5" fill="#22c55e" opacity="0.95"/>
+      <circle cx="25" cy="50" r="1.8" fill="#86efac"/>
+
+      <!-- Mounting holes -->
+      <circle cx="21"  cy="14" r="2.5" fill="none" stroke="#aab0bc" stroke-width="1"/>
+      <circle cx="119" cy="14" r="2.5" fill="none" stroke="#aab0bc" stroke-width="1"/>
+      <circle cx="21"  cy="84" r="2.5" fill="none" stroke="#aab0bc" stroke-width="1"/>
+      <circle cx="119" cy="84" r="2.5" fill="none" stroke="#aab0bc" stroke-width="1"/>
+    </svg>
     <span class="name">NoPorts PoE</span>
     <span class="chip">ESP32-P4</span>
     <span class="desc">Headless device with web UI. Gigabit Ethernet &amp; PoE.</span>
   </a>
+
 </div>
 
 <footer>
