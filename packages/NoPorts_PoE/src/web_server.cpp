@@ -421,7 +421,7 @@ static void _handle_enroll_post() {
 
   String otp = extract("otp");
   if (otp.isEmpty()) return _send_json(400, "{\"ok\":false,\"error\":\"No OTP\"}");
-  if (_enroll->phase == ENROLL_RUNNING) return _send_json(409, "{\"ok\":false,\"error\":\"Already running\"}");
+  if (_enroll->phase != ENROLL_IDLE) return _send_json(409, "{\"ok\":false,\"error\":\"Already enrolled or running\"}");
 
   _enroll->phase = ENROLL_RUNNING;
   _enroll->started_ms = millis();

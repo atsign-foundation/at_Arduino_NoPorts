@@ -7,6 +7,7 @@
 #include "ui_tft.h"
 #include <WiFi.h>
 #include <Arduino.h>
+#include <esp_task_wdt.h>
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -532,6 +533,7 @@ bool ui_wifi_auto_connect(int timeout_ms) {
       WiFi.disconnect();
       return false;
     }
+    esp_task_wdt_reset();
     delay(100);
   }
   

@@ -29,6 +29,7 @@ extern "C" {
 #include "nvsconfig.h"
 #include "web_server.h"
 #include "led.h"
+#include <esp_task_wdt.h>
 
 // ─── Network includes — ETH for P4, WiFi for test build ───────────────────
 #ifdef NOPORTS_TEST_WIFI_AP
@@ -68,8 +69,17 @@ static bool g_net_up           = false;  // set true once we have an IP
 static bool g_post_net_done    = false;  // NTP + mDNS + daemon start done once
 
 static uint32_t g_last_eth_check = 0;
-#define ETH_CHECK_INTERVAL_MS 5000
-#define ETH_RECONNECT_TIMEOUT_MS 15000
+#define ETH_CHECK_INTERVAL_MS   5000
+
+// Hardware watchdog — 60 s covers any plausible TLS handshake or DHCP wait.
+// trigger_panic = true writes a stack dump to flash before resetting.
+#define WDT_TIMEOUT_MS          60000
+
+// Heap recovery thresholds.  AES DMA needs ~30 KB contiguous; below that
+// TLS starts failing.  Thresholds are conservative to catch slow leaks early.
+#define HEAP_WARN_BYTES         50000   // log warning only
+#define HEAP_RECOVER_BYTES      30000   // restart daemon to free relay buffers
+#define HEAP_REBOOT_BYTES       15000   // unrecoverable — reboot
 
 // ─── Daemon callbacks → stats struct (called from npDaemon internals) ─────
 
@@ -272,13 +282,26 @@ static void on_eth_event(arduino_event_id_t event, arduino_event_info_t) {
                     ETH.linkSpeed(),
                     ETH.fullDuplex() ? "FD" : "HD");
       break;
+    case ARDUINO_EVENT_ETH_LOST_IP:
+      // DHCP lease expired and renewal failed — IP is gone, link may still be up.
+      // Treat identically to link-down: stop daemon and re-arm post-network setup
+      // so that when GOT_IP fires again (renewed lease) the daemon restarts cleanly.
+      Serial.println("[ETH] IP lost (DHCP lease expired)");
+      g_net_up        = false;
+      g_post_net_done = false;
+      if (daemon_running) { npDaemon.stop(); daemon_running = false; }
+      break;
     case ARDUINO_EVENT_ETH_DISCONNECTED:
       Serial.println("[ETH] Link down");
-      g_net_up = false;
+      g_net_up       = false;
+      g_post_net_done = false;  // allow full re-init (mDNS, NTP, daemon) on reconnect
+      if (daemon_running) { npDaemon.stop(); daemon_running = false; }
       break;
     case ARDUINO_EVENT_ETH_STOP:
       Serial.println("[ETH] Stopped");
-      g_net_up = false;
+      g_net_up        = false;
+      g_post_net_done = false;
+      if (daemon_running) { npDaemon.stop(); daemon_running = false; }
       break;
     default: break;
   }
@@ -295,6 +318,19 @@ void setup() {
   Serial.println("=============================\n");
 
   atlogger_set_logging_level(ATLOGGER_LOGGING_LEVEL_INFO);
+
+  // Hardware task watchdog — catches infinite loops and hard hangs.
+  // The loop task feeds it via esp_task_wdt_reset() every iteration.
+  {
+    esp_task_wdt_config_t wdt_cfg = {
+      .timeout_ms     = WDT_TIMEOUT_MS,
+      .idle_core_mask = 0,
+      .trigger_panic  = true,
+    };
+    esp_task_wdt_reconfigure(&wdt_cfg);
+    esp_task_wdt_add(NULL);  // subscribe the current (loop) task
+    Serial.printf("[wdt] Hardware watchdog: %u s\n", WDT_TIMEOUT_MS / 1000);
+  }
 
   if (!LittleFS.begin(true)) {
     Serial.println("[main] LittleFS init failed — halting");
@@ -370,13 +406,50 @@ void loop() {
     }
   }
 
-  // Heap monitor — logs every 10 s so we can see pressure during heavy relay traffic
+  // Feed hardware watchdog — must happen at least once per WDT_TIMEOUT_MS
+  esp_task_wdt_reset();
+
+  // Heap monitor + recovery (every 10 s)
   {
-    static uint32_t _last_heap_ms = 0;
+    static uint32_t _last_heap_ms    = 0;
+    static uint32_t _last_recover_ms = 0;
     if (millis() - _last_heap_ms > 10000) {
       _last_heap_ms = millis();
-      Serial.printf("[mem] free=%u min=%u largest=%u\n",
-                    ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
+      uint32_t free_h = ESP.getFreeHeap();
+      uint32_t min_h  = ESP.getMinFreeHeap();
+      uint32_t large  = ESP.getMaxAllocHeap();
+      Serial.printf("[mem] free=%u min=%u largest=%u\n", free_h, min_h, large);
+
+      if (free_h < HEAP_REBOOT_BYTES) {
+        Serial.printf("[mem] CRITICAL free=%u — rebooting\n", free_h);
+        delay(200);
+        ESP.restart();
+      } else if (free_h < HEAP_RECOVER_BYTES) {
+        // Restart daemon to release relay buffers; rate-limit to once per 5 min
+        if (millis() - _last_recover_ms > 300000UL) {
+          _last_recover_ms = millis();
+          Serial.printf("[mem] LOW free=%u — restarting daemon\n", free_h);
+          restart_daemon_cb();
+        }
+      } else if (free_h < HEAP_WARN_BYTES) {
+        Serial.printf("[mem] WARN free=%u\n", free_h);
+      }
+    }
+  }
+
+  // Daemon health: if stuck in ERROR state for >5 min, restart it
+  {
+    static bool     _daemon_in_error  = false;
+    static uint32_t _daemon_err_since = 0;
+    if (daemon_running && g_stats.state == DAEMON_ERROR) {
+      if (!_daemon_in_error) { _daemon_in_error = true; _daemon_err_since = millis(); }
+      else if (millis() - _daemon_err_since > 300000UL) {
+        Serial.println("[main] Daemon stuck in ERROR — restarting");
+        _daemon_in_error = false;
+        restart_daemon_cb();
+      }
+    } else {
+      _daemon_in_error = false;
     }
   }
 
@@ -385,15 +458,11 @@ void loop() {
   if (g_net_up && millis() - g_last_eth_check > ETH_CHECK_INTERVAL_MS) {
     g_last_eth_check = millis();
     if (!ETH.linkUp()) {
-      Serial.println("[ETH] Link lost — pausing daemon");
-      g_net_up = false;
+      Serial.println("[ETH] Link lost — stopping daemon, awaiting reconnect");
+      g_net_up        = false;
+      g_post_net_done = false;  // re-arm post_network_setup for when link returns
       if (daemon_running) { npDaemon.stop(); daemon_running = false; }
     }
-  }
-
-  // Reconnect: wait for ETH_GOT_IP event to set g_net_up again and re-trigger post_network_setup
-  if (!g_net_up && !g_post_net_done) {
-    // Nothing to do — event handler sets g_net_up when link returns
   }
 #endif
 

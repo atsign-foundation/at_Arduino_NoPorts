@@ -17,6 +17,7 @@
 #include <LittleFS.h>
 #include <WiFi.h>
 #include <esp_wifi.h>   // esp_wifi_set_ps / WIFI_PS_NONE
+#include <esp_task_wdt.h>
 #include <NoPorts.h>
 #include "esp_bt.h"
 
@@ -828,6 +829,11 @@ void setup() {
   Serial.println("  Memory-Optimized Version");
   Serial.println("==============================\n");
 
+  // Hardware watchdog — IDF 4.x API (seconds, not ms struct like IDF 5.x)
+  esp_task_wdt_init(60, true);  // 60 s timeout, panic+reboot on trigger
+  esp_task_wdt_add(NULL);       // subscribe the Arduino loop task
+  Serial.println("[wdt] Hardware watchdog: 60 s");
+
   // Release Bluetooth controller memory — we never use BT (~30KB heap savings)
   esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
   Serial.printf("[main] Heap after BT release: %u bytes\n", ESP.getFreeHeap());
@@ -1036,8 +1042,10 @@ void loop() {
   // -----------------------------------------------------------------------
   if (current_screen == SCREEN_DASHBOARD && millis() - _last_wifi_check_ms > WIFI_CHECK_INTERVAL_MS) {
     _last_wifi_check_ms = millis();
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[main] WiFi disconnected — attempting reconnect...");
+    bool _no_ip = WiFi.status() == WL_CONNECTED && WiFi.localIP() == IPAddress(0, 0, 0, 0);
+    if (WiFi.status() != WL_CONNECTED || _no_ip) {
+      Serial.println(_no_ip ? "[main] DHCP lease lost (IP gone) — reconnecting..."
+                            : "[main] WiFi disconnected — attempting reconnect...");
       ui_set_led(true, false, false);  // Red = disconnected
 
       // Try quick reconnect with saved credentials
@@ -1150,5 +1158,6 @@ void loop() {
   _cpu_work_us += (micros() - _cpu_loop_start_us);
 
   ui_led_tick();  // advance breathing LED waveform every ~10ms tick
+  esp_task_wdt_reset();
   delay(10);  // yield to FreeRTOS
 }

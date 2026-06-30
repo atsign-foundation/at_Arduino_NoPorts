@@ -14,3 +14,12 @@ CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 # 8192 is still large enough for all NoPorts/SSH traffic.
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=8192
+
+# lwIP TCP buffer tuning for NoPorts relay under multiple concurrent sessions.
+# Same approach as CYD: 1xMSS per PCB keeps lwIP pbuf budget bounded even with
+# several relay sockets open simultaneously on Ethernet.
+CONFIG_LWIP_TCP_WND_DEFAULT=1460
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=1460
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=12
+# Halve TIME_WAIT to 5 s (default 60 s) so closed PCB slots recycle quickly.
+CONFIG_LWIP_TCP_MSL=5000
