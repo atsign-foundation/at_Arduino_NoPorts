@@ -31,7 +31,7 @@ services:
       context: web
       dockerfile: Dockerfile
     ports:
-      - "8080:80"
+      - "8081:80"
     depends_on:
       - cyd-flasher
       - poe-flasher
