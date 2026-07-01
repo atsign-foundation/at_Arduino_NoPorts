@@ -27,7 +27,7 @@ All tunnel traffic is **end-to-end encrypted** (AES-256-CTR) and
 |---|---|---|---|---|
 | **CYD** (ESP32-2432S028R / v2) | ESP32 | WiFi | 2.8" touchscreen | `NoPorts_CYD` |
 | **Freenove FNK0104** (CYD S3) | ESP32-S3 | WiFi | 2.8" touchscreen | `NoPorts_CYD` |
-| **M5Stack Unit PoE-P4** | ESP32-P4 | Gigabit Ethernet + PoE | Web UI | `NoPorts_PoE` |
+| **M5Stack Unit PoE-P4** | ESP32-P4 | Fast Ethernet (10/100) + PoE | Web UI | `NoPorts_PoE` |
 
 ### CYD — Cheap Yellow Display
 
@@ -40,8 +40,9 @@ and a live dashboard showing tunnel activity and system stats.
 
 The [M5Stack Unit PoE-P4](https://docs.m5stack.com/en/unit/Unit_PoE-P4) is a
 compact headless module powered by the ESP32-P4 (RISC-V, 360 MHz, 32 MB PSRAM).
-It connects via **Gigabit Ethernet** and can be powered entirely over **PoE**
-(802.3af, up to 6 W) — no WiFi, no USB power supply needed. Configuration and
+It connects via **Fast Ethernet (10/100 Mbps)** using the onboard IP101GRI PHY,
+and can be powered entirely over **PoE** (802.3af, up to 6 W) — no WiFi, no
+USB power supply needed. Configuration and
 monitoring are done through a built-in **web UI** accessible over the local
 network. Designed for always-on, unattended deployment.
 
@@ -126,7 +127,7 @@ Or use the hosted installer at [cyd.crushware.com](https://cyd.crushware.com).
 | Multi-session relay (up to 4 concurrent) | ✓ | ✓ |
 | APKAM enrollment | Touchscreen | Web UI |
 | Live dashboard | Touchscreen | Web UI |
-| Connectivity | WiFi | Gigabit Ethernet |
+| Connectivity | WiFi | Fast Ethernet (10/100) |
 | PoE power | — | ✓ |
 | Hardware watchdog + heap recovery | ✓ | ✓ |
 | Auto-recovery on network loss / DHCP expiry | ✓ | ✓ |
