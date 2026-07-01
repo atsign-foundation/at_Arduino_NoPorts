@@ -21,6 +21,32 @@ All tunnel traffic is **end-to-end encrypted** (AES-256-CTR) and
 
 ---
 
+## Supported Hardware
+
+| Device | Chip | Connectivity | UI | Package |
+|---|---|---|---|---|
+| **CYD** (ESP32-2432S028R / v2) | ESP32 | WiFi | 2.8" touchscreen | `NoPorts_CYD` |
+| **Freenove FNK0104** (CYD S3) | ESP32-S3 | WiFi | 2.8" touchscreen | `NoPorts_CYD` |
+| **M5Stack Unit PoE-P4** | ESP32-P4 | Gigabit Ethernet + PoE | Web UI | `NoPorts_PoE` |
+
+### CYD — Cheap Yellow Display
+
+The [ESP32-2432S028R](https://github.com/witnessmenow/ESP32-Cheap-Yellow-Display)
+is an inexpensive (~$15) ESP32 board with a built-in 2.8" ILI9341 TFT
+touchscreen. It provides a full onboard UI for WiFi setup, atSign enrollment,
+and a live dashboard showing tunnel activity and system stats.
+
+### M5Stack Unit PoE-P4
+
+The [M5Stack Unit PoE-P4](https://docs.m5stack.com/en/unit/Unit_PoE-P4) is a
+compact headless module powered by the ESP32-P4 (RISC-V, 360 MHz, 32 MB PSRAM).
+It connects via **Gigabit Ethernet** and can be powered entirely over **PoE**
+(802.3af, up to 6 W) — no WiFi, no USB power supply needed. Configuration and
+monitoring are done through a built-in **web UI** accessible over the local
+network. Designed for always-on, unattended deployment.
+
+---
+
 ## Repository Structure
 
 ```
@@ -29,13 +55,13 @@ at_Arduino_NoPorts/
 │   └── NoPorts/                # NoPorts daemon library (sshnpd for ESP32)
 │
 ├── packages/                   # Ready-to-build PlatformIO projects
-│   ├── NoPorts/                # Generic ESP32 NoPorts daemon
-│   └── NoPorts_CYD/           # NoPorts with touchscreen UI for the CYD board
+│   ├── NoPorts_CYD/            # NoPorts with touchscreen UI (CYD / ESP32-S3)
+│   └── NoPorts_PoE/            # NoPorts headless daemon (M5Stack Unit PoE-P4)
 │
-└── images/                     # Screenshots and reference images
+└── web/                        # Browser-based firmware installer (docker compose)
 ```
 
-> **Note:** The `at_client` Arduino library (atSDK for ESP32) now lives in its own repository:
+> **Note:** The `at_client` Arduino library (atSDK for ESP32) lives in its own repository:
 > [github.com/atsign-foundation/at_client_arduino](https://github.com/atsign-foundation/at_client_arduino)
 
 ### Libraries (`lib/`)
@@ -43,28 +69,14 @@ at_Arduino_NoPorts/
 | Library | Description |
 |---|---|
 | **[NoPorts](lib/NoPorts/)** | NoPorts daemon (`sshnpd`) library — registers on the atProtocol network, accepts encrypted tunnel requests, and relays TCP traffic to local network services. |
-| **[at_client](https://github.com/atsign-foundation/at_client_arduino)** *(external)* | Full ESP32 port of the [at_c SDK](https://github.com/atsign-foundation/at_c) — PKAM/CRAM auth, put/get/delete keys, monitor notifications, AES-256, RSA-2048, base64, and more. Required dependency of NoPorts, now in its own repo. |
+| **[at_client](https://github.com/atsign-foundation/at_client_arduino)** *(external)* | Full ESP32 port of the [at_c SDK](https://github.com/atsign-foundation/at_c) — PKAM/CRAM auth, put/get/delete keys, monitor notifications, AES-256, RSA-2048, base64, and more. |
 
 ### Packages (`packages/`)
 
-| Package | Description |
-|---|---|
-| **[NoPorts](packages/NoPorts/)** | A PlatformIO project targeting generic ESP32 boards (ESP32-WROOM-32, ESP32-S3, ESP32-C3, etc.). Configuration is done in `main.cpp`. |
-| **[NoPorts_CYD](packages/NoPorts_CYD/)** | A PlatformIO project for the **CYD (Cheap Yellow Display)** ESP32-2432S028R board. Includes a touchscreen UI for WiFi setup, device enrollment, and a live dashboard showing tunnel activity, throughput, and system stats. |
-
----
-
-## Hardware
-
-This project is actively developed and tested on:
-
-- **ESP32-2432S028R** (CYD — "Cheap Yellow Display") — standard micro-USB version
-- **ESP32-2432S028Rv2** (CYD2USB) — newer version with micro-USB + USB-C
-
-It should also work on **other ESP32 boards** (ESP32-WROOM-32, ESP32-S3,
-ESP32-C3, etc.) using the generic `packages/NoPorts` project — but your
-mileage may vary. If you try it on other hardware, please open an issue or PR
-to let us know how it went!
+| Package | Target hardware | Description |
+|---|---|---|
+| **[NoPorts_CYD](packages/NoPorts_CYD/)** | ESP32-2432S028R, ESP32-S3 CYD variants | Touchscreen UI — WiFi setup, enrollment, live dashboard. |
+| **[NoPorts_PoE](packages/NoPorts_PoE/)** | M5Stack Unit PoE-P4 (ESP32-P4) | Headless daemon with web UI. Connects over Gigabit Ethernet, powered by PoE. |
 
 ---
 
@@ -74,53 +86,57 @@ to let us know how it went!
 
 - [PlatformIO](https://docs.platformio.org/en/latest/core/installation.html) (CLI or VS Code extension)
 - Two **atSigns** — one for the ESP32 (device) and one for your laptop (manager). Get free atSigns at [atsign.com](https://atsign.com).
-- A 2.4 GHz WiFi network (ESP32 does not support 5 GHz)
 
-### Quick Start
+### CYD Quick Start
 
-1. Clone the repo:
-   ```bash
-   git clone https://github.com/atsign-foundation/at_Arduino_NoPorts.git
-   cd at_Arduino_NoPorts
-   ```
+1. Clone the repo and open `packages/NoPorts_CYD` in PlatformIO.
+2. Flash firmware — WiFi credentials and atSign enrollment are configured via the touchscreen on first boot.
+3. Requires a **2.4 GHz WiFi** network (ESP32 does not support 5 GHz).
 
-2. Pick a package:
-   - **CYD board?** → `cd packages/NoPorts_CYD` — WiFi and enrollment are configured via the touchscreen.
-   - **Generic ESP32?** → `cd packages/NoPorts` — edit `src/main.cpp` with your WiFi credentials, atSigns, and `permitopen` entries.
+### M5Stack Unit PoE-P4 Quick Start
 
-3. Place your `.atKeys` file (renamed to `atkeys.json`) in the `data/` directory.
+1. Clone the repo and open `packages/NoPorts_PoE` in PlatformIO (uses the [pioarduino](https://github.com/pioarduino/platform-espressif32) platform for ESP32-P4 support).
+2. Flash firmware via USB-C.
+3. Plug an Ethernet cable into the RJ45 port (PoE switch recommended — no USB power needed).
+4. Navigate to the device's IP address in a browser to complete configuration.
 
-4. Build and flash:
-   ```bash
-   pio run -t uploadfs   # Upload atkeys.json to the filesystem
-   pio run -t upload     # Flash the firmware
-   pio device monitor -b 115200
-   ```
+### Browser-based Firmware Installer
 
-For detailed setup instructions, see the README in each package directory.
+A Docker-based web flasher lets you flash either device directly from a browser (Chrome/Edge) over WebSerial — no local toolchain needed:
+
+```bash
+docker compose up --build
+# Then open http://localhost:8081
+```
+
+Or use the hosted installer at [cyd.crushware.com](https://cyd.crushware.com).
 
 ---
 
 ## Current Capabilities
 
-| Feature | Status |
-|---|---|
-| atProtocol authentication (PKAM) | Working |
-| Monitor for notifications | Working |
-| Ping / heartbeat responses | Working |
-| NPT (network port tunneling) | Working |
-| AES-CTR end-to-end encryption | Working |
-| RSA-2048 signing / verification | Working |
-| Multi-session relay (up to 4 concurrent) | Working |
-| APKAM enrollment (onboard & enroll) | Working |
-| Touchscreen UI (CYD) | Working |
+| Feature | CYD | PoE-P4 |
+|---|---|---|
+| atProtocol authentication (PKAM) | ✓ | ✓ |
+| Monitor for notifications | ✓ | ✓ |
+| Ping / heartbeat responses | ✓ | ✓ |
+| NPT (network port tunneling) | ✓ | ✓ |
+| AES-CTR end-to-end encryption | ✓ | ✓ |
+| RSA-2048 signing / verification | ✓ | ✓ |
+| Multi-session relay (up to 4 concurrent) | ✓ | ✓ |
+| APKAM enrollment | Touchscreen | Web UI |
+| Live dashboard | Touchscreen | Web UI |
+| Connectivity | WiFi | Gigabit Ethernet |
+| PoE power | — | ✓ |
+| Hardware watchdog + heap recovery | ✓ | ✓ |
+| Auto-recovery on network loss / DHCP expiry | ✓ | ✓ |
 
 ### Known Limitations
 
-- **ESP32 only** — ESP8266 lacks sufficient RAM and crypto support
-- **No SSH server on the ESP32** — it tunnels to TCP services on the local network
-- **RSA operations are slow** — envelope verification takes 1–2 seconds on ESP32
+- **No SSH server on-device** — tunnels to TCP services on the local network
+- **RSA operations are slow** — envelope verification takes 1–2 seconds
 - **Limited concurrent tunnels** — realistically 2–4 simultaneous connections
+- **NoPorts_PoE requires pioarduino** — the official espressif32 PlatformIO platform does not yet support ESP32-P4
 
 ---
 
