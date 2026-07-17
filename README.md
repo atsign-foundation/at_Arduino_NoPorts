@@ -77,7 +77,7 @@ at_Arduino_NoPorts/
 | Package | Target hardware | Description |
 |---|---|---|
 | **[NoPorts_CYD](packages/NoPorts_CYD/)** | ESP32-2432S028R, ESP32-S3 CYD variants | Touchscreen UI — WiFi setup, enrollment, live dashboard. |
-| **[NoPorts_PoE](packages/NoPorts_PoE/)** | M5Stack Unit PoE-P4 (ESP32-P4) | Headless daemon with web UI. Connects over Gigabit Ethernet, powered by PoE. |
+| **[NoPorts_PoE](packages/NoPorts_PoE/)** | M5Stack Unit PoE-P4 (ESP32-P4) | Headless daemon with web UI. Connects over Fast Ethernet (10/100), powered by PoE. |
 
 ---
 

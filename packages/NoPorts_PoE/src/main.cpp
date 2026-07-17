@@ -20,6 +20,7 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <ESPmDNS.h>
+#include <esp_sntp.h>
 #include <NoPorts.h>
 
 extern "C" {
@@ -208,19 +209,34 @@ static void restart_daemon_cb() {
 
 // ─── Network helpers ──────────────────────────────────────────────────────
 
+static time_t _ntp_last_good = 0;  // 0 = never synced
+
 static void sync_ntp() {
   Serial.println("[NTP] Syncing...");
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  time_t before = time(nullptr);
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
   struct tm t;
   int retries = 0;
   while (!getLocalTime(&t, 1000) && ++retries < 10)
     Serial.printf("[NTP] Waiting (%d/10)\n", retries);
   if (retries < 10) {
-    char buf[32]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M UTC", &t);
-    Serial.printf("[NTP] %s\n", buf);
+    time_t after = mktime(&t);
+    // After first good sync, reject responses that jump the clock by more than
+    // one hour — guards against spoofed NTP packets on the local network.
+    if (_ntp_last_good > 0 && labs((long)(after - before)) > 3600) {
+      Serial.printf("[NTP] WARN: suspicious jump %ld s — reverting\n",
+                    (long)(after - before));
+      timeval tv{before, 0};
+      settimeofday(&tv, nullptr);
+    } else {
+      _ntp_last_good = after;
+      char buf[32]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M UTC", &t);
+      Serial.printf("[NTP] %s\n", buf);
+    }
   } else {
     Serial.println("[NTP] WARNING: Failed");
   }
+  esp_sntp_stop();  // close UDP socket — no persistent port visible to port scanners
 }
 
 // Run once after we first get a network IP.
@@ -465,6 +481,22 @@ void loop() {
     }
   }
 #endif
+
+  // Daily NTP re-sync — randomized interval (23–25 h) to avoid predictable timing
+  if (g_net_up) {
+    static bool     _ntp_init     = false;
+    static uint32_t _ntp_last_ms  = 0;
+    static uint32_t _ntp_interval = 0;
+    if (!_ntp_init) {
+      _ntp_init     = true;
+      _ntp_last_ms  = millis();
+      _ntp_interval = 82800000UL + (esp_random() % 7200000UL);
+    } else if (millis() - _ntp_last_ms > _ntp_interval) {
+      _ntp_last_ms  = millis();
+      _ntp_interval = 82800000UL + (esp_random() % 7200000UL);
+      sync_ntp();
+    }
+  }
 
   // Update LED
   {

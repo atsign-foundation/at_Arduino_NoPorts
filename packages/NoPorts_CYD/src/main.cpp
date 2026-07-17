@@ -18,6 +18,7 @@
 #include <WiFi.h>
 #include <esp_wifi.h>   // esp_wifi_set_ps / WIFI_PS_NONE
 #include <esp_task_wdt.h>
+#include <esp_sntp.h>
 #include <NoPorts.h>
 #include "esp_bt.h"
 
@@ -357,9 +358,12 @@ static void _do_reset() {
 // Screen transitions
 // ---------------------------------------------------------------------------
 
+static time_t _ntp_last_good = 0;  // 0 = never synced
+
 static void sync_ntp_time() {
   Serial.println("[NTP] Syncing time...");
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  time_t before = time(nullptr);
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
 
   struct tm timeinfo;
   int retries = 0;
@@ -367,14 +371,26 @@ static void sync_ntp_time() {
     retries++;
     Serial.printf("[NTP] Waiting for time... (%d/10)\n", retries);
   }
-  
+
   if (retries < 10) {
-    char buf[64];
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &timeinfo);
-    Serial.printf("[NTP] Time set: %s\n", buf);
+    time_t after = mktime(&timeinfo);
+    // After first good sync, reject responses that jump the clock by more than
+    // one hour — guards against spoofed NTP packets on the local network.
+    if (_ntp_last_good > 0 && labs((long)(after - before)) > 3600) {
+      Serial.printf("[NTP] WARN: suspicious jump %ld s — reverting\n",
+                    (long)(after - before));
+      timeval tv{before, 0};
+      settimeofday(&tv, nullptr);
+    } else {
+      _ntp_last_good = after;
+      char buf[64];
+      strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &timeinfo);
+      Serial.printf("[NTP] Time set: %s\n", buf);
+    }
   } else {
     Serial.println("[NTP] WARNING: Failed to get time");
   }
+  esp_sntp_stop();  // close UDP socket — no persistent port visible to port scanners
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,6 +1172,22 @@ void loop() {
   
   // Record work time before yielding
   _cpu_work_us += (micros() - _cpu_loop_start_us);
+
+  // Daily NTP re-sync — randomized interval (23–25 h) to avoid predictable timing
+  if (current_screen == SCREEN_DASHBOARD) {
+    static bool     _ntp_init     = false;
+    static uint32_t _ntp_last_ms  = 0;
+    static uint32_t _ntp_interval = 0;
+    if (!_ntp_init) {
+      _ntp_init     = true;
+      _ntp_last_ms  = millis();
+      _ntp_interval = 82800000UL + (esp_random() % 7200000UL);
+    } else if (millis() - _ntp_last_ms > _ntp_interval) {
+      _ntp_last_ms  = millis();
+      _ntp_interval = 82800000UL + (esp_random() % 7200000UL);
+      sync_ntp_time();
+    }
+  }
 
   ui_led_tick();  // advance breathing LED waveform every ~10ms tick
   esp_task_wdt_reset();
