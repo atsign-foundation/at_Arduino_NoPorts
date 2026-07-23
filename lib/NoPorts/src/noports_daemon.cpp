@@ -987,23 +987,23 @@ void NoPortsDaemon::_handleNotification(void *msg) {
   bool is_init = atclient_atnotification_is_decrypted_value_initialized(message->notification);
   bool has_key = atclient_atnotification_is_key_initialized(message->notification);
 
-  NOPORTS_LOGI(TAG, "Notification received: key_init=%d val_init=%d id=%s",
+  NOPORTS_LOGD(TAG, "Notification received: key_init=%d val_init=%d id=%s",
                has_key, is_init,
                message->notification->id ? message->notification->id : "null");
   if (has_key) {
-    NOPORTS_LOGI(TAG, "  key=%s from=%s to=%s",
+    NOPORTS_LOGD(TAG, "  key=%s from=%s to=%s",
                  message->notification->key ? message->notification->key : "null",
                  message->notification->from ? message->notification->from : "null",
                  message->notification->to ? message->notification->to : "null");
   }
 
   if (!is_init) {
-    NOPORTS_LOGI(TAG, "Skipping notification (no decrypted value)");
+    NOPORTS_LOGD(TAG, "Skipping notification (no decrypted value)");
     return;
   }
 
   if (!has_key || strcmp(message->notification->id, "-1") == 0) {
-    NOPORTS_LOGI(TAG, "Skipping notification (no key or id=-1)");
+    NOPORTS_LOGD(TAG, "Skipping notification (no key or id=-1)");
     return;
   }
 
@@ -1020,7 +1020,7 @@ void NoPortsDaemon::_handleNotification(void *msg) {
   free(tail);
 
   if (tailstart == NULL) {
-    NOPORTS_LOGI(TAG, "Skipping: couldn't find tail in key");
+    NOPORTS_LOGD(TAG, "Skipping: couldn't find tail in key");
     return;
   }
   *tailstart = '\0'; // reterminate
@@ -1030,18 +1030,18 @@ void NoPortsDaemon::_handleNotification(void *msg) {
   size_t head_len = strlen(head);
 
   if (strlen(key) < head_len) {
-    NOPORTS_LOGI(TAG, "Skipping: key too short for head strip");
+    NOPORTS_LOGD(TAG, "Skipping: key too short for head strip");
     return;
   }
 
   if (strncmp(key, head, head_len) != 0) {
-    NOPORTS_LOGI(TAG, "Skipping: head mismatch");
+    NOPORTS_LOGD(TAG, "Skipping: head mismatch");
     return;
   }
 
   key += head_len + 1; // +1 for ":"
 
-  NOPORTS_LOGI(TAG, "Parsed notification key: '%s'", key);
+  NOPORTS_LOGD(TAG, "Parsed notification key: '%s'", key);
 
   // Identify notification type
   NoPortsNotificationKey nk = NK_NONE;
