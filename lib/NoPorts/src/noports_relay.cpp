@@ -288,7 +288,7 @@ struct RelaySub {
 //   3. Signs JSON(p) with APKAM RSA private key (SHA-256 / PKCS1v15)
 //   4. Builds envelope: {"p": p, "s": base64(sig), "ha": "sha256", "sa": "rsa2048", "sk": uri}
 //   5. Base64-encodes JSON(envelope) → envelope64
-//   6. AES-256-SIC (CTR) encrypts envelope64 with relayAuthAesKey + random IV (no padding)
+//   6. PKCS7-pads envelope64 (blockSize=16), then AES-256-CTR encrypts with relayAuthAesKey + random IV
 //   7. Builds outer: {"iv": base64(iv), "e": base64(encrypted)}
 //   8. Base64-encodes JSON(outer) → authPayload64
 //   9. Sends: "{sessionId}:{authPayload64}\n"
@@ -422,10 +422,21 @@ static bool _escr_authenticate(WiFiClient *sock, const NoPortsRelayConfig *cfg) 
       iv32[2] = esp_random(); iv32[3] = esp_random();
     }
 
-    // ---- Step 9: AES-256-SIC (CTR) encrypt env64 ----
-    // Dart at_chops uses AES(key, mode: AESMode.sic) from the encrypt package,
-    // which is CTR mode.  No padding needed — CTR is a stream cipher.
-    encrypted = (unsigned char *)malloc(env64_len);
+    // ---- Step 9: PKCS7-pad then AES-256-CTR encrypt env64 ----
+    // Dart AESEncryptionAlgo (at_chops) adds PKCS7 padding (blockSize=16) to the
+    // plaintext BEFORE CTR-encrypting, and removes it after CTR-decrypting.
+    // We must match: pad env64, then CTR-encrypt the padded bytes.
+    size_t pad_byte  = 16 - (env64_len % 16);   // always 1..16
+    size_t padded_len = env64_len + pad_byte;
+    // Reuse env64 in place: extend the allocation and append padding.
+    {
+      char *tmp = (char *)realloc(env64, padded_len);
+      if (!tmp) goto escr_cleanup;
+      env64 = tmp;
+    }
+    memset((unsigned char *)env64 + env64_len, (unsigned char)pad_byte, pad_byte);
+
+    encrypted = (unsigned char *)malloc(padded_len);
     if (!encrypted) goto escr_cleanup;
     {
       mbedtls_aes_context aes_ctx;
@@ -435,7 +446,7 @@ static bool _escr_authenticate(WiFiClient *sock, const NoPortsRelayConfig *cfg) 
       unsigned char stream_block[16] = {0};
       unsigned char nonce_counter[16];
       memcpy(nonce_counter, iv, 16);
-      mbedtls_aes_crypt_ctr(&aes_ctx, env64_len, &nc_off, nonce_counter,
+      mbedtls_aes_crypt_ctr(&aes_ctx, padded_len, &nc_off, nonce_counter,
                              stream_block, (unsigned char *)env64, encrypted);
       mbedtls_aes_free(&aes_ctx);
     }
@@ -451,13 +462,13 @@ static bool _escr_authenticate(WiFiClient *sock, const NoPortsRelayConfig *cfg) 
     }
     iv_b64[iv_b64_len] = '\0';
 
-    size_t enc_b64_max = (env64_len / 3 + 2) * 4 + 4;
+    size_t enc_b64_max = (padded_len / 3 + 2) * 4 + 4;
     enc_b64 = (char *)malloc(enc_b64_max);
     if (!enc_b64) goto escr_cleanup;
     size_t enc_b64_len = 0;
     if (mbedtls_base64_encode(
           (unsigned char *)enc_b64, enc_b64_max, &enc_b64_len,
-          encrypted, env64_len) != 0) {
+          encrypted, padded_len) != 0) {
       NOPORTS_LOGE(TAG, "ESCR: enc b64 failed");
       goto escr_cleanup;
     }
