@@ -161,6 +161,11 @@ void NoPortsDaemon::_freeResources() {
     free(_monitor_regex);
     _monitor_regex = nullptr;
   }
+  // enrollment_id is strdup'd in begin() — free our copy
+  if (_config.enrollment_id) {
+    free((void *)_config.enrollment_id);
+    _config.enrollment_id = nullptr;
+  }
 }
 
 NoPortsDaemon::~NoPortsDaemon() {
@@ -179,6 +184,11 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
 
   _state = DAEMON_INITIALIZING;
   memcpy(&_config, &config, sizeof(NoPortsConfig));
+
+  // enrollment_id is a heap string freed by noports_keys_free() after begin() returns.
+  // Deep-copy it so the daemon owns a persistent copy for the lifetime of the session.
+  if (_config.enrollment_id)
+    _config.enrollment_id = strdup(_config.enrollment_id);
 
   // ---- Validate config ----
   if (!_config.atsign || strlen(_config.atsign) == 0) {
@@ -382,6 +392,11 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
 
   // ---- Build ping response ----
   _buildPingResponse();
+
+  // ---- Publish ESCR public signing key ----
+  // The Dart sshnpd calls ApkamSigning.publishPublicSigningKey() at startup.
+  // Without this, the SRVD cannot look up our public key to verify ESCR signatures.
+  _publishPublicSigningKey();
 
   // ---- Publish device info ----
   if (!_config.hide) {
@@ -835,6 +850,7 @@ void NoPortsDaemon::_buildPingResponse() {
   cJSON_AddBoolToObject(features, "supportsPortChoice", true);
   cJSON_AddBoolToObject(features, "adjustableTimeout", true);
   cJSON_AddBoolToObject(features, "controlChannelHeartbeats", true);
+  cJSON_AddBoolToObject(features, "supportsRamEscr", _pkam_signing_key != nullptr && _config.enrollment_id != nullptr);
   cJSON_AddBoolToObject(features, "twinKeys", true);
   cJSON_AddItemToObject(ping_json, "supportedFeatures", features);
 
@@ -849,10 +865,53 @@ void NoPortsDaemon::_buildPingResponse() {
   }
   cJSON_AddItemToObject(ping_json, "allowedServices", allowed);
 
+  // ESCR: publish signing key URI so npt client can pre-fetch the public key.
+  // Without this, the SRVD cannot look up our public key to verify the signature.
+  if (_config.enrollment_id && _pkam_signing_key) {
+    char pk_uri[320];
+    snprintf(pk_uri, sizeof(pk_uri), "public:_apsk.%s.a.__e%s",
+             _config.enrollment_id, _config.atsign);
+    cJSON_AddStringToObject(ping_json, "publicSigningKeyUri", pk_uri);
+  }
+
   _ping_response = cJSON_PrintUnformatted(ping_json);
   cJSON_Delete(ping_json);
 
   NOPORTS_LOGD(TAG, "Ping response: %s", _ping_response ? _ping_response : "NULL");
+}
+
+void NoPortsDaemon::_publishPublicSigningKey() {
+  if (!_config.enrollment_id || !_config.pkam_public_key_base64) {
+    NOPORTS_LOGD(TAG, "ESCR: no enrollment_id or pkam_public_key_base64 — skipping key publish");
+    return;
+  }
+
+  // Build atkey: public:_apsk.{enrollmentId}.a.__e@{atSign}
+  // keyname = "_apsk.{enrollmentId}", namespace = "a.__e"
+  // (a.__e == EnrollmentConstants.perEnrollmentApproved in Dart at_commons)
+  char keyname[256];
+  snprintf(keyname, sizeof(keyname), "_apsk.%s", _config.enrollment_id);
+
+  atclient_atkey sk_key;
+  atclient_atkey_init(&sk_key);
+
+  int res = atclient_atkey_create_public_key(&sk_key, keyname, _config.atsign, "a.__e");
+  if (res != 0) {
+    NOPORTS_LOGW(TAG, "ESCR: failed to create signing key atkey: %d", res);
+    atclient_atkey_free(&sk_key);
+    return;
+  }
+
+  res = atclient_put_public_key((atclient *)_worker_ctx, &sk_key,
+                                _config.pkam_public_key_base64, NULL, NULL);
+  atclient_atkey_free(&sk_key);
+
+  if (res != 0) {
+    NOPORTS_LOGW(TAG, "ESCR: failed to publish public signing key: %d", res);
+  } else {
+    NOPORTS_LOGI(TAG, "ESCR: published signing key at public:_apsk.%s.a.__e%s",
+                 _config.enrollment_id, _config.atsign);
+  }
 }
 
 bool NoPortsDaemon::_publishDeviceInfo() {
@@ -1618,12 +1677,14 @@ void NoPortsDaemon::_continueNptRequest(void *env,
         relay_cfg.relay_auth_aes_key = strdup(raw_aes_key);
         relay_cfg.escr_signing_key   = _pkam_signing_key;  // daemon owns this
 
-        // Build signing key URI: _apsk.<enrollmentId>.noports.__e@<atSign>
-        // atsign already has '@' prefix (e.g. "@mydevice")
-        size_t uri_len = strlen(_config.enrollment_id) + strlen(_config.atsign) + 30;
+        // Build signing key URI: public:_apsk.<enrollmentId>.a.__e@<atSign>
+        // The "public:" prefix is required so the SRVD can look up the key.
+        // atsign already has '@' prefix (e.g. "@mydevice").
+        // "a.__e" == EnrollmentConstants.perEnrollmentApproved in Dart at_commons.
+        size_t uri_len = strlen(_config.enrollment_id) + strlen(_config.atsign) + 25;
         char *uri = (char *)malloc(uri_len);
         if (uri) {
-          snprintf(uri, uri_len, "_apsk.%s.noports.__e%s",
+          snprintf(uri, uri_len, "public:_apsk.%s.a.__e%s",
                    _config.enrollment_id, _config.atsign);
           relay_cfg.escr_signing_key_uri = uri;
         }

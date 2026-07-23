@@ -239,6 +239,7 @@ private:
   bool _startMonitor();
   bool _publishDeviceInfo();
   void _buildPingResponse();
+  void _publishPublicSigningKey();  // publish APKAM public key for ESCR auth
 
   // Notification handlers
   void _handleNotification(void *message); // atclient_monitor_message*

@@ -69,8 +69,7 @@ extern "C" {
 
 // Stack size for relay FreeRTOS task
 // With all large buffers (earlyA/B, cmsgA/B, buf, crypt_buf) on the heap,
-// actual stack usage is ~1200 bytes. 6KB provides comfortable headroom.
-// FreeRTOS stack for the relay task (words → bytes on ESP32 is ×4).
+// actual stack usage is ~1200 bytes for the normal relay path.
 // RelaySub subs[] is heap-allocated separately (calloc at runtime) so the
 // task stack only needs to hold the call chain and local scalars:
 //   WiFiClient ctrl:             ~16
@@ -79,8 +78,16 @@ extern "C" {
 //   misc locals + call chain:   ~500
 //   FreeRTOS context:           ~200
 //   ─────────────────────────────────
-//   Total peak:               ~1550  → 4096 gives ~2546 bytes headroom
-#define RELAY_TASK_STACK_SIZE 4096
+//   Normal peak:              ~1550
+//
+// ESCR auth adds mbedtls structs on atchops_rsa_sign()'s stack frame:
+//   mbedtls_rsa_context:        ~200
+//   mbedtls_entropy_context:    ~800
+//   mbedtls_ctr_drbg_context:   ~330
+//   _escr_authenticate frame:   ~300
+//   ─────────────────────────────────
+//   ESCR peak:                ~3180  → 8192 gives ~5012 bytes headroom
+#define RELAY_TASK_STACK_SIZE 8192
 
 // Maximum concurrent sub-connections per relay (multi mode).
 // Each sub uses 2 sockets (rvd + local) + optional AES state (~1KB).
@@ -281,7 +288,7 @@ struct RelaySub {
 //   3. Signs JSON(p) with APKAM RSA private key (SHA-256 / PKCS1v15)
 //   4. Builds envelope: {"p": p, "s": base64(sig), "ha": "sha256", "sa": "rsa2048", "sk": uri}
 //   5. Base64-encodes JSON(envelope) → envelope64
-//   6. AES-256-CBC encrypts envelope64 with relayAuthAesKey (PKCS7 padded) + random IV
+//   6. AES-256-SIC (CTR) encrypts envelope64 with relayAuthAesKey + random IV (no padding)
 //   7. Builds outer: {"iv": base64(iv), "e": base64(encrypted)}
 //   8. Base64-encodes JSON(outer) → authPayload64
 //   9. Sends: "{sessionId}:{authPayload64}\n"
@@ -301,7 +308,6 @@ static bool _escr_authenticate(WiFiClient *sock, const NoPortsRelayConfig *cfg) 
   char *auth_payload64 = NULL;
   unsigned char *sig  = NULL;
   char *sig_b64       = NULL;
-  unsigned char *padded    = NULL;
   unsigned char *encrypted = NULL;
   cJSON *p = NULL, *envelope = NULL, *outer = NULL;
 
@@ -416,28 +422,24 @@ static bool _escr_authenticate(WiFiClient *sock, const NoPortsRelayConfig *cfg) 
       iv32[2] = esp_random(); iv32[3] = esp_random();
     }
 
-    // ---- Step 9: PKCS7-pad env64, then AES-256-CBC encrypt ----
-    size_t pad_byte  = 16 - (env64_len % 16);
-    size_t padded_len = env64_len + pad_byte;
-    padded = (unsigned char *)malloc(padded_len);
-    if (!padded) goto escr_cleanup;
-    memcpy(padded, env64, env64_len);
-    memset(padded + env64_len, (unsigned char)pad_byte, pad_byte);
-    free(env64); env64 = NULL;
-
-    encrypted = (unsigned char *)malloc(padded_len);
+    // ---- Step 9: AES-256-SIC (CTR) encrypt env64 ----
+    // Dart at_chops uses AES(key, mode: AESMode.sic) from the encrypt package,
+    // which is CTR mode.  No padding needed — CTR is a stream cipher.
+    encrypted = (unsigned char *)malloc(env64_len);
     if (!encrypted) goto escr_cleanup;
     {
       mbedtls_aes_context aes_ctx;
       mbedtls_aes_init(&aes_ctx);
       mbedtls_aes_setkey_enc(&aes_ctx, aes_key, 256);
-      unsigned char iv_cbc[16];
-      memcpy(iv_cbc, iv, 16);
-      mbedtls_aes_crypt_cbc(&aes_ctx, MBEDTLS_AES_ENCRYPT,
-                             padded_len, iv_cbc, padded, encrypted);
+      size_t nc_off = 0;
+      unsigned char stream_block[16] = {0};
+      unsigned char nonce_counter[16];
+      memcpy(nonce_counter, iv, 16);
+      mbedtls_aes_crypt_ctr(&aes_ctx, env64_len, &nc_off, nonce_counter,
+                             stream_block, (unsigned char *)env64, encrypted);
       mbedtls_aes_free(&aes_ctx);
     }
-    free(padded); padded = NULL;
+    free(env64); env64 = NULL;
 
     // ---- Step 10: Base64-encode IV and ciphertext ----
     char iv_b64[32];
@@ -449,13 +451,13 @@ static bool _escr_authenticate(WiFiClient *sock, const NoPortsRelayConfig *cfg) 
     }
     iv_b64[iv_b64_len] = '\0';
 
-    size_t enc_b64_max = (padded_len / 3 + 2) * 4 + 4;
+    size_t enc_b64_max = (env64_len / 3 + 2) * 4 + 4;
     enc_b64 = (char *)malloc(enc_b64_max);
     if (!enc_b64) goto escr_cleanup;
     size_t enc_b64_len = 0;
     if (mbedtls_base64_encode(
           (unsigned char *)enc_b64, enc_b64_max, &enc_b64_len,
-          encrypted, padded_len) != 0) {
+          encrypted, env64_len) != 0) {
       NOPORTS_LOGE(TAG, "ESCR: enc b64 failed");
       goto escr_cleanup;
     }
@@ -533,7 +535,6 @@ escr_cleanup:
   if (sig_b64)      free(sig_b64);
   if (env64)        free(env64);
   if (enc_b64)      free(enc_b64);
-  if (padded)       free(padded);
   if (encrypted)    free(encrypted);
   if (auth_payload64) free(auth_payload64);
   return auth_ok;
