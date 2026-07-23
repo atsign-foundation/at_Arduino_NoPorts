@@ -20,7 +20,16 @@
 #include <mbedtls/base64.h>
 #include <lwip/sockets.h>   // recv, MSG_PEEK, MSG_DONTWAIT, lwip_send
 #include <esp_heap_caps.h>  // heap_caps_get_largest_free_block()
+#include <esp_system.h>     // esp_random() for ESCR IV generation
 #include <errno.h>
+
+// ESCR auth requires atchops RSA signing and cJSON
+extern "C" {
+  #include "atclient/json.h"    // cJSON
+  #include "atchops/rsa.h"      // atchops_rsa_sign, ATCHOPS_MD_SHA256
+  #include "atchops/rsa_key.h"  // atchops_rsa_key_private_key
+  #include "atchops/sha.h"      // ATCHOPS_MD_SHA256 enum value
+}
 
 #define TAG "noports_relay"
 
@@ -263,6 +272,272 @@ struct RelaySub {
   uint8_t  pending_local[RELAY_CHUNK_SIZE];
   int      pending_local_len; // valid bytes in pending_local (0 = nothing pending)
 };
+
+// Internal: ESCR (Encrypted Signed Challenge-Response) authentication with SRVD.
+//
+// Protocol (matches Dart RelayAuthenticatorESCR):
+//   1. SRVD sends a random challenge terminated by '\n'
+//   2. Daemon builds inner payload p = {"sid": sessionId, "c": challenge, "side": "b"}
+//   3. Signs JSON(p) with APKAM RSA private key (SHA-256 / PKCS1v15)
+//   4. Builds envelope: {"p": p, "s": base64(sig), "ha": "sha256", "sa": "rsa2048", "sk": uri}
+//   5. Base64-encodes JSON(envelope) → envelope64
+//   6. AES-256-CBC encrypts envelope64 with relayAuthAesKey (PKCS7 padded) + random IV
+//   7. Builds outer: {"iv": base64(iv), "e": base64(encrypted)}
+//   8. Base64-encodes JSON(outer) → authPayload64
+//   9. Sends: "{sessionId}:{authPayload64}\n"
+//  10. Waits for "ok\n"
+//
+// Returns true on success.  All intermediate buffers are heap-allocated and
+// freed before return to keep relay task stack usage under 300 bytes here.
+static bool _escr_authenticate(WiFiClient *sock, const NoPortsRelayConfig *cfg) {
+  bool auth_ok = false;
+
+  // Heap-allocated intermediate buffers (all freed in cleanup)
+  char *p_json        = NULL;
+  char *env_json      = NULL;
+  char *outer_json    = NULL;
+  char *env64         = NULL;
+  char *enc_b64       = NULL;
+  char *auth_payload64 = NULL;
+  unsigned char *sig  = NULL;
+  char *sig_b64       = NULL;
+  unsigned char *padded    = NULL;
+  unsigned char *encrypted = NULL;
+  cJSON *p = NULL, *envelope = NULL, *outer = NULL;
+
+  // ---- Step 1: Read challenge (newline-terminated, max 63 chars) ----
+  char challenge[64];
+  memset(challenge, 0, sizeof(challenge));
+  int pos = 0;
+  unsigned long t0 = millis();
+  while ((millis() - t0) < 5000UL && pos < 63) {
+    uint8_t b;
+    if (sock->read(&b, 1) == 1) {
+      if (b == '\n') break;
+      challenge[pos++] = (char)b;
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+  }
+  challenge[pos] = '\0';
+  if (pos == 0) {
+    NOPORTS_LOGE(TAG, "ESCR: no challenge from SRVD (timeout or empty)");
+    goto escr_cleanup;
+  }
+  NOPORTS_LOGD(TAG, "ESCR: challenge (%d chars) received", pos);
+
+  // ---- Step 2: Build inner payload p ----
+  p = cJSON_CreateObject();
+  if (!p) goto escr_cleanup;
+  cJSON_AddStringToObject(p, "sid",  cfg->session_id);
+  cJSON_AddStringToObject(p, "c",    challenge);
+  cJSON_AddStringToObject(p, "side", "b");  // daemon is always side 'b'
+
+  p_json = cJSON_PrintUnformatted(p);
+  cJSON_Delete(p); p = NULL;
+  if (!p_json) goto escr_cleanup;
+
+  // ---- Step 3: RSA sign p_json with APKAM private key ----
+  sig = (unsigned char *)malloc(256);
+  if (!sig) goto escr_cleanup;
+  memset(sig, 0, 256);
+  if (atchops_rsa_sign(
+        (atchops_rsa_key_private_key *)cfg->escr_signing_key,
+        ATCHOPS_MD_SHA256,
+        (unsigned char *)p_json, strlen(p_json), sig) != 0) {
+    NOPORTS_LOGE(TAG, "ESCR: RSA signing failed");
+    goto escr_cleanup;
+  }
+
+  // ---- Step 4: Base64-encode signature ----
+  sig_b64 = (char *)malloc(352);
+  if (!sig_b64) goto escr_cleanup;
+  {
+    size_t sig_b64_len = 0;
+    if (mbedtls_base64_encode((unsigned char *)sig_b64, 352, &sig_b64_len, sig, 256) != 0) {
+      NOPORTS_LOGE(TAG, "ESCR: sig b64 failed");
+      goto escr_cleanup;
+    }
+    sig_b64[sig_b64_len] = '\0';
+  }
+  free(sig); sig = NULL;
+
+  // ---- Step 5: Build envelope JSON (re-parse p from p_json) ----
+  p = cJSON_Parse(p_json);
+  cJSON_free(p_json); p_json = NULL;
+  if (!p) goto escr_cleanup;
+
+  envelope = cJSON_CreateObject();
+  if (!envelope) goto escr_cleanup;
+  cJSON_AddItemToObject(envelope, "p", p);  // envelope takes ownership
+  p = NULL;
+  cJSON_AddStringToObject(envelope, "s",  sig_b64);
+  free(sig_b64); sig_b64 = NULL;
+  cJSON_AddStringToObject(envelope, "ha", "sha256");
+  cJSON_AddStringToObject(envelope, "sa", "rsa2048");
+  cJSON_AddStringToObject(envelope, "sk", cfg->escr_signing_key_uri);
+
+  env_json = cJSON_PrintUnformatted(envelope);
+  cJSON_Delete(envelope); envelope = NULL;
+  if (!env_json) goto escr_cleanup;
+
+  // ---- Step 6: Base64-encode envelope JSON → env64 ----
+  {
+    size_t env_json_len = strlen(env_json);
+    size_t env64_max = (env_json_len / 3 + 2) * 4 + 4;
+    env64 = (char *)malloc(env64_max);
+    if (!env64) goto escr_cleanup;
+    size_t env64_len = 0;
+    if (mbedtls_base64_encode(
+          (unsigned char *)env64, env64_max, &env64_len,
+          (unsigned char *)env_json, env_json_len) != 0) {
+      NOPORTS_LOGE(TAG, "ESCR: envelope b64 failed");
+      goto escr_cleanup;
+    }
+    env64[env64_len] = '\0';
+    cJSON_free(env_json); env_json = NULL;
+
+    // ---- Step 7: Decode relayAuthAesKey (base64 → 32 raw bytes) ----
+    unsigned char aes_key[32];
+    size_t aes_key_len = 0;
+    if (mbedtls_base64_decode(
+          aes_key, sizeof(aes_key), &aes_key_len,
+          (const unsigned char *)cfg->relay_auth_aes_key,
+          strlen(cfg->relay_auth_aes_key)) != 0 || aes_key_len != 32) {
+      NOPORTS_LOGE(TAG, "ESCR: AES key decode failed");
+      goto escr_cleanup;
+    }
+
+    // ---- Step 8: Generate random 16-byte IV using hardware RNG ----
+    unsigned char iv[16];
+    {
+      uint32_t *iv32 = (uint32_t *)iv;
+      iv32[0] = esp_random(); iv32[1] = esp_random();
+      iv32[2] = esp_random(); iv32[3] = esp_random();
+    }
+
+    // ---- Step 9: PKCS7-pad env64, then AES-256-CBC encrypt ----
+    size_t pad_byte  = 16 - (env64_len % 16);
+    size_t padded_len = env64_len + pad_byte;
+    padded = (unsigned char *)malloc(padded_len);
+    if (!padded) goto escr_cleanup;
+    memcpy(padded, env64, env64_len);
+    memset(padded + env64_len, (unsigned char)pad_byte, pad_byte);
+    free(env64); env64 = NULL;
+
+    encrypted = (unsigned char *)malloc(padded_len);
+    if (!encrypted) goto escr_cleanup;
+    {
+      mbedtls_aes_context aes_ctx;
+      mbedtls_aes_init(&aes_ctx);
+      mbedtls_aes_setkey_enc(&aes_ctx, aes_key, 256);
+      unsigned char iv_cbc[16];
+      memcpy(iv_cbc, iv, 16);
+      mbedtls_aes_crypt_cbc(&aes_ctx, MBEDTLS_AES_ENCRYPT,
+                             padded_len, iv_cbc, padded, encrypted);
+      mbedtls_aes_free(&aes_ctx);
+    }
+    free(padded); padded = NULL;
+
+    // ---- Step 10: Base64-encode IV and ciphertext ----
+    char iv_b64[32];
+    size_t iv_b64_len = 0;
+    if (mbedtls_base64_encode(
+          (unsigned char *)iv_b64, sizeof(iv_b64), &iv_b64_len, iv, 16) != 0) {
+      NOPORTS_LOGE(TAG, "ESCR: IV b64 failed");
+      goto escr_cleanup;
+    }
+    iv_b64[iv_b64_len] = '\0';
+
+    size_t enc_b64_max = (padded_len / 3 + 2) * 4 + 4;
+    enc_b64 = (char *)malloc(enc_b64_max);
+    if (!enc_b64) goto escr_cleanup;
+    size_t enc_b64_len = 0;
+    if (mbedtls_base64_encode(
+          (unsigned char *)enc_b64, enc_b64_max, &enc_b64_len,
+          encrypted, padded_len) != 0) {
+      NOPORTS_LOGE(TAG, "ESCR: enc b64 failed");
+      goto escr_cleanup;
+    }
+    enc_b64[enc_b64_len] = '\0';
+    free(encrypted); encrypted = NULL;
+
+    // ---- Step 11: Build outer JSON {"iv": ..., "e": ...} ----
+    outer = cJSON_CreateObject();
+    if (!outer) goto escr_cleanup;
+    cJSON_AddStringToObject(outer, "iv", iv_b64);
+    cJSON_AddStringToObject(outer, "e",  enc_b64);
+    free(enc_b64); enc_b64 = NULL;
+
+    outer_json = cJSON_PrintUnformatted(outer);
+    cJSON_Delete(outer); outer = NULL;
+    if (!outer_json) goto escr_cleanup;
+
+    // ---- Step 12: Base64-encode outer JSON → authPayload64 ----
+    size_t outer_json_len = strlen(outer_json);
+    size_t auth_payload64_max = (outer_json_len / 3 + 2) * 4 + 4;
+    auth_payload64 = (char *)malloc(auth_payload64_max);
+    if (!auth_payload64) goto escr_cleanup;
+    size_t auth_payload64_len = 0;
+    if (mbedtls_base64_encode(
+          (unsigned char *)auth_payload64, auth_payload64_max, &auth_payload64_len,
+          (const unsigned char *)outer_json, outer_json_len) != 0) {
+      NOPORTS_LOGE(TAG, "ESCR: authPayload b64 failed");
+      goto escr_cleanup;
+    }
+    auth_payload64[auth_payload64_len] = '\0';
+    cJSON_free(outer_json); outer_json = NULL;
+  }  // end local-scope block for env_json_len, aes_key, iv, iv_b64, etc.
+
+  // ---- Step 13: Send "{sessionId}:{authPayload64}\n" ----
+  sock->print(cfg->session_id);
+  sock->print(":");
+  sock->print(auth_payload64);
+  sock->print("\n");
+  sock->flush();
+  free(auth_payload64); auth_payload64 = NULL;
+  NOPORTS_LOGD(TAG, "ESCR: response sent for session %.20s...", cfg->session_id);
+
+  // ---- Step 14: Wait for "ok\n" from SRVD ----
+  {
+    char response[16];
+    memset(response, 0, sizeof(response));
+    int rpos = 0;
+    t0 = millis();
+    while ((millis() - t0) < 5000UL && rpos < 15) {
+      uint8_t b;
+      if (sock->read(&b, 1) == 1) {
+        if (b == '\n') break;
+        response[rpos++] = (char)b;
+      } else {
+        vTaskDelay(pdMS_TO_TICKS(1));
+      }
+    }
+    response[rpos] = '\0';
+    if (strcmp(response, "ok") == 0) {
+      auth_ok = true;
+      NOPORTS_LOGI(TAG, "ESCR: authenticated OK");
+    } else {
+      NOPORTS_LOGE(TAG, "ESCR: auth rejected (got '%s')", response);
+    }
+  }
+
+escr_cleanup:
+  if (p)            cJSON_Delete(p);
+  if (envelope)     cJSON_Delete(envelope);
+  if (outer)        cJSON_Delete(outer);
+  if (p_json)       cJSON_free(p_json);
+  if (env_json)     cJSON_free(env_json);
+  if (outer_json)   cJSON_free(outer_json);
+  if (sig)          free(sig);
+  if (sig_b64)      free(sig_b64);
+  if (env64)        free(env64);
+  if (enc_b64)      free(enc_b64);
+  if (padded)       free(padded);
+  if (encrypted)    free(encrypted);
+  if (auth_payload64) free(auth_payload64);
+  return auth_ok;
+}
 
 // Internal: check if a WiFiClient's peer has closed the connection.
 // Uses recv(MSG_PEEK|MSG_DONTWAIT) with size 1 on the raw fd.
@@ -738,7 +1013,15 @@ static int _handle_connect_msg(NoPortsRelay *relay, RelaySub *subs, int n_subs,
   _relay_pcb_count++;
   sub->rvd.setNoDelay(true);
   _set_sub_sock_bufs(sub->rvd);
-  if (relay->config.rv_auth && relay->config.rvd_auth_string) {
+  if (relay->config.escr_auth && relay->config.escr_signing_key &&
+      relay->config.relay_auth_aes_key) {
+    if (!_escr_authenticate(&sub->rvd, &relay->config)) {
+      NOPORTS_LOGE(TAG, "Sub[%d] ESCR auth failed", slot);
+      sub->rvd.stop();
+      _relay_pcb_count--;
+      goto sub_fail;
+    }
+  } else if (relay->config.rv_auth && relay->config.rvd_auth_string) {
     sub->rvd.print(relay->config.rvd_auth_string);
     sub->rvd.print("\n");
     sub->rvd.flush();
@@ -862,12 +1145,20 @@ static void _relay_task_inner(NoPortsRelay *relay) {
   _set_sock_keepalive(sockA.fd());
   NOPORTS_LOGI(TAG, "Connected to RVD (sockA)");
 
-  if (relay->config.rv_auth && relay->config.rvd_auth_string) {
+  if (relay->config.escr_auth && relay->config.escr_signing_key &&
+      relay->config.relay_auth_aes_key) {
+    relay->state = RELAY_AUTHENTICATING;
+    if (!_escr_authenticate(&sockA, &relay->config)) {
+      NOPORTS_LOGE(TAG, "ESCR auth failed (sockA)");
+      relay->state = RELAY_ERROR;
+      goto cleanup;
+    }
+  } else if (relay->config.rv_auth && relay->config.rvd_auth_string) {
     relay->state = RELAY_AUTHENTICATING;
     sockA.print(relay->config.rvd_auth_string);
     sockA.print("\n");
     sockA.flush();
-    NOPORTS_LOGI(TAG, "Auth sent (sockA)");
+    NOPORTS_LOGI(TAG, "Legacy auth sent (sockA)");
   }
 
   NOPORTS_LOGI(TAG, "Connecting to RVD %s:%d (sockB)",
@@ -882,11 +1173,18 @@ static void _relay_task_inner(NoPortsRelay *relay) {
   _set_sock_keepalive(relay->rvd_client.fd());
   NOPORTS_LOGI(TAG, "Connected to RVD (sockB)");
 
-  if (relay->config.rv_auth && relay->config.rvd_auth_string) {
+  if (relay->config.escr_auth && relay->config.escr_signing_key &&
+      relay->config.relay_auth_aes_key) {
+    if (!_escr_authenticate(&relay->rvd_client, &relay->config)) {
+      NOPORTS_LOGE(TAG, "ESCR auth failed (sockB)");
+      relay->state = RELAY_ERROR;
+      goto cleanup;
+    }
+  } else if (relay->config.rv_auth && relay->config.rvd_auth_string) {
     relay->rvd_client.print(relay->config.rvd_auth_string);
     relay->rvd_client.print("\n");
     relay->rvd_client.flush();
-    NOPORTS_LOGI(TAG, "Auth sent (sockB)");
+    NOPORTS_LOGI(TAG, "Legacy auth sent (sockB)");
   }
 
   NOPORTS_LOGI(TAG, "Both SRVD connections established");
@@ -1303,6 +1601,15 @@ cleanup:
     free(relay->config.rvd_auth_string);
     relay->config.rvd_auth_string = NULL;
   }
+  if (relay->config.relay_auth_aes_key) {
+    free(relay->config.relay_auth_aes_key);
+    relay->config.relay_auth_aes_key = NULL;
+  }
+  if (relay->config.escr_signing_key_uri) {
+    free(relay->config.escr_signing_key_uri);
+    relay->config.escr_signing_key_uri = NULL;
+  }
+  // escr_signing_key is NOT freed — owned by the daemon (_pkam_signing_key)
   if (relay->config.rvd_host) {
     free((void *)relay->config.rvd_host);
     relay->config.rvd_host = NULL;
@@ -1432,12 +1739,20 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
   NOPORTS_LOGI(TAG, "Multi: control channel connected (pcbs=%d/%d)",
                _relay_pcb_count, MAX_RELAY_PCBS);
 
-  if (relay->config.rv_auth && relay->config.rvd_auth_string) {
+  if (relay->config.escr_auth && relay->config.escr_signing_key &&
+      relay->config.relay_auth_aes_key) {
+    relay->state = RELAY_AUTHENTICATING;
+    if (!_escr_authenticate(&ctrl, &relay->config)) {
+      NOPORTS_LOGE(TAG, "Multi: ESCR auth failed on control channel");
+      relay->state = RELAY_ERROR;
+      goto cleanup;
+    }
+  } else if (relay->config.rv_auth && relay->config.rvd_auth_string) {
     relay->state = RELAY_AUTHENTICATING;
     ctrl.print(relay->config.rvd_auth_string);
     ctrl.print("\n");
     ctrl.flush();
-    NOPORTS_LOGI(TAG, "Multi: control channel auth sent");
+    NOPORTS_LOGI(TAG, "Multi: legacy auth sent on control channel");
   }
 
   // Take ownership of control channel decrypter
@@ -2001,6 +2316,15 @@ cleanup:
     free(relay->config.rvd_auth_string);
     relay->config.rvd_auth_string = NULL;
   }
+  if (relay->config.relay_auth_aes_key) {
+    free(relay->config.relay_auth_aes_key);
+    relay->config.relay_auth_aes_key = NULL;
+  }
+  if (relay->config.escr_signing_key_uri) {
+    free(relay->config.escr_signing_key_uri);
+    relay->config.escr_signing_key_uri = NULL;
+  }
+  // escr_signing_key is NOT freed — owned by the daemon (_pkam_signing_key)
   if (relay->config.rvd_host) {
     free((void *)relay->config.rvd_host);
     relay->config.rvd_host = NULL;
@@ -2083,6 +2407,11 @@ int noports_relay_start(NoPortsRelay *relay, const NoPortsRelayConfig *config) {
   // (the originals may be freed by cJSON_Delete before the task uses them)
   if (config->rvd_host) relay->config.rvd_host = strdup(config->rvd_host);
   if (config->local_host) relay->config.local_host = strdup(config->local_host);
+  if (config->relay_auth_aes_key)
+    relay->config.relay_auth_aes_key = strdup(config->relay_auth_aes_key);
+  if (config->escr_signing_key_uri)
+    relay->config.escr_signing_key_uri = strdup(config->escr_signing_key_uri);
+  // escr_signing_key is a pointer to daemon-owned key — copy the pointer only
 
   relay->state = RELAY_IDLE;
   relay->should_run = true;

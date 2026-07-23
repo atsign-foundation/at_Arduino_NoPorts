@@ -84,6 +84,7 @@ NoPortsDaemon::NoPortsDaemon()
   , _worker_ctx(nullptr)
   , _atkeys(nullptr)
   , _signing_key(nullptr)
+  , _pkam_signing_key(nullptr)
   , _monitor_options(nullptr)
   , _worker_options(nullptr)
   , _ping_response(nullptr)
@@ -136,6 +137,11 @@ void NoPortsDaemon::_freeResources() {
     atchops_rsa_key_private_key_free((atchops_rsa_key_private_key *)_signing_key);
     free(_signing_key);
     _signing_key = nullptr;
+  }
+  if (_pkam_signing_key) {
+    atchops_rsa_key_private_key_free((atchops_rsa_key_private_key *)_pkam_signing_key);
+    free(_pkam_signing_key);
+    _pkam_signing_key = nullptr;
   }
   if (_monitor_options) {
     atclient_authenticate_options_free((atclient_authenticate_options *)_monitor_options);
@@ -349,6 +355,23 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
     _state = DAEMON_ERROR;
     return false;
   }
+
+  // ---- Create APKAM signing key copy (from pkam private key, for ESCR auth) ----
+  _pkam_signing_key = calloc(1, sizeof(atchops_rsa_key_private_key));
+  if (!_pkam_signing_key) {
+    _setError("Failed to allocate PKAM signing key");
+    _state = DAEMON_ERROR;
+    return false;
+  }
+  atchops_rsa_key_private_key_init((atchops_rsa_key_private_key *)_pkam_signing_key);
+  res = atchops_rsa_key_private_key_clone(&keys->pkam_private_key,
+                                          (atchops_rsa_key_private_key *)_pkam_signing_key);
+  if (res != 0) {
+    _setError("Failed to clone PKAM signing key: %d", res);
+    _state = DAEMON_ERROR;
+    return false;
+  }
+  NOPORTS_LOGI(TAG, "PKAM signing key ready for ESCR auth");
 
   // ---- Authenticate ----
   _state = DAEMON_AUTHENTICATING;
@@ -1579,48 +1602,85 @@ void NoPortsDaemon::_continueNptRequest(void *env,
   strncpy(relay_cfg.session_id, cJSON_GetStringValue(session_id),
           sizeof(relay_cfg.session_id) - 1);
 
-  // Handle RVD authentication
+  // Handle RVD authentication — supports ESCR (Encrypted Signed Challenge-Response)
+  // and legacy payload modes.  ESCR requires APKAM enrollment (enrollment_id != NULL).
   bool authenticate_to_rvd = cJSON_IsTrue(cJSON_GetObjectItem(payload, "authenticateToRvd"));
   if (authenticate_to_rvd) {
-    relay_cfg.rv_auth = true;
+    const char *auth_mode_str =
+      cJSON_GetStringValue(cJSON_GetObjectItem(payload, "relayAuthMode"));
+    bool use_escr = (auth_mode_str && strcmp(auth_mode_str, "escr") == 0);
 
-    // Create auth string (from handler_commons.c create_rvd_auth_string)
-    cJSON *client_nonce = cJSON_GetObjectItem(payload, "clientNonce");
-    cJSON *rvd_nonce = cJSON_GetObjectItem(payload, "rvdNonce");
+    if (use_escr && _config.enrollment_id && _pkam_signing_key) {
+      const char *raw_aes_key =
+        cJSON_GetStringValue(cJSON_GetObjectItem(payload, "relayAuthAesKey"));
+      if (raw_aes_key) {
+        relay_cfg.escr_auth          = true;
+        relay_cfg.relay_auth_aes_key = strdup(raw_aes_key);
+        relay_cfg.escr_signing_key   = _pkam_signing_key;  // daemon owns this
 
-    if (cJSON_IsString(client_nonce) && cJSON_IsString(rvd_nonce)) {
-      cJSON *auth_payload = cJSON_CreateObject();
-      cJSON_AddItemReferenceToObject(auth_payload, "sessionId", session_id);
-      cJSON_AddItemReferenceToObject(auth_payload, "clientNonce", client_nonce);
-      cJSON_AddItemReferenceToObject(auth_payload, "rvdNonce", rvd_nonce);
-
-      cJSON *auth_envelope = cJSON_CreateObject();
-      cJSON_AddItemReferenceToObject(auth_envelope, "payload", auth_payload);
-
-      char *signing_input = cJSON_PrintUnformatted(auth_payload);
-      unsigned char signature[256];
-      memset(signature, 0, 256);
-
-      res = atchops_rsa_sign(skey, ATCHOPS_MD_SHA256,
-                             (unsigned char *)signing_input,
-                             strlen(signing_input), signature);
-      cJSON_free(signing_input);
-
-      if (res == 0) {
-        char b64sig[384];
-        memset(b64sig, 0, 384);
-        size_t sig_len;
-        res = atchops_base64_encode(signature, 256, b64sig, 384, &sig_len);
-        if (res == 0) {
-          cJSON_AddStringToObject(auth_envelope, "signature", b64sig);
-          cJSON_AddStringToObject(auth_envelope, "hashingAlgo", "sha256");
-          cJSON_AddStringToObject(auth_envelope, "signingAlgo", "rsa2048");
-          relay_cfg.rvd_auth_string = cJSON_PrintUnformatted(auth_envelope);
+        // Build signing key URI: _apsk.<enrollmentId>.noports.__e@<atSign>
+        // atsign already has '@' prefix (e.g. "@mydevice")
+        size_t uri_len = strlen(_config.enrollment_id) + strlen(_config.atsign) + 30;
+        char *uri = (char *)malloc(uri_len);
+        if (uri) {
+          snprintf(uri, uri_len, "_apsk.%s.noports.__e%s",
+                   _config.enrollment_id, _config.atsign);
+          relay_cfg.escr_signing_key_uri = uri;
         }
+        NOPORTS_LOGI(TAG, "NPT: ESCR auth enabled, sk=%s",
+                     relay_cfg.escr_signing_key_uri ? relay_cfg.escr_signing_key_uri : "NULL");
+      } else {
+        NOPORTS_LOGW(TAG, "NPT: relayAuthMode=escr but relayAuthAesKey missing"
+                          " — falling back to legacy auth");
+        use_escr = false;
       }
+    } else if (use_escr) {
+      NOPORTS_LOGW(TAG, "NPT: relayAuthMode=escr but no APKAM enrollment_id"
+                        " — falling back to legacy auth");
+      use_escr = false;
+    }
 
-      cJSON_Delete(auth_payload);
-      cJSON_Delete(auth_envelope);
+    if (!use_escr) {
+      // Legacy payload auth: sign {sessionId, clientNonce, rvdNonce}
+      relay_cfg.rv_auth = true;
+
+      cJSON *client_nonce = cJSON_GetObjectItem(payload, "clientNonce");
+      cJSON *rvd_nonce    = cJSON_GetObjectItem(payload, "rvdNonce");
+
+      if (cJSON_IsString(client_nonce) && cJSON_IsString(rvd_nonce)) {
+        cJSON *auth_payload  = cJSON_CreateObject();
+        cJSON_AddItemReferenceToObject(auth_payload, "sessionId",   session_id);
+        cJSON_AddItemReferenceToObject(auth_payload, "clientNonce", client_nonce);
+        cJSON_AddItemReferenceToObject(auth_payload, "rvdNonce",    rvd_nonce);
+
+        cJSON *auth_envelope = cJSON_CreateObject();
+        cJSON_AddItemReferenceToObject(auth_envelope, "payload", auth_payload);
+
+        char *signing_input = cJSON_PrintUnformatted(auth_payload);
+        unsigned char signature[256];
+        memset(signature, 0, 256);
+
+        res = atchops_rsa_sign(skey, ATCHOPS_MD_SHA256,
+                               (unsigned char *)signing_input,
+                               strlen(signing_input), signature);
+        cJSON_free(signing_input);
+
+        if (res == 0) {
+          char b64sig[384];
+          memset(b64sig, 0, 384);
+          size_t sig_len;
+          res = atchops_base64_encode(signature, 256, b64sig, 384, &sig_len);
+          if (res == 0) {
+            cJSON_AddStringToObject(auth_envelope, "signature",    b64sig);
+            cJSON_AddStringToObject(auth_envelope, "hashingAlgo",  "sha256");
+            cJSON_AddStringToObject(auth_envelope, "signingAlgo",  "rsa2048");
+            relay_cfg.rvd_auth_string = cJSON_PrintUnformatted(auth_envelope);
+          }
+        }
+
+        cJSON_Delete(auth_payload);
+        cJSON_Delete(auth_envelope);
+      }
     }
   }
 

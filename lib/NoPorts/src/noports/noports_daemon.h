@@ -193,7 +193,8 @@ private:
   void *_monitor_ctx;       // atclient (monitor)
   void *_worker_ctx;        // atclient (worker)
   void *_atkeys;            // atclient_atkeys
-  void *_signing_key;       // atchops_rsa_key_private_key
+  void *_signing_key;       // atchops_rsa_key_private_key (encrypt key, for notification signing)
+  void *_pkam_signing_key;  // atchops_rsa_key_private_key (APKAM key, for ESCR auth)
   void *_monitor_options;   // atclient_authenticate_options
   void *_worker_options;    // atclient_authenticate_options
 

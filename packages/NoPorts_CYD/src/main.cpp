@@ -18,7 +18,12 @@
 #include <WiFi.h>
 #include <esp_wifi.h>   // esp_wifi_set_ps / WIFI_PS_NONE
 #include <esp_task_wdt.h>
-#include <esp_sntp.h>
+#include "esp_idf_version.h"
+#if ESP_IDF_VERSION_MAJOR >= 5
+  #include <esp_sntp.h>        // IDF 5+: esp_sntp_stop()
+#else
+  #include <lwip/apps/sntp.h>  // IDF 4.x: sntp_stop() (no esp_ wrapper yet)
+#endif
 #include <NoPorts.h>
 #include "esp_bt.h"
 
@@ -390,7 +395,11 @@ static void sync_ntp_time() {
   } else {
     Serial.println("[NTP] WARNING: Failed to get time");
   }
-  esp_sntp_stop();  // close UDP socket — no persistent port visible to port scanners
+#if ESP_IDF_VERSION_MAJOR >= 5
+  esp_sntp_stop();  // IDF 5+: wrapper in <esp_sntp.h>
+#else
+  sntp_stop();      // IDF 4.x: lwIP-level function
+#endif
 }
 
 // ---------------------------------------------------------------------------

@@ -46,9 +46,15 @@ struct NoPortsRelayConfig {
   const char *local_host;   // typically "127.0.0.1" or "localhost"
   uint16_t    local_port;
 
-  // Authentication
-  bool        rv_auth;           // authenticate to RVD?
-  char       *rvd_auth_string;   // JSON auth envelope
+  // Authentication — legacy payload mode
+  bool        rv_auth;           // authenticate to RVD? (legacy)
+  char       *rvd_auth_string;   // JSON auth envelope (legacy)
+
+  // ESCR authentication (Encrypted Signed Challenge-Response)
+  bool        escr_auth;             // use ESCR instead of legacy payload auth
+  char       *relay_auth_aes_key;    // AES-256 key string from NPT payload
+  char       *escr_signing_key_uri;  // signing key URI (sk field in ESCR envelope)
+  void       *escr_signing_key;      // atchops_rsa_key_private_key* (NOT owned by relay)
 
   // End-to-end encryption
   bool           rv_e2ee;             // encrypt traffic?
