@@ -84,6 +84,7 @@ NoPortsDaemon::NoPortsDaemon()
   , _worker_ctx(nullptr)
   , _atkeys(nullptr)
   , _signing_key(nullptr)
+  , _pkam_signing_key(nullptr)
   , _monitor_options(nullptr)
   , _worker_options(nullptr)
   , _ping_response(nullptr)
@@ -137,6 +138,11 @@ void NoPortsDaemon::_freeResources() {
     free(_signing_key);
     _signing_key = nullptr;
   }
+  if (_pkam_signing_key) {
+    atchops_rsa_key_private_key_free((atchops_rsa_key_private_key *)_pkam_signing_key);
+    free(_pkam_signing_key);
+    _pkam_signing_key = nullptr;
+  }
   if (_monitor_options) {
     atclient_authenticate_options_free((atclient_authenticate_options *)_monitor_options);
     free(_monitor_options);
@@ -154,6 +160,11 @@ void NoPortsDaemon::_freeResources() {
   if (_monitor_regex) {
     free(_monitor_regex);
     _monitor_regex = nullptr;
+  }
+  // enrollment_id is strdup'd in begin() — free our copy
+  if (_config.enrollment_id) {
+    free((void *)_config.enrollment_id);
+    _config.enrollment_id = nullptr;
   }
 }
 
@@ -173,6 +184,11 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
 
   _state = DAEMON_INITIALIZING;
   memcpy(&_config, &config, sizeof(NoPortsConfig));
+
+  // enrollment_id is a heap string freed by noports_keys_free() after begin() returns.
+  // Deep-copy it so the daemon owns a persistent copy for the lifetime of the session.
+  if (_config.enrollment_id)
+    _config.enrollment_id = strdup(_config.enrollment_id);
 
   // ---- Validate config ----
   if (!_config.atsign || strlen(_config.atsign) == 0) {
@@ -350,6 +366,23 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
     return false;
   }
 
+  // ---- Create APKAM signing key copy (from pkam private key, for ESCR auth) ----
+  _pkam_signing_key = calloc(1, sizeof(atchops_rsa_key_private_key));
+  if (!_pkam_signing_key) {
+    _setError("Failed to allocate PKAM signing key");
+    _state = DAEMON_ERROR;
+    return false;
+  }
+  atchops_rsa_key_private_key_init((atchops_rsa_key_private_key *)_pkam_signing_key);
+  res = atchops_rsa_key_private_key_clone(&keys->pkam_private_key,
+                                          (atchops_rsa_key_private_key *)_pkam_signing_key);
+  if (res != 0) {
+    _setError("Failed to clone PKAM signing key: %d", res);
+    _state = DAEMON_ERROR;
+    return false;
+  }
+  NOPORTS_LOGI(TAG, "PKAM signing key ready for ESCR auth");
+
   // ---- Authenticate ----
   _state = DAEMON_AUTHENTICATING;
   if (!_authenticate()) {
@@ -359,6 +392,11 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
 
   // ---- Build ping response ----
   _buildPingResponse();
+
+  // ---- Publish ESCR public signing key ----
+  // The Dart sshnpd calls ApkamSigning.publishPublicSigningKey() at startup.
+  // Without this, the SRVD cannot look up our public key to verify ESCR signatures.
+  _publishPublicSigningKey();
 
   // ---- Publish device info ----
   if (!_config.hide) {
@@ -812,6 +850,7 @@ void NoPortsDaemon::_buildPingResponse() {
   cJSON_AddBoolToObject(features, "supportsPortChoice", true);
   cJSON_AddBoolToObject(features, "adjustableTimeout", true);
   cJSON_AddBoolToObject(features, "controlChannelHeartbeats", true);
+  cJSON_AddBoolToObject(features, "supportsRamEscr", _pkam_signing_key != nullptr && _config.enrollment_id != nullptr);
   cJSON_AddBoolToObject(features, "twinKeys", true);
   cJSON_AddItemToObject(ping_json, "supportedFeatures", features);
 
@@ -826,10 +865,53 @@ void NoPortsDaemon::_buildPingResponse() {
   }
   cJSON_AddItemToObject(ping_json, "allowedServices", allowed);
 
+  // ESCR: publish signing key URI so npt client can pre-fetch the public key.
+  // Without this, the SRVD cannot look up our public key to verify the signature.
+  if (_config.enrollment_id && _pkam_signing_key) {
+    char pk_uri[320];
+    snprintf(pk_uri, sizeof(pk_uri), "public:_apsk.%s.a.__e%s",
+             _config.enrollment_id, _config.atsign);
+    cJSON_AddStringToObject(ping_json, "publicSigningKeyUri", pk_uri);
+  }
+
   _ping_response = cJSON_PrintUnformatted(ping_json);
   cJSON_Delete(ping_json);
 
   NOPORTS_LOGD(TAG, "Ping response: %s", _ping_response ? _ping_response : "NULL");
+}
+
+void NoPortsDaemon::_publishPublicSigningKey() {
+  if (!_config.enrollment_id || !_config.pkam_public_key_base64) {
+    NOPORTS_LOGD(TAG, "ESCR: no enrollment_id or pkam_public_key_base64 — skipping key publish");
+    return;
+  }
+
+  // Build atkey: public:_apsk.{enrollmentId}.a.__e@{atSign}
+  // keyname = "_apsk.{enrollmentId}", namespace = "a.__e"
+  // (a.__e == EnrollmentConstants.perEnrollmentApproved in Dart at_commons)
+  char keyname[256];
+  snprintf(keyname, sizeof(keyname), "_apsk.%s", _config.enrollment_id);
+
+  atclient_atkey sk_key;
+  atclient_atkey_init(&sk_key);
+
+  int res = atclient_atkey_create_public_key(&sk_key, keyname, _config.atsign, "a.__e");
+  if (res != 0) {
+    NOPORTS_LOGW(TAG, "ESCR: failed to create signing key atkey: %d", res);
+    atclient_atkey_free(&sk_key);
+    return;
+  }
+
+  res = atclient_put_public_key((atclient *)_worker_ctx, &sk_key,
+                                _config.pkam_public_key_base64, NULL, NULL);
+  atclient_atkey_free(&sk_key);
+
+  if (res != 0) {
+    NOPORTS_LOGW(TAG, "ESCR: failed to publish public signing key: %d", res);
+  } else {
+    NOPORTS_LOGI(TAG, "ESCR: published signing key at public:_apsk.%s.a.__e%s",
+                 _config.enrollment_id, _config.atsign);
+  }
 }
 
 bool NoPortsDaemon::_publishDeviceInfo() {
@@ -905,23 +987,23 @@ void NoPortsDaemon::_handleNotification(void *msg) {
   bool is_init = atclient_atnotification_is_decrypted_value_initialized(message->notification);
   bool has_key = atclient_atnotification_is_key_initialized(message->notification);
 
-  NOPORTS_LOGI(TAG, "Notification received: key_init=%d val_init=%d id=%s",
+  NOPORTS_LOGD(TAG, "Notification received: key_init=%d val_init=%d id=%s",
                has_key, is_init,
                message->notification->id ? message->notification->id : "null");
   if (has_key) {
-    NOPORTS_LOGI(TAG, "  key=%s from=%s to=%s",
+    NOPORTS_LOGD(TAG, "  key=%s from=%s to=%s",
                  message->notification->key ? message->notification->key : "null",
                  message->notification->from ? message->notification->from : "null",
                  message->notification->to ? message->notification->to : "null");
   }
 
   if (!is_init) {
-    NOPORTS_LOGI(TAG, "Skipping notification (no decrypted value)");
+    NOPORTS_LOGD(TAG, "Skipping notification (no decrypted value)");
     return;
   }
 
   if (!has_key || strcmp(message->notification->id, "-1") == 0) {
-    NOPORTS_LOGI(TAG, "Skipping notification (no key or id=-1)");
+    NOPORTS_LOGD(TAG, "Skipping notification (no key or id=-1)");
     return;
   }
 
@@ -938,7 +1020,7 @@ void NoPortsDaemon::_handleNotification(void *msg) {
   free(tail);
 
   if (tailstart == NULL) {
-    NOPORTS_LOGI(TAG, "Skipping: couldn't find tail in key");
+    NOPORTS_LOGD(TAG, "Skipping: couldn't find tail in key");
     return;
   }
   *tailstart = '\0'; // reterminate
@@ -948,18 +1030,18 @@ void NoPortsDaemon::_handleNotification(void *msg) {
   size_t head_len = strlen(head);
 
   if (strlen(key) < head_len) {
-    NOPORTS_LOGI(TAG, "Skipping: key too short for head strip");
+    NOPORTS_LOGD(TAG, "Skipping: key too short for head strip");
     return;
   }
 
   if (strncmp(key, head, head_len) != 0) {
-    NOPORTS_LOGI(TAG, "Skipping: head mismatch");
+    NOPORTS_LOGD(TAG, "Skipping: head mismatch");
     return;
   }
 
   key += head_len + 1; // +1 for ":"
 
-  NOPORTS_LOGI(TAG, "Parsed notification key: '%s'", key);
+  NOPORTS_LOGD(TAG, "Parsed notification key: '%s'", key);
 
   // Identify notification type
   NoPortsNotificationKey nk = NK_NONE;
@@ -1579,48 +1661,87 @@ void NoPortsDaemon::_continueNptRequest(void *env,
   strncpy(relay_cfg.session_id, cJSON_GetStringValue(session_id),
           sizeof(relay_cfg.session_id) - 1);
 
-  // Handle RVD authentication
+  // Handle RVD authentication — supports ESCR (Encrypted Signed Challenge-Response)
+  // and legacy payload modes.  ESCR requires APKAM enrollment (enrollment_id != NULL).
   bool authenticate_to_rvd = cJSON_IsTrue(cJSON_GetObjectItem(payload, "authenticateToRvd"));
   if (authenticate_to_rvd) {
-    relay_cfg.rv_auth = true;
+    const char *auth_mode_str =
+      cJSON_GetStringValue(cJSON_GetObjectItem(payload, "relayAuthMode"));
+    bool use_escr = (auth_mode_str && strcmp(auth_mode_str, "escr") == 0);
 
-    // Create auth string (from handler_commons.c create_rvd_auth_string)
-    cJSON *client_nonce = cJSON_GetObjectItem(payload, "clientNonce");
-    cJSON *rvd_nonce = cJSON_GetObjectItem(payload, "rvdNonce");
+    if (use_escr && _config.enrollment_id && _pkam_signing_key) {
+      const char *raw_aes_key =
+        cJSON_GetStringValue(cJSON_GetObjectItem(payload, "relayAuthAesKey"));
+      if (raw_aes_key) {
+        relay_cfg.escr_auth          = true;
+        relay_cfg.relay_auth_aes_key = strdup(raw_aes_key);
+        relay_cfg.escr_signing_key   = _pkam_signing_key;  // daemon owns this
 
-    if (cJSON_IsString(client_nonce) && cJSON_IsString(rvd_nonce)) {
-      cJSON *auth_payload = cJSON_CreateObject();
-      cJSON_AddItemReferenceToObject(auth_payload, "sessionId", session_id);
-      cJSON_AddItemReferenceToObject(auth_payload, "clientNonce", client_nonce);
-      cJSON_AddItemReferenceToObject(auth_payload, "rvdNonce", rvd_nonce);
-
-      cJSON *auth_envelope = cJSON_CreateObject();
-      cJSON_AddItemReferenceToObject(auth_envelope, "payload", auth_payload);
-
-      char *signing_input = cJSON_PrintUnformatted(auth_payload);
-      unsigned char signature[256];
-      memset(signature, 0, 256);
-
-      res = atchops_rsa_sign(skey, ATCHOPS_MD_SHA256,
-                             (unsigned char *)signing_input,
-                             strlen(signing_input), signature);
-      cJSON_free(signing_input);
-
-      if (res == 0) {
-        char b64sig[384];
-        memset(b64sig, 0, 384);
-        size_t sig_len;
-        res = atchops_base64_encode(signature, 256, b64sig, 384, &sig_len);
-        if (res == 0) {
-          cJSON_AddStringToObject(auth_envelope, "signature", b64sig);
-          cJSON_AddStringToObject(auth_envelope, "hashingAlgo", "sha256");
-          cJSON_AddStringToObject(auth_envelope, "signingAlgo", "rsa2048");
-          relay_cfg.rvd_auth_string = cJSON_PrintUnformatted(auth_envelope);
+        // Build signing key URI: public:_apsk.<enrollmentId>.a.__e@<atSign>
+        // The "public:" prefix is required so the SRVD can look up the key.
+        // atsign already has '@' prefix (e.g. "@mydevice").
+        // "a.__e" == EnrollmentConstants.perEnrollmentApproved in Dart at_commons.
+        size_t uri_len = strlen(_config.enrollment_id) + strlen(_config.atsign) + 25;
+        char *uri = (char *)malloc(uri_len);
+        if (uri) {
+          snprintf(uri, uri_len, "public:_apsk.%s.a.__e%s",
+                   _config.enrollment_id, _config.atsign);
+          relay_cfg.escr_signing_key_uri = uri;
         }
+        NOPORTS_LOGI(TAG, "NPT: ESCR auth enabled, sk=%s",
+                     relay_cfg.escr_signing_key_uri ? relay_cfg.escr_signing_key_uri : "NULL");
+      } else {
+        NOPORTS_LOGW(TAG, "NPT: relayAuthMode=escr but relayAuthAesKey missing"
+                          " — falling back to legacy auth");
+        use_escr = false;
       }
+    } else if (use_escr) {
+      NOPORTS_LOGW(TAG, "NPT: relayAuthMode=escr but no APKAM enrollment_id"
+                        " — falling back to legacy auth");
+      use_escr = false;
+    }
 
-      cJSON_Delete(auth_payload);
-      cJSON_Delete(auth_envelope);
+    if (!use_escr) {
+      // Legacy payload auth: sign {sessionId, clientNonce, rvdNonce}
+      relay_cfg.rv_auth = true;
+
+      cJSON *client_nonce = cJSON_GetObjectItem(payload, "clientNonce");
+      cJSON *rvd_nonce    = cJSON_GetObjectItem(payload, "rvdNonce");
+
+      if (cJSON_IsString(client_nonce) && cJSON_IsString(rvd_nonce)) {
+        cJSON *auth_payload  = cJSON_CreateObject();
+        cJSON_AddItemReferenceToObject(auth_payload, "sessionId",   session_id);
+        cJSON_AddItemReferenceToObject(auth_payload, "clientNonce", client_nonce);
+        cJSON_AddItemReferenceToObject(auth_payload, "rvdNonce",    rvd_nonce);
+
+        cJSON *auth_envelope = cJSON_CreateObject();
+        cJSON_AddItemReferenceToObject(auth_envelope, "payload", auth_payload);
+
+        char *signing_input = cJSON_PrintUnformatted(auth_payload);
+        unsigned char signature[256];
+        memset(signature, 0, 256);
+
+        res = atchops_rsa_sign(skey, ATCHOPS_MD_SHA256,
+                               (unsigned char *)signing_input,
+                               strlen(signing_input), signature);
+        cJSON_free(signing_input);
+
+        if (res == 0) {
+          char b64sig[384];
+          memset(b64sig, 0, 384);
+          size_t sig_len;
+          res = atchops_base64_encode(signature, 256, b64sig, 384, &sig_len);
+          if (res == 0) {
+            cJSON_AddStringToObject(auth_envelope, "signature",    b64sig);
+            cJSON_AddStringToObject(auth_envelope, "hashingAlgo",  "sha256");
+            cJSON_AddStringToObject(auth_envelope, "signingAlgo",  "rsa2048");
+            relay_cfg.rvd_auth_string = cJSON_PrintUnformatted(auth_envelope);
+          }
+        }
+
+        cJSON_Delete(auth_payload);
+        cJSON_Delete(auth_envelope);
+      }
     }
   }
 

@@ -9,8 +9,9 @@ NoPorts daemon with touchscreen UI for the **CYD (Cheap Yellow Display)** ESP32-
 - 🌐 **WiFi Configuration** - Scan and connect to networks with on-screen keyboard
 - 🔐 **APKAM Enrollment** - Secure device enrollment with atProtocol
 - 📊 **Real-time Dashboard** - Monitor tunnels, pings, throughput (bps), and CPU usage
-- 🔀 **Multi-Session Relay** - Up to 4 concurrent TCP sessions per NPT connection
+- 🔀 **Multi-Session Relay** - Up to 5 concurrent TCP sessions per NPT connection
 - 🔒 **Per-Session Encryption** - Independent AES-CTR keys for each sub-connection
+- 🛡️ **ESCR Authentication** - Encrypted Signed Challenge-Response relay auth (`npt --ram escr`)
 - 💡 **RGB LED Status** - Color-coded states (green=connected, amber=relay active, red=error)
 - 💾 **Persistent Storage** - WiFi credentials and keys saved to NVS/LittleFS
 - 🎯 **Touch Interface** - Flicker-free touchscreen UI optimized for 320x240 display
@@ -86,7 +87,7 @@ pio device monitor -b 115200
 │   ├── noports_daemon.cpp    # NPT request handling, auth, relay orchestration
 │   ├── noports_relay.cpp     # TCP relay engine (single + multi-session)
 │   └── noports/
-│       ├── noports_daemon.h  # Daemon class, NOPORTS_MAX_RELAYS=4
+│       ├── noports_daemon.h  # Daemon class, NOPORTS_MAX_RELAYS=5/6
 │       ├── noports_relay.h   # Relay struct, config, sub-connection types
 │       └── noports_config.h  # Timeout and buffer configuration
 ```

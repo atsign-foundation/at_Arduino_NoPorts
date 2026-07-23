@@ -20,7 +20,11 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <ESPmDNS.h>
-#include <esp_sntp.h>
+#if ESP_IDF_VERSION_MAJOR >= 5
+  #include <esp_sntp.h>        // IDF 5+: esp_sntp_stop()
+#else
+  #include <lwip/apps/sntp.h>  // IDF 4.x: sntp_stop() (no esp_ wrapper yet)
+#endif
 #include <NoPorts.h>
 
 extern "C" {
@@ -236,7 +240,11 @@ static void sync_ntp() {
   } else {
     Serial.println("[NTP] WARNING: Failed");
   }
-  esp_sntp_stop();  // close UDP socket — no persistent port visible to port scanners
+#if ESP_IDF_VERSION_MAJOR >= 5
+  esp_sntp_stop();  // IDF 5+: wrapper in <esp_sntp.h>
+#else
+  sntp_stop();      // IDF 4.x: lwIP-level function
+#endif
 }
 
 // Run once after we first get a network IP.
