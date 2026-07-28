@@ -9,6 +9,10 @@
 # This trades a small per-record overhead for dramatically lower peak fragmentation.
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 
+# Full Mozilla CA bundle (~130 roots) stored in flash — zero heap cost.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+
 # Reduce max TLS record size from 16384 to 8192 bytes.
 # Halves the contiguous block the AES DMA needs per session.
 # 8192 is still large enough for all NoPorts/SSH traffic.
