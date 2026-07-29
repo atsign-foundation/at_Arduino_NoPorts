@@ -66,6 +66,7 @@ static uint32_t _last_wifi_check_ms = 0;
 #define WIFI_CHECK_INTERVAL_MS 5000
 #define WIFI_RECONNECT_TIMEOUT_MS 15000
 
+
 // CPU usage tracking
 static uint32_t _cpu_loop_start_us = 0;
 static int32_t  _cpu_work_us = 0;       // accumulated work time in current window
@@ -806,7 +807,7 @@ static void _show_config() {
   ui_config_create(_on_config_saved);
 }
 
-// Show WiFi setup screen (called from dashboard)
+// Show WiFi setup screen (called from dashboard by the user — no auto-search)
 static void _show_wifi() {
   if (daemon_running) {
     npDaemon.stop();
@@ -1027,10 +1028,10 @@ void setup() {
 
         on_wifi_connected();
       } else {
-        Serial.println("[main] Auto-connect failed - showing WiFi setup");
+        Serial.println("[main] Auto-connect failed - showing WiFi setup with auto-search");
         WiFi.disconnect();
         current_screen = SCREEN_WIFI;
-        ui_wifi_create(on_wifi_connected);
+        ui_wifi_create(on_wifi_connected, true);
       }
     }
   } else {
@@ -1075,13 +1076,13 @@ void loop() {
 
       // Try quick reconnect with saved credentials
       if (!ui_wifi_auto_connect(WIFI_RECONNECT_TIMEOUT_MS)) {
-        Serial.println("[main] Reconnect failed — showing WiFi setup");
+        Serial.println("[main] Reconnect failed — showing WiFi setup with auto-search");
         if (daemon_running) {
           npDaemon.stop();
           daemon_running = false;
         }
         current_screen = SCREEN_WIFI;
-        ui_wifi_create(_on_wifi_reconnected);
+        ui_wifi_create(_on_wifi_reconnected, true);
         return;  // skip rest of this loop iteration
       }
       Serial.println("[main] WiFi reconnected");
