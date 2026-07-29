@@ -42,6 +42,15 @@ static String _status_msg;
 static int _scan_retries = 0;
 #define MAX_SCAN_RETRIES 5
 
+// Auto-search: when true the screen rescans periodically and connects
+// automatically if the saved SSID reappears.  Cleared when the user taps any
+// network to take manual control.
+static bool    _auto_search      = false;
+static String  _auto_search_ssid;
+static String  _auto_search_pass;
+static uint32_t _auto_rescan_ms = 0;
+#define AUTO_RESCAN_INTERVAL_MS 15000UL
+
 // Keyboard mode: 0=lowercase, 1=uppercase, 2=symbols
 static int _wifi_kb_mode = 0;
 
@@ -157,7 +166,14 @@ static void _start_scan() {
     }
     _state = WIFI_SHOW_LIST;
     _network_count = 0;
-    _draw_status("No networks found - tap Rescan");
+    if (_auto_search && _auto_search_ssid.length() > 0) {
+      char msg[64];
+      snprintf(msg, sizeof(msg), "Scanning for %s...", _auto_search_ssid.c_str());
+      _draw_status(msg);
+      _auto_rescan_ms = millis();
+    } else {
+      _draw_status("No networks found - tap Rescan");
+    }
     _draw_network_list();
     return;
   }
@@ -174,6 +190,37 @@ static void _start_scan() {
   _scan_retries = 0;
 
   Serial.printf("[ui_wifi] Found %d networks\n", _network_count);
+
+  // Auto-search: if the saved SSID is visible, connect immediately without
+  // waiting for user input.
+  if (_auto_search && _auto_search_ssid.length() > 0) {
+    for (int i = 0; i < _network_count; i++) {
+      if (_networks[i] == _auto_search_ssid) {
+        Serial.printf("[ui_wifi] Auto-search: '%s' visible — auto-connecting\n",
+                      _auto_search_ssid.c_str());
+        _selected_network = i;
+        strncpy(_password, _auto_search_pass.c_str(), sizeof(_password) - 1);
+        _password[sizeof(_password) - 1] = '\0';
+        _password_len = strlen(_password);
+        _state = WIFI_SHOW_LIST;
+        _draw_status("Found! Reconnecting...");
+        _draw_network_list();
+        _state = WIFI_CONNECTING;
+        _connect_start_ms = millis();
+        WiFi.begin(_auto_search_ssid.c_str(), _auto_search_pass.c_str());
+        return;
+      }
+    }
+    // Saved SSID not in this scan — show list and schedule next rescan
+    char msg[64];
+    snprintf(msg, sizeof(msg), "Scanning for %s...", _auto_search_ssid.c_str());
+    _state = WIFI_SHOW_LIST;
+    _draw_status(msg);
+    _draw_network_list();
+    _auto_rescan_ms = millis();
+    return;
+  }
+
   _state = WIFI_SHOW_LIST;
   _draw_status(_network_count > 0 ? "Touch to select network" : "No networks found - tap Rescan");
   _draw_network_list();
@@ -391,17 +438,27 @@ static bool _check_keyboard_press(int16_t tx, int16_t ty) {
 // Public API
 // ---------------------------------------------------------------------------
 
-void ui_wifi_create(void (*on_connected)()) {
+void ui_wifi_create(void (*on_connected)(), bool auto_search) {
   _on_connected_cb = on_connected;
   _scan_retries = 0;
   _selected_network = -1;
   _password_len = 0;
   _password[0] = '\0';
   _wifi_kb_mode = 0;
-  
+
+  _auto_search = auto_search;
+  if (auto_search) {
+    _auto_search_ssid = ui_load_string(NVS_KEY_SSID);
+    _auto_search_pass = ui_load_string(NVS_KEY_PASS);
+    if (_auto_search_ssid.length() == 0) {
+      _auto_search = false;  // no saved SSID — nothing to search for
+    }
+  }
+  _auto_rescan_ms = 0;
+
   TFT_eSPI &tft = ui_get_tft();
   tft.fillScreen(COLOR_BG_DARK);
-  
+
   _draw_header("WiFi Setup");
   _start_scan();
 }
@@ -412,18 +469,31 @@ void ui_wifi_update() {
       // Synchronous scan is handled entirely inside _start_scan() now.
       // If we still land here, the scan completed and transitioned state.
       break;
-    
+
+    case WIFI_SHOW_LIST:
+      // Auto-search: rescan periodically until the saved SSID reappears.
+      if (_auto_search && _auto_search_ssid.length() > 0
+          && millis() - _auto_rescan_ms >= AUTO_RESCAN_INTERVAL_MS) {
+        Serial.println("[ui_wifi] Auto-search: rescanning...");
+        TFT_eSPI &tft = ui_get_tft();
+        tft.fillScreen(COLOR_BG_DARK);
+        _draw_header("WiFi Setup");
+        _scan_retries = 0;
+        _start_scan();
+      }
+      break;
+
     case WIFI_CONNECTING: {
       // Check connection status
       if (WiFi.status() == WL_CONNECTED) {
         _state = WIFI_CONNECTED;
-        
-        // Save credentials
+
+        // Save credentials (no-op if auto-connecting to the already-saved SSID)
         ui_save_string(NVS_KEY_SSID, _networks[_selected_network].c_str());
         ui_save_string(NVS_KEY_PASS, _password);
-        
+
         Serial.printf("[ui_wifi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-        
+
         TFT_eSPI &tft = ui_get_tft();
         tft.fillScreen(COLOR_BG_DARK);
         tft.setTextColor(COLOR_SUCCESS);
@@ -432,9 +502,9 @@ void ui_wifi_update() {
         tft.drawString("Connected!", TFT_WIDTH / 2, TFT_HEIGHT / 2 - 20, 4);
         tft.setTextColor(COLOR_TEXT_WHITE);
         tft.drawString(WiFi.localIP().toString().c_str(), TFT_WIDTH / 2, TFT_HEIGHT / 2 + 20, 2);
-        
+
         delay(2000);
-        
+
         if (_on_connected_cb) {
           _on_connected_cb();
         }
@@ -448,17 +518,25 @@ void ui_wifi_update() {
         tft.setTextSize(1);
         tft.drawString("Connection Failed", TFT_WIDTH / 2, TFT_HEIGHT / 2, 4);
         delay(2000);
-        
+
         // Return to list
         _state = WIFI_SHOW_LIST;
         _selected_network = -1;
         _password_len = 0;
         _password[0] = '\0';
-        
+
         TFT_eSPI &tft2 = ui_get_tft();
         tft2.fillScreen(COLOR_BG_DARK);
         _draw_header("WiFi Setup");
-        _draw_status("Touch to select network");
+        if (_auto_search && _auto_search_ssid.length() > 0) {
+          // Auto-search was connecting — trigger immediate rescan
+          char msg[64];
+          snprintf(msg, sizeof(msg), "Scanning for %s...", _auto_search_ssid.c_str());
+          _draw_status(msg);
+          _auto_rescan_ms = millis() - AUTO_RESCAN_INTERVAL_MS;  // rescan immediately
+        } else {
+          _draw_status("Touch to select network");
+        }
         _draw_network_list();
       } else {
         // Still connecting
@@ -466,7 +544,7 @@ void ui_wifi_update() {
       }
       break;
     }
-    
+
     default:
       break;
   }
@@ -489,6 +567,7 @@ bool ui_wifi_handle_touch(int16_t tx, int16_t ty) {
     int y = LIST_START_Y;
     for (int i = 0; i < _network_count && i < MAX_NETWORKS; i++) {
       if (ui_touch_in_rect(tx, ty, 5, y, TFT_WIDTH - 10, NETWORK_HEIGHT - 4)) {
+        _auto_search = false;  // user is taking manual control
         _selected_network = i;
         _password_len = 0;
         _password[0] = '\0';
@@ -547,3 +626,4 @@ String ui_wifi_get_ip() {
   }
   return "0.0.0.0";
 }
+

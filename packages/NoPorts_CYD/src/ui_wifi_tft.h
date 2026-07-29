@@ -11,11 +11,13 @@
 /**
  * @brief Create and show the WiFi setup screen
  *
- * Displays available WiFi networks and allows selection/password entry
- *
- * @param on_connected Callback invoked when WiFi connects successfully
+ * @param on_connected  Callback invoked when WiFi connects successfully
+ * @param auto_search   When true the screen continuously rescans and
+ *                      auto-connects if the saved SSID reappears (used after
+ *                      a disconnect).  Stops the moment the user taps any
+ *                      network to take manual control.
  */
-void ui_wifi_create(void (*on_connected)());
+void ui_wifi_create(void (*on_connected)(), bool auto_search = false);
 
 /**
  * @brief Update the WiFi screen (handle scanning, connection status, password entry)
@@ -39,5 +41,6 @@ bool ui_wifi_auto_connect(int timeout_ms = 10000);
  * @brief Get the current WiFi IP address as a string
  */
 String ui_wifi_get_ip();
+
 
 #endif // UI_WIFI_TFT_H
