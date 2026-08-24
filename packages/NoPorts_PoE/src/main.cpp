@@ -86,6 +86,30 @@ static uint32_t g_last_eth_check = 0;
 #define HEAP_RECOVER_BYTES      30000   // restart daemon to free relay buffers
 #define HEAP_REBOOT_BYTES       15000   // unrecoverable — reboot
 
+// Daemon supervision.  The Linux sshnpd relies on systemd Restart=always to
+// come back after any stop; on ESP32 this sketch is the supervisor.  If the
+// daemon stops without the sketch asking, restart it in place; if it will
+// not stay up, reboot to clear heap fragmentation and wedged TLS/lwIP state.
+#define DAEMON_RESTART_DELAY_MS 10000UL   // wait between supervision restarts
+#define DAEMON_RESTART_MAX      3         // in-place attempts before rebooting
+#define DAEMON_STABLE_MS        600000UL  // up this long = healthy, reset attempts
+
+// Reboot-reason breadcrumb.  RTC noinit memory survives a software reset
+// (not a power cycle), so the next boot's log can say why the device
+// rebooted itself instead of looking like a random power event.
+#define REBOOT_REASON_MAGIC     0x52424F54UL  // "RBOT"
+typedef struct { uint32_t magic; char reason[48]; } RebootReason;
+static RTC_NOINIT_ATTR RebootReason g_reboot_reason;
+
+static void reboot_with_reason(const char *reason) {
+  Serial.printf("[main] REBOOT: %s\n", reason);
+  g_reboot_reason.magic = REBOOT_REASON_MAGIC;
+  strncpy(g_reboot_reason.reason, reason, sizeof(g_reboot_reason.reason) - 1);
+  g_reboot_reason.reason[sizeof(g_reboot_reason.reason) - 1] = '\0';
+  delay(200);  // let serial drain
+  ESP.restart();
+}
+
 // ─── Daemon callbacks → stats struct (called from npDaemon internals) ─────
 
 static void on_tunnel_open(const char *host, uint16_t port, const char *) {
@@ -341,17 +365,28 @@ void setup() {
   Serial.println("  NoPorts PoE  v" POE_APP_VERSION);
   Serial.println("=============================\n");
 
+  if (g_reboot_reason.magic == REBOOT_REASON_MAGIC) {
+    Serial.printf("[main] Previous reboot was self-initiated: %s\n",
+                  g_reboot_reason.reason);
+    g_reboot_reason.magic = 0;
+  }
+
   atlogger_set_logging_level(ATLOGGER_LOGGING_LEVEL_INFO);
 
   // Hardware task watchdog — catches infinite loops and hard hangs.
   // The loop task feeds it via esp_task_wdt_reset() every iteration.
   {
+#if ESP_IDF_VERSION_MAJOR >= 5
     esp_task_wdt_config_t wdt_cfg = {
       .timeout_ms     = WDT_TIMEOUT_MS,
       .idle_core_mask = 0,
       .trigger_panic  = true,
     };
     esp_task_wdt_reconfigure(&wdt_cfg);
+#else
+    // IDF 4.x (test_esp32s3 env): seconds-based API, no config struct
+    esp_task_wdt_init(WDT_TIMEOUT_MS / 1000, true);
+#endif
     esp_task_wdt_add(NULL);  // subscribe the current (loop) task
     Serial.printf("[wdt] Hardware watchdog: %u s\n", WDT_TIMEOUT_MS / 1000);
   }
@@ -416,8 +451,13 @@ void loop() {
   // Drive NoPorts daemon
   if (daemon_running && npDaemon.isRunning()) {
     npDaemon.loop();
+  }
 
-    // Refresh stats for web dashboard (every 500 ms)
+  // Refresh stats for web dashboard (every 500 ms).
+  // Outside the isRunning() gate so the dashboard keeps showing the real
+  // daemon state after an internal stop instead of freezing on the last
+  // value sampled while it was still running.
+  if (daemon_running) {
     static uint32_t last_stat = 0;
     if (millis() - last_stat > 500) {
       last_stat = millis();
@@ -445,9 +485,7 @@ void loop() {
       Serial.printf("[mem] free=%u min=%u largest=%u\n", free_h, min_h, large);
 
       if (free_h < HEAP_REBOOT_BYTES) {
-        Serial.printf("[mem] CRITICAL free=%u — rebooting\n", free_h);
-        delay(200);
-        ESP.restart();
+        reboot_with_reason("heap critically low");
       } else if (free_h < HEAP_RECOVER_BYTES) {
         // Restart daemon to release relay buffers; rate-limit to once per 5 min
         if (millis() - _last_recover_ms > 300000UL) {
@@ -461,19 +499,46 @@ void loop() {
     }
   }
 
-  // Daemon health: if stuck in ERROR state for >5 min, restart it
+  // Daemon supervision.  Every intentional stop in this sketch clears
+  // daemon_running first, so daemon_running with isRunning() false means the
+  // daemon stopped on its own (internal error, or the testing shutdown
+  // notification).  Restart it in place, escalating to a reboot after
+  // DAEMON_RESTART_MAX failed attempts.  This replaces the old "stuck in
+  // ERROR" check, which never fired: g_stats.state stopped refreshing the
+  // moment isRunning() went false, so it could never observe DAEMON_ERROR.
   {
-    static bool     _daemon_in_error  = false;
-    static uint32_t _daemon_err_since = 0;
-    if (daemon_running && g_stats.state == DAEMON_ERROR) {
-      if (!_daemon_in_error) { _daemon_in_error = true; _daemon_err_since = millis(); }
-      else if (millis() - _daemon_err_since > 300000UL) {
-        Serial.println("[main] Daemon stuck in ERROR — restarting");
-        _daemon_in_error = false;
-        restart_daemon_cb();
-      }
+    static bool     _sup_active   = false;
+    static uint8_t  _sup_attempts = 0;
+    static uint32_t _sup_next_ms  = 0;
+    static uint32_t _sup_up_since = 0;
+
+    if (daemon_running && npDaemon.isRunning()) {
+      if (_sup_up_since == 0) _sup_up_since = millis();
+      if (_sup_attempts > 0 && millis() - _sup_up_since > DAEMON_STABLE_MS)
+        _sup_attempts = 0;
+      _sup_active = false;
     } else {
-      _daemon_in_error = false;
+      _sup_up_since = 0;
+      if (daemon_running && !_sup_active) {
+        Serial.println("[main] Daemon stopped unexpectedly — supervisor engaged");
+        _sup_active  = true;
+        _sup_next_ms = millis() + DAEMON_RESTART_DELAY_MS;
+      }
+      if (_sup_active) {
+        if (!g_net_up) {
+          // Network outage: the ETH event handlers re-arm post_network_setup()
+          // and restart the daemon when the link returns — stand down.
+          _sup_active = false;
+        } else if ((int32_t)(millis() - _sup_next_ms) >= 0) {
+          if (_sup_attempts >= DAEMON_RESTART_MAX)
+            reboot_with_reason("daemon would not stay up");
+          _sup_attempts++;
+          Serial.printf("[main] Supervisor: daemon restart %u/%u\n",
+                        _sup_attempts, DAEMON_RESTART_MAX);
+          restart_daemon_cb();
+          _sup_next_ms = millis() + DAEMON_RESTART_DELAY_MS;
+        }
+      }
     }
   }
 

@@ -85,5 +85,16 @@ void setup() {
 
 void loop() {
   npDaemon.loop();
+
+  // The sketch is the daemon's supervisor (the Linux sshnpd relies on
+  // systemd Restart=always for this).  If the daemon stops on its own —
+  // internal error, or the testing shutdown notification — reboot to
+  // recover; this bare example has no other recovery path.
+  if (!npDaemon.isRunning()) {
+    Serial.println("NoPorts daemon stopped — rebooting in 5 s");
+    delay(5000);
+    ESP.restart();
+  }
+
   delay(10);
 }
