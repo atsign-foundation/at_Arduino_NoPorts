@@ -1073,8 +1073,28 @@ void NoPortsDaemon::_handleNotification(void *msg) {
       break;
 
     case NK_GRACEFUL_SHUTDOWN:
-      NOPORTS_LOGI(TAG, "Graceful shutdown requested");
-      _handleGracefulShutdown();
+      // Testing-only, mirroring the C sshnpd's
+      // SSHNPD_ENABLE_TESTING_SHUTDOWN_NOTIFICATION guard.  Compiled out by
+      // default so an arbitrary atSign cannot remotely stop the daemon.
+#ifdef NOPORTS_ENABLE_TESTING_SHUTDOWN_NOTIFICATION
+#warning BINARY COMPILED WITH SHUTDOWN NOTIFICATION ENABLED NOT FOR PRODUCTION USE
+      if (_config.policy_atsign && _config.policy_atsign[0] != '\0') {
+        // Policy mode auth would need an async RPC round-trip with no
+        // continuation to resume into here — reject rather than fail open.
+        NOPORTS_LOGW(TAG, "Shutdown: rejected — not supported in policy mode (from %s)",
+                     message->notification->from);
+      } else if (!_isManagerAtsign(message->notification->from)) {
+        NOPORTS_LOGW(TAG, "Shutdown: rejected from unauthorized atSign: %s",
+                     message->notification->from);
+      } else {
+        NOPORTS_LOGI(TAG, "Graceful shutdown requested by %s",
+                     message->notification->from);
+        _handleGracefulShutdown();
+      }
+#else
+      NOPORTS_LOGW(TAG, "Graceful shutdown notification is disabled in this build "
+                        "(define NOPORTS_ENABLE_TESTING_SHUTDOWN_NOTIFICATION to enable)");
+#endif
       break;
 
     case NK_NONE:
@@ -1082,6 +1102,22 @@ void NoPortsDaemon::_handleNotification(void *msg) {
       NOPORTS_LOGD(TAG, "Unknown notification key: %s", key);
       break;
   }
+}
+
+// ============================================================================
+// Private: Manager-list authorization check
+// ============================================================================
+
+bool NoPortsDaemon::_isManagerAtsign(const char *atsign) {
+  if (atsign == nullptr) {
+    return false;
+  }
+  for (uint8_t i = 0; i < _config.manager_count; i++) {
+    if (strcmp(atsign, _config.manager_list[i]) == 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // ============================================================================
@@ -1118,14 +1154,7 @@ void NoPortsDaemon::_handlePing(void *msg) {
     return;
   }
 
-  bool ping_authorized = false;
-  for (uint8_t i = 0; i < _config.manager_count; i++) {
-    if (strcmp(from, _config.manager_list[i]) == 0) {
-      ping_authorized = true;
-      break;
-    }
-  }
-  if (!ping_authorized) {
+  if (!_isManagerAtsign(from)) {
     NOPORTS_LOGW(TAG, "Ping: rejected from unauthorized atSign: %s", from);
     return;
   }
@@ -1187,14 +1216,7 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
     return;
   }
 
-  bool manager_authorized = false;
-  for (uint8_t i = 0; i < _config.manager_count; i++) {
-    if (strcmp(requesting_atsign, _config.manager_list[i]) == 0) {
-      manager_authorized = true;
-      break;
-    }
-  }
-  if (!manager_authorized) {
+  if (!_isManagerAtsign(requesting_atsign)) {
     NOPORTS_LOGW(TAG, "NPT: rejected request from unauthorized atSign: %s",
                  requesting_atsign);
     cJSON_Delete(envelope);

@@ -246,6 +246,9 @@ private:
   void _handlePing(void *message);
   void _handleNptRequest(void *message);
   void _handleGracefulShutdown();
+  // Returns true if atsign exactly matches an entry in config.manager_list.
+  // Returns false on nullptr or when no managers are configured.
+  bool _isManagerAtsign(const char *atsign);
 
   // Policy-service RPC helpers
   // Called when policy_atsign is configured: sends auth-check RPC via worker,
