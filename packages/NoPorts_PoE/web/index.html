@@ -5,7 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>NoPorts PoE – Firmware Installer</title>
 
-  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+  <!-- ESP Web Tools: browser-side ESPTool using the WebSerial API.
+       Served from this same origin (vendored, version-pinned + checksum-verified
+       into the image by the Dockerfile) rather than a live CDN, so the code that
+       writes firmware cannot be swapped out by a compromised third party. -->
+  <script type="module" src="esp-web-tools/install-button.js"></script>
 
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }

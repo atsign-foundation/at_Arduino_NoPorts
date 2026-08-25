@@ -23,6 +23,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip install --no-cache-dir platformio esptool
 
+# ---------------------------------------------------------------------------
+# Vendor ESP Web Tools (the browser-side flasher) at a pinned, checksum-verified
+# version so the install page loads it from this same origin instead of a live
+# CDN. This removes the supply-chain risk of fetching unpinned JS from unpkg at
+# flash time — the exact bytes are fixed at build time and the download aborts
+# on any hash mismatch. To upgrade: bump the version, update the SHA-256 (from
+# `shasum -a 256` of the npm tarball), and re-test the flow.
+# ---------------------------------------------------------------------------
+ARG ESP_WEB_TOOLS_VERSION=10.4.0
+ARG ESP_WEB_TOOLS_SHA256=f18da75335d2f0dca044c4bb052848c0696e7b03cc23d61d8530dd6eba0a9008
+RUN curl -fsSL -o /tmp/ewt.tgz \
+        "https://registry.npmjs.org/esp-web-tools/-/esp-web-tools-${ESP_WEB_TOOLS_VERSION}.tgz" && \
+    echo "${ESP_WEB_TOOLS_SHA256}  /tmp/ewt.tgz" | sha256sum -c - && \
+    mkdir -p /esp-web-tools && \
+    tar -xzf /tmp/ewt.tgz -C /esp-web-tools --strip-components=3 package/dist/web && \
+    rm /tmp/ewt.tgz
+
 WORKDIR /build
 
 # ---------------------------------------------------------------------------
@@ -108,6 +125,10 @@ COPY packages/NoPorts_CYD/web/nginx.conf /etc/nginx/conf.d/noports.conf
 
 # Web assets (static HTML + manifests)
 COPY packages/NoPorts_CYD/web/ /usr/share/nginx/html/
+
+# Vendored ESP Web Tools (pinned + checksum-verified in the builder stage),
+# served same-origin at /esp-web-tools/ — see index.html.
+COPY --from=builder /esp-web-tools/ /usr/share/nginx/html/esp-web-tools/
 
 # Merged firmware binaries (used by factory-reset manifests)
 COPY --from=builder /build/packages/NoPorts_CYD/merged-cyd2usb.bin     /usr/share/nginx/html/
