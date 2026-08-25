@@ -237,7 +237,64 @@ static void restart_daemon_cb() {
 
 // ─── Network helpers ──────────────────────────────────────────────────────
 
-static time_t _ntp_last_good = 0;  // 0 = never synced
+static time_t _ntp_last_good = 0;  // 0 = never synced THIS session (gates ±1h clamp)
+
+// Convert a broken-down UTC date/time to Unix epoch without relying on timegm()
+// or the process timezone (days_from_civil, Howard Hinnant — all signed math).
+static time_t _utc_epoch(int year, int mon0, int mday, int hour, int min, int sec) {
+  int m   = mon0 + 1;                              // 1..12
+  int y   = year - (m <= 2 ? 1 : 0);
+  int era = (y >= 0 ? y : y - 399) / 400;
+  int yoe = y - era * 400;                         // 0..399
+  int doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + mday - 1;  // 0..365
+  int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;             // 0..146096
+  long long days = (long long)era * 146097 + doe - 719468;     // days since 1970-01-01
+  return (time_t)(days * 86400LL + hour * 3600LL + min * 60LL + sec);
+}
+
+// Firmware build time, parsed from the compiler's __DATE__/__TIME__ (UTC).
+// Used as an absolute lower bound for accepted NTP times: the clock can never
+// be set earlier than when this firmware was built.
+static time_t _build_epoch() {
+  static const char *months = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  char mon[4] = { __DATE__[0], __DATE__[1], __DATE__[2], '\0' };
+  const char *p = strstr(months, mon);
+  int mon0 = p ? (int)((p - months) / 3) : 0;
+  int mday = atoi(__DATE__ + 4);   // atoi skips the space-padding of single-digit days
+  int year = atoi(__DATE__ + 7);
+  int hour = atoi(__TIME__);
+  int min  = atoi(__TIME__ + 3);
+  int sec  = atoi(__TIME__ + 6);
+  time_t t = _utc_epoch(year, mon0, mday, hour, min, sec);
+  return t > 0 ? t : 0;
+}
+
+// Absolute lower bound for an acceptable NTP time: the later of the firmware
+// build date (minus a skew margin) and the last known-good time persisted to
+// NVS.  A real NTP reply is always at/after this; only a spoofed backward jump
+// falls below it.
+static time_t _ntp_time_floor() {
+  time_t floor = _build_epoch();
+  if (floor > 86400) floor -= 86400;  // 1-day margin for build-host clock skew
+  String s = nvs_load(NVS_KEY_NTP_GOOD);
+  if (s.length()) {
+    time_t persisted = (time_t)strtoll(s.c_str(), nullptr, 10);
+    if (persisted > floor) floor = persisted;
+  }
+  return floor;
+}
+
+// Persist forward progress of the known-good clock so the floor survives reboot.
+// The ~24h re-sync interval keeps this to about one NVS write per day.
+static void _persist_ntp_good(time_t t) {
+  String s = nvs_load(NVS_KEY_NTP_GOOD);
+  time_t stored = s.length() ? (time_t)strtoll(s.c_str(), nullptr, 10) : 0;
+  if (t > stored) {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%lld", (long long)t);
+    nvs_save(NVS_KEY_NTP_GOOD, buf);
+  }
+}
 
 static void sync_ntp() {
   Serial.println("[NTP] Syncing...");
@@ -249,15 +306,26 @@ static void sync_ntp() {
     Serial.printf("[NTP] Waiting (%d/10)\n", retries);
   if (retries < 10) {
     time_t after = mktime(&t);
-    // After first good sync, reject responses that jump the clock by more than
-    // one hour — guards against spoofed NTP packets on the local network.
-    if (_ntp_last_good > 0 && labs((long)(after - before)) > 3600) {
+    time_t floor = _ntp_time_floor();
+    // Absolute floor — applies on EVERY sync, including the first.  Rejects any
+    // reply that would set the clock earlier than the firmware build date or the
+    // last known-good time.  This blocks a spoofed SNTP reply from rolling the
+    // clock backward at boot (e.g. to validate an expired TLS certificate).
+    if (after < floor) {
+      Serial.printf("[NTP] REJECT: %lld < floor %lld — backward/spoofed, keeping current time\n",
+                    (long long)after, (long long)floor);
+      timeval tv{before, 0};
+      settimeofday(&tv, nullptr);
+    // After a good sync THIS session, also reject >1h jumps from the current
+    // (already-correct) clock — guards against skewing a good clock.
+    } else if (_ntp_last_good > 0 && labs((long)(after - before)) > 3600) {
       Serial.printf("[NTP] WARN: suspicious jump %ld s — reverting\n",
                     (long)(after - before));
       timeval tv{before, 0};
       settimeofday(&tv, nullptr);
     } else {
       _ntp_last_good = after;
+      _persist_ntp_good(after);
       char buf[32]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M UTC", &t);
       Serial.printf("[NTP] %s\n", buf);
     }

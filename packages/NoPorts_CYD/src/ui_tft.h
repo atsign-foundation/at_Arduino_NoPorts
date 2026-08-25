@@ -100,6 +100,7 @@ struct UiEvent {
 #define NVS_KEY_MANAGER   "manager"
 #define NVS_KEY_LED_COLOR "led_color"
 #define NVS_KEY_CONFIGURED "configured"
+#define NVS_KEY_NTP_GOOD  "ntp_good"    // last known-good NTP epoch (monotonic time floor across reboots)
 #define NVS_KEY_MANAGERS   "managers"    // comma-separated atSign list e.g. "@colin,@cconstab"
 #define NVS_KEY_PERMITOPEN  "permitopen"  // comma-separated host:port rules e.g. "localhost:22,localhost:80"
 #define NVS_KEY_RULES_MODE  "rules_mode"  // "0" = managers list, "1" = policy atSign
