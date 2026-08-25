@@ -32,6 +32,16 @@
 // Policy-service RPC pending state
 // ---------------------------------------------------------------------------
 
+// Per-sender policy-check throttle (DoS mitigation).
+//   NOPORTS_POLICY_COOLDOWN_SLOTS — size of the LRU table of recent senders.
+//   NOPORTS_POLICY_COOLDOWN_MS    — minimum interval between accepted policy
+//     checks for the same atSign.  A single sender can therefore spend at most
+//     one policy-check slot per this interval; bursts in between are dropped.
+//     Kept modest so a manager opening a second tunnel is not noticeably
+//     delayed, while a flooding atSign cannot monopolise the single slot.
+#define NOPORTS_POLICY_COOLDOWN_SLOTS 8
+#define NOPORTS_POLICY_COOLDOWN_MS    2000UL
+
 /** Type of request pending policy authorization */
 enum NoPortsPolicyPendingType {
   NOPORTS_POLICY_NONE = 0,
@@ -233,6 +243,17 @@ private:
   // Policy-service RPC — single in-flight pending slot
   NoPortsPolicyPending _policy_pending;
 
+  // Per-sender cooldown table (LRU) used to throttle requests.
+  // Ping and NPT are tracked separately so the normal client sequence
+  // (ping, then immediately an NPT request from the same atSign) is not
+  // throttled — only rapid repeats of the SAME request type are.
+  struct PolicyCooldownEntry {
+    char     atsign[64];
+    uint32_t last_ping_ms;  // millis() of last ACCEPTED ping check (0 = never)
+    uint32_t last_npt_ms;   // millis() of last ACCEPTED NPT request (0 = never)
+    bool     used;
+  } _policy_cooldown[NOPORTS_POLICY_COOLDOWN_SLOTS];
+
   // Internal methods (mirror the C sshnpd functions)
   void _freeResources();  // free all allocated SDK objects
   bool _authenticate();
@@ -257,6 +278,12 @@ private:
   void _sendPolicyRpcRequest(const char *client_atsign);
   void _handlePolicyResponse(void *message);
   void _cleanupPolicyPending();
+  // DoS throttle: returns true if a request of the given |type| from |atsign|
+  // should be dropped because one was already accepted within
+  // NOPORTS_POLICY_COOLDOWN_MS.  On a non-throttled call it records the
+  // acceptance timestamp for that type (LRU-evicting the oldest entry when the
+  // table is full).  Ping and NPT are throttled independently.
+  bool _policyRateLimited(const char *atsign, NoPortsPolicyPendingType type);
   // Extracts post-auth ping response logic (called directly in manager mode,
   // or from _handlePolicyResponse after a successful policy RPC).
   void _handlePingAuthorized(const char *from_atsign);
