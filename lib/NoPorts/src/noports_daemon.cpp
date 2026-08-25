@@ -52,8 +52,14 @@ extern "C" {
 // Policy-service RPC settings (used in loop(), _startMonitor(), and helpers)
 #define NOPORTS_POLICY_DOMAIN_NS   "auth_checks"
 // ATCLIENT_RPC_NS_RPCS ("__rpcs") is defined in atclient/rpc.h
-// Milliseconds to wait for a policy-service response before aborting.
-#define NOPORTS_POLICY_TIMEOUT_MS  30000
+// Milliseconds to wait for a policy-service response before aborting and
+// releasing the single pending slot.  The timer is reset when the server ACKs
+// (see _handlePolicyResponse), so this bounds the wait after the last sign of
+// progress.  Kept short so a slow/unreachable policy server — or a bogus
+// request that the server never answers — cannot hold the slot for long and
+// stall legitimate checks.  Must stay comfortably above the real policy-server
+// round-trip time under load.
+#define NOPORTS_POLICY_TIMEOUT_MS  10000
 
 // Monotonically increasing counter shared across all policy RPC requests.
 // Each ping AND npt check must use a unique reqId so the Dart AtRpc server's
@@ -115,6 +121,7 @@ NoPortsDaemon::NoPortsDaemon()
     _relays[i].decrypter = NULL;
   }
   memset(&_policy_pending, 0, sizeof(_policy_pending));
+  memset(_policy_cooldown, 0, sizeof(_policy_cooldown));
 }
 
 void NoPortsDaemon::_freeResources() {
@@ -966,6 +973,16 @@ bool NoPortsDaemon::_publishDeviceInfo() {
 // Private: Notification handling (from daemon.c)
 // ============================================================================
 
+// Compare two atSigns for equality, tolerating an optional leading '@' on
+// either operand.  Returns false if either is NULL.  Used to authenticate the
+// sender of policy-service RPC responses.
+static bool _atsign_equals(const char *a, const char *b) {
+  if (a == nullptr || b == nullptr) return false;
+  if (*a == '@') a++;
+  if (*b == '@') b++;
+  return strcmp(a, b) == 0;
+}
+
 void NoPortsDaemon::_handleNotification(void *msg) {
   atclient_monitor_message *message = (atclient_monitor_message *)msg;
 
@@ -980,6 +997,20 @@ void NoPortsDaemon::_handleNotification(void *msg) {
       message->notification->key &&
       atclient_rpc_is_response_key(message->notification->key,
                                      NOPORTS_NS, NOPORTS_POLICY_DOMAIN_NS)) {
+    // SECURITY: only the configured policy atSign may answer auth-check RPCs.
+    // atclient_rpc_is_response_key matches on the namespace pattern ONLY — it
+    // does not bind the response to a sender.  The reqId is a predictable
+    // per-boot counter, so without this check any atSign could forge a
+    // "success" response (authorized=true, permitOpen=["*:*"]) that matches an
+    // in-flight reqId and bypass the policy decision entirely.  The atServer
+    // attests notification->from, so a spoofed sender cannot pass this gate.
+    if (!_atsign_equals(message->notification->from, _config.policy_atsign)) {
+      NOPORTS_LOGW(TAG, "Policy RPC: dropping response-shaped notification from "
+                        "non-policy atSign '%s' (expected '%s')",
+                   message->notification->from ? message->notification->from : "null",
+                   _config.policy_atsign);
+      return;
+    }
     _handlePolicyResponse(msg);
     return;
   }
@@ -1138,6 +1169,12 @@ void NoPortsDaemon::_handlePing(void *msg) {
   // Two modes: manager-list check (default) or policy-service RPC.
   if (_config.policy_atsign && _config.policy_atsign[0] != '\0') {
     // Policy mode — async RPC to the policy service.
+    // Throttle first: a ping needs no signature, so it is the cheapest way to
+    // spend the single policy slot.  Rate-limit per sender before doing so.
+    if (_policyRateLimited(from, NOPORTS_POLICY_PING)) {
+      NOPORTS_LOGW(TAG, "Ping: rate-limited (cooldown) — dropping ping from %s", from);
+      return;
+    }
     if (_policy_pending.in_use) {
       NOPORTS_LOGW(TAG, "Ping: policy check in flight, ignoring ping from %s", from);
       return;
@@ -1172,6 +1209,18 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
   atchops_rsa_key_private_key *skey = (atchops_rsa_key_private_key *)_signing_key;
   int res = 0;
 
+  // Per-sender throttle BEFORE any expensive work.  _verifyEnvelopeSignature
+  // below fetches the sender's public key over the worker (a network round
+  // trip), and any atSign can send an npt_request notification — so rejecting
+  // a flooding sender here means a bogus request never costs a key lookup or a
+  // policy slot.  Applies in both manager and policy modes; notification->from
+  // is atServer-attested and cannot be spoofed.
+  if (_policyRateLimited(message->notification->from, NOPORTS_POLICY_NPT)) {
+    NOPORTS_LOGW(TAG, "NPT: rate-limited (cooldown) — ignoring request from %s",
+                 message->notification->from ? message->notification->from : "null");
+    return;
+  }
+
   // Extract envelope from notification
   if (!atclient_atnotification_is_decrypted_value_initialized(message->notification) ||
       message->notification->decrypted_value == NULL) {
@@ -1198,11 +1247,22 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
   if (_config.policy_atsign && _config.policy_atsign[0] != '\0') {
     // Policy mode: defer auth to the policy service via async RPC.
     // Continuation runs in _handlePolicyResponse → _continueNptRequest.
+    // (Per-sender throttle already applied at the top of this function.)
+
     if (_policy_pending.in_use) {
-      NOPORTS_LOGW(TAG, "NPT: policy check in flight — ignoring request from %s",
-                   requesting_atsign);
-      cJSON_Delete(envelope);
-      return;
+      // NPT is the high-value path; do not let a pending PING check block it.
+      // Preempt an in-flight ping (its late response will be dropped on reqId
+      // mismatch), but never preempt another in-flight NPT.
+      if (_policy_pending.type == NOPORTS_POLICY_PING) {
+        NOPORTS_LOGI(TAG, "NPT: preempting in-flight ping check for %s",
+                     requesting_atsign);
+        _cleanupPolicyPending();
+      } else {
+        NOPORTS_LOGW(TAG, "NPT: policy check in flight — ignoring request from %s",
+                     requesting_atsign);
+        cJSON_Delete(envelope);
+        return;
+      }
     }
     _policy_pending.in_use          = true;
     _policy_pending.type            = NOPORTS_POLICY_NPT;
@@ -1293,6 +1353,63 @@ void NoPortsDaemon::_cleanupPolicyPending() {
   memset(&_policy_pending, 0, sizeof(_policy_pending));
 }
 
+// Per-sender throttle for requests (DoS mitigation).  Returns true when a
+// request of |type| from |atsign| should be dropped because one was already
+// accepted within NOPORTS_POLICY_COOLDOWN_MS.  Otherwise records the acceptance
+// and returns false.  Because the timestamp is only updated on acceptance, a
+// legitimate sender's first request always passes; only rapid repeats of the
+// SAME type are throttled, and the table can never permanently lock anyone out.
+// Ping and NPT use independent timestamps so a ping does not throttle the NPT
+// request that normally follows it.
+bool NoPortsDaemon::_policyRateLimited(const char *atsign,
+                                       NoPortsPolicyPendingType type) {
+  if (!atsign) return false;
+  uint32_t now = millis();
+
+  int free_slot = -1;
+  int oldest_slot = 0;
+  uint32_t oldest_recency = 0xFFFFFFFFUL;  // smallest max(ts) → LRU victim
+
+  for (int i = 0; i < NOPORTS_POLICY_COOLDOWN_SLOTS; i++) {
+    if (_policy_cooldown[i].used) {
+      if (strcmp(_policy_cooldown[i].atsign, atsign) == 0) {
+        uint32_t *ts = (type == NOPORTS_POLICY_PING)
+                         ? &_policy_cooldown[i].last_ping_ms
+                         : &_policy_cooldown[i].last_npt_ms;
+        // *ts == 0 means "never accepted for this type" → not throttled.
+        if (*ts != 0 && (now - *ts) < NOPORTS_POLICY_COOLDOWN_MS) {
+          return true;  // throttled — do NOT refresh the timestamp
+        }
+        *ts = now ? now : 1;  // accepted — start a new window (avoid 0 sentinel)
+        return false;
+      }
+      // Track the least-recently-active entry for LRU eviction.
+      uint32_t recency = _policy_cooldown[i].last_ping_ms > _policy_cooldown[i].last_npt_ms
+                           ? _policy_cooldown[i].last_ping_ms
+                           : _policy_cooldown[i].last_npt_ms;
+      if (recency < oldest_recency) {
+        oldest_recency = recency;
+        oldest_slot = i;
+      }
+    } else if (free_slot < 0) {
+      free_slot = i;
+    }
+  }
+
+  // Not seen — record in a free slot, else evict the least-recently-active (LRU).
+  int slot = (free_slot >= 0) ? free_slot : oldest_slot;
+  memset(&_policy_cooldown[slot], 0, sizeof(_policy_cooldown[slot]));
+  strncpy(_policy_cooldown[slot].atsign, atsign,
+          sizeof(_policy_cooldown[slot].atsign) - 1);
+  _policy_cooldown[slot].atsign[sizeof(_policy_cooldown[slot].atsign) - 1] = '\0';
+  if (type == NOPORTS_POLICY_PING)
+    _policy_cooldown[slot].last_ping_ms = now ? now : 1;
+  else
+    _policy_cooldown[slot].last_npt_ms = now ? now : 1;
+  _policy_cooldown[slot].used = true;
+  return false;
+}
+
 void NoPortsDaemon::_sendPolicyRpcRequest(const char *client_atsign) {
   atclient *worker = (atclient *)_worker_ctx;
   uint32_t req_id  = _policy_pending.req_id;
@@ -1338,6 +1455,15 @@ void NoPortsDaemon::_handlePolicyResponse(void *msg) {
 
   if (!message->notification->key) {
     NOPORTS_LOGW(TAG, "Policy RPC: response with no key");
+    return;
+  }
+
+  // SECURITY (defense in depth): reject any response not sent by the configured
+  // policy atSign.  The primary gate is in _handleNotification, but this keeps
+  // the invariant local so the handler can never authorize on a forged sender.
+  if (!_atsign_equals(message->notification->from, _config.policy_atsign)) {
+    NOPORTS_LOGW(TAG, "Policy RPC: response from non-policy atSign '%s' — ignoring",
+                 message->notification->from ? message->notification->from : "null");
     return;
   }
 

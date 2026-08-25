@@ -27,6 +27,7 @@
 #define NVS_KEY_WEB_LOCAL     "web_local"   // "1" = only accept localhost connections
 #define NVS_KEY_LED_MODE      "led_mode"    // "0"=off "1"=heartbeat "2"=status "3"=full
 #define NVS_KEY_CONFIGURED    "configured"
+#define NVS_KEY_NTP_GOOD      "ntp_good"    // last known-good NTP epoch (monotonic time floor across reboots)
 
 // ─── Filesystem paths ─────────────────────────────────────────────────────
 #define ATKEYS_PATH     "/atkeys.json"           // Arduino LittleFS API path
