@@ -983,6 +983,28 @@ static bool _atsign_equals(const char *a, const char *b) {
   return strcmp(a, b) == 0;
 }
 
+// RSA-encrypt a NUL-terminated base64 key/IV string with the client's
+// ephemeral public key and return the result base64-encoded (malloc'd).
+// Returns NULL on any failure so the caller can reject the whole request
+// instead of sending the client a partial key set.
+static char *_rsa_encrypt_b64(atchops_rsa_key_public_key *pk,
+                              const unsigned char *plaintext) {
+  unsigned char enc_buf[256];
+  if (atchops_rsa_encrypt(pk, plaintext,
+                          strlen((const char *)plaintext), enc_buf) != 0) {
+    return NULL;
+  }
+  char *out = (char *)malloc(384);
+  if (!out) return NULL;
+  memset(out, 0, 384);
+  size_t b64_len;
+  if (atchops_base64_encode(enc_buf, 256, out, 384, &b64_len) != 0) {
+    free(out);
+    return NULL;
+  }
+  return out;
+}
+
 void NoPortsDaemon::_handleNotification(void *msg) {
   atclient_monitor_message *message = (atclient_monitor_message *)msg;
 
@@ -1894,11 +1916,15 @@ void NoPortsDaemon::_continueNptRequest(void *env,
   }
 
   // Handle E2EE (from handler_commons.c setup_rvd_session_encryption)
-  // Daemon generates TWO AES key/IV pairs (C2D + D2C), encrypts them with
-  // client's ephemeral RSA PK, sends encrypted versions in success response,
-  // and uses plaintext versions for control channel encryption.
-  // Twin-key mode: C2D for Client→Daemon, D2C for Daemon→Client
+  // Daemon generates a C2D (Client→Daemon) AES key/IV pair whenever
+  // encryptRvdTraffic is set, and a second D2C (Daemon→Client) pair only
+  // when the client requested twin-key mode via the twinKeys flag — same
+  // as the Dart daemon, so legacy clients get the single-key response
+  // they expect.  Encrypted copies go in the success response; plaintext
+  // copies drive control channel encryption.
   bool encrypt_rvd_traffic = cJSON_IsTrue(cJSON_GetObjectItem(payload, "encryptRvdTraffic"));
+  bool twin_keys = encrypt_rvd_traffic &&
+                   cJSON_IsTrue(cJSON_GetObjectItem(payload, "twinKeys"));
   char *session_aes_key_b64 = NULL;
   char *session_iv_b64 = NULL;
   char *session_aes_key_d2c_b64 = NULL;
@@ -1906,100 +1932,97 @@ void NoPortsDaemon::_continueNptRequest(void *env,
 
   if (encrypt_rvd_traffic) {
     relay_cfg.rv_e2ee = true;
+    bool e2ee_ok = false;
 
-    // Generate C2D session AES key and IV
-    unsigned char aes_key[32], iv[16];
-    memset(aes_key, 0, 32);
-    memset(iv, 0, 16);
-    atchops_aes_generate_key(aes_key, ATCHOPS_AES_256);
-    atchops_iv_generate(iv);
+    do {
+      // Generate C2D session AES key and IV
+      unsigned char aes_key[32], iv[16];
+      memset(aes_key, 0, 32);
+      memset(iv, 0, 16);
+      if (atchops_aes_generate_key(aes_key, ATCHOPS_AES_256) != 0) break;
+      if (atchops_iv_generate(iv) != 0) break;
 
-    // Generate D2C session AES key and IV
-    unsigned char aes_key_d2c[32], iv_d2c[16];
-    memset(aes_key_d2c, 0, 32);
-    memset(iv_d2c, 0, 16);
-    atchops_aes_generate_key(aes_key_d2c, ATCHOPS_AES_256);
-    atchops_iv_generate(iv_d2c);
-
-    // Base64 encode plaintext keys for relay's control channel
-    relay_cfg.session_aes_key = (unsigned char *)malloc(49);
-    relay_cfg.session_iv = (unsigned char *)malloc(25);
-    relay_cfg.session_aes_key_d2c = (unsigned char *)malloc(49);
-    relay_cfg.session_iv_d2c = (unsigned char *)malloc(25);
-
-    if (relay_cfg.session_aes_key && relay_cfg.session_iv &&
-        relay_cfg.session_aes_key_d2c && relay_cfg.session_iv_d2c) {
+      // Base64 encode plaintext keys for relay's control channel
+      relay_cfg.session_aes_key = (unsigned char *)malloc(49);
+      relay_cfg.session_iv = (unsigned char *)malloc(25);
+      if (!relay_cfg.session_aes_key || !relay_cfg.session_iv) break;
+      memset(relay_cfg.session_aes_key, 0, 49);
+      memset(relay_cfg.session_iv, 0, 25);
       size_t len;
       atchops_base64_encode(aes_key, 32, (char *)relay_cfg.session_aes_key, 49, &len);
       atchops_base64_encode(iv, 16, (char *)relay_cfg.session_iv, 25, &len);
-      atchops_base64_encode(aes_key_d2c, 32, (char *)relay_cfg.session_aes_key_d2c, 49, &len);
-      atchops_base64_encode(iv_d2c, 16, (char *)relay_cfg.session_iv_d2c, 25, &len);
 
-      NOPORTS_LOGI(TAG, "NPT: generated twin session keys (C2D + D2C)");
+      if (twin_keys) {
+        // Generate D2C session AES key and IV
+        unsigned char aes_key_d2c[32], iv_d2c[16];
+        memset(aes_key_d2c, 0, 32);
+        memset(iv_d2c, 0, 16);
+        if (atchops_aes_generate_key(aes_key_d2c, ATCHOPS_AES_256) != 0) break;
+        if (atchops_iv_generate(iv_d2c) != 0) break;
+
+        relay_cfg.session_aes_key_d2c = (unsigned char *)malloc(49);
+        relay_cfg.session_iv_d2c = (unsigned char *)malloc(25);
+        if (!relay_cfg.session_aes_key_d2c || !relay_cfg.session_iv_d2c) break;
+        memset(relay_cfg.session_aes_key_d2c, 0, 49);
+        memset(relay_cfg.session_iv_d2c, 0, 25);
+        atchops_base64_encode(aes_key_d2c, 32, (char *)relay_cfg.session_aes_key_d2c, 49, &len);
+        atchops_base64_encode(iv_d2c, 16, (char *)relay_cfg.session_iv_d2c, 25, &len);
+      }
+
+      NOPORTS_LOGI(TAG, "NPT: generated %s session keys",
+                   twin_keys ? "twin (C2D + D2C)" : "single (legacy)");
 
       // Encrypt the session keys with client's ephemeral RSA public key
       cJSON *client_pk = cJSON_GetObjectItem(payload, "clientEphemeralPK");
       cJSON *client_pk_type = cJSON_GetObjectItem(payload, "clientEphemeralPKType");
 
-      if (client_pk && client_pk_type &&
-          strcmp(cJSON_GetStringValue(client_pk_type), "rsa2048") == 0) {
-
-        atchops_rsa_key_public_key ephem_pk;
-        atchops_rsa_key_public_key_init(&ephem_pk);
-
-        char *pk_str = cJSON_GetStringValue(client_pk);
-        res = atchops_rsa_key_populate_public_key(&ephem_pk, pk_str, strlen(pk_str));
-
-        if (res == 0) {
-          unsigned char enc_buf[256];
-
-          // Encrypt C2D AES key
-          res = atchops_rsa_encrypt(&ephem_pk, relay_cfg.session_aes_key,
-                                    strlen((char *)relay_cfg.session_aes_key), enc_buf);
-          if (res == 0) {
-            session_aes_key_b64 = (char *)malloc(384);
-            if (session_aes_key_b64) {
-              size_t b64_len;
-              atchops_base64_encode(enc_buf, 256, session_aes_key_b64, 384, &b64_len);
-            }
-          }
-
-          // Encrypt C2D IV
-          res = atchops_rsa_encrypt(&ephem_pk, relay_cfg.session_iv,
-                                    strlen((char *)relay_cfg.session_iv), enc_buf);
-          if (res == 0) {
-            session_iv_b64 = (char *)malloc(384);
-            if (session_iv_b64) {
-              size_t b64_len;
-              atchops_base64_encode(enc_buf, 256, session_iv_b64, 384, &b64_len);
-            }
-          }
-
-          // Encrypt D2C AES key
-          res = atchops_rsa_encrypt(&ephem_pk, relay_cfg.session_aes_key_d2c,
-                                    strlen((char *)relay_cfg.session_aes_key_d2c), enc_buf);
-          if (res == 0) {
-            session_aes_key_d2c_b64 = (char *)malloc(384);
-            if (session_aes_key_d2c_b64) {
-              size_t b64_len;
-              atchops_base64_encode(enc_buf, 256, session_aes_key_d2c_b64, 384, &b64_len);
-            }
-          }
-
-          // Encrypt D2C IV
-          res = atchops_rsa_encrypt(&ephem_pk, relay_cfg.session_iv_d2c,
-                                    strlen((char *)relay_cfg.session_iv_d2c), enc_buf);
-          if (res == 0) {
-            session_iv_d2c_b64 = (char *)malloc(384);
-            if (session_iv_d2c_b64) {
-              size_t b64_len;
-              atchops_base64_encode(enc_buf, 256, session_iv_d2c_b64, 384, &b64_len);
-            }
-          }
-        }
-
-        atchops_rsa_key_public_key_free(&ephem_pk);
+      if (!cJSON_IsString(client_pk) || !cJSON_IsString(client_pk_type) ||
+          strcmp(cJSON_GetStringValue(client_pk_type), "rsa2048") != 0) {
+        NOPORTS_LOGE(TAG, "NPT: missing or unsupported clientEphemeralPK/PKType");
+        break;
       }
+
+      atchops_rsa_key_public_key ephem_pk;
+      atchops_rsa_key_public_key_init(&ephem_pk);
+
+      char *pk_str = cJSON_GetStringValue(client_pk);
+      if (atchops_rsa_key_populate_public_key(&ephem_pk, pk_str, strlen(pk_str)) != 0) {
+        NOPORTS_LOGE(TAG, "NPT: failed to populate client ephemeral PK");
+        atchops_rsa_key_public_key_free(&ephem_pk);
+        break;
+      }
+
+      session_aes_key_b64 = _rsa_encrypt_b64(&ephem_pk, relay_cfg.session_aes_key);
+      session_iv_b64 = _rsa_encrypt_b64(&ephem_pk, relay_cfg.session_iv);
+      if (twin_keys) {
+        session_aes_key_d2c_b64 = _rsa_encrypt_b64(&ephem_pk, relay_cfg.session_aes_key_d2c);
+        session_iv_d2c_b64 = _rsa_encrypt_b64(&ephem_pk, relay_cfg.session_iv_d2c);
+      }
+      atchops_rsa_key_public_key_free(&ephem_pk);
+
+      e2ee_ok = session_aes_key_b64 && session_iv_b64 &&
+                (!twin_keys || (session_aes_key_d2c_b64 && session_iv_d2c_b64));
+    } while (0);
+
+    if (!e2ee_ok) {
+      // A partial key set would give the client a session that fails
+      // confusingly downstream — reject the whole request instead.
+      NOPORTS_LOGE(TAG, "NPT: session key setup failed, rejecting request");
+      _sendNptError(requesting_atsign, session_id_str,
+                    "Failed to set up session encryption");
+      if (relay_cfg.session_aes_key) free(relay_cfg.session_aes_key);
+      if (relay_cfg.session_iv) free(relay_cfg.session_iv);
+      if (relay_cfg.session_aes_key_d2c) free(relay_cfg.session_aes_key_d2c);
+      if (relay_cfg.session_iv_d2c) free(relay_cfg.session_iv_d2c);
+      if (relay_cfg.relay_auth_aes_key) free(relay_cfg.relay_auth_aes_key);
+      if (relay_cfg.escr_signing_key_uri) free(relay_cfg.escr_signing_key_uri);
+      if (relay_cfg.rvd_auth_string) cJSON_free(relay_cfg.rvd_auth_string);
+      if (session_aes_key_b64) free(session_aes_key_b64);
+      if (session_iv_b64) free(session_iv_b64);
+      if (session_aes_key_d2c_b64) free(session_aes_key_d2c_b64);
+      if (session_iv_d2c_b64) free(session_iv_d2c_b64);
+      cJSON_Delete(envelope);
+      return;
     }
   }
 
@@ -2014,17 +2037,16 @@ void NoPortsDaemon::_continueNptRequest(void *env,
     cJSON *res_payload = cJSON_CreateObject();
     cJSON_AddStringToObject(res_payload, "status", "connected");
     cJSON_AddItemReferenceToObject(res_payload, "sessionId", session_id);
-    if (session_aes_key_b64) {
-      cJSON_AddStringToObject(res_payload, "sessionAESKey", session_aes_key_b64);
-    }
-    if (session_iv_b64) {
-      cJSON_AddStringToObject(res_payload, "sessionIV", session_iv_b64);
-    }
-    if (session_aes_key_d2c_b64) {
+    // Twin mode uses the canonical twin field names; legacy clients get
+    // the old single-key names — same convention as the Dart daemon.
+    if (twin_keys) {
+      cJSON_AddStringToObject(res_payload, "aesKeyC2D", session_aes_key_b64);
+      cJSON_AddStringToObject(res_payload, "ivC2D", session_iv_b64);
       cJSON_AddStringToObject(res_payload, "aesKeyD2C", session_aes_key_d2c_b64);
-    }
-    if (session_iv_d2c_b64) {
       cJSON_AddStringToObject(res_payload, "ivD2C", session_iv_d2c_b64);
+    } else if (encrypt_rvd_traffic) {
+      cJSON_AddStringToObject(res_payload, "sessionAESKey", session_aes_key_b64);
+      cJSON_AddStringToObject(res_payload, "sessionIV", session_iv_b64);
     }
 
     cJSON *res_envelope = cJSON_CreateObject();
