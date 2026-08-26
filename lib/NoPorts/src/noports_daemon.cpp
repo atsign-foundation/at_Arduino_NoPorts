@@ -1993,16 +1993,27 @@ void NoPortsDaemon::_continueNptRequest(void *env,
       }
 
       // The "rsa2048" label above is client-supplied and only names the type;
-      // it does not constrain the actual modulus. atchops_rsa_encrypt writes
-      // exactly the modulus length (n.len) into the fixed 256-byte enc_buf in
-      // _rsa_encrypt_b64, so a key whose real modulus is larger than 2048 bits
-      // (e.g. RSA-4096 -> 512 bytes) would overflow that stack buffer. Enforce
-      // a true 2048-bit modulus before any encryption is attempted.
-      if (ephem_pk.n.len != 256) {
-        NOPORTS_LOGE(TAG, "NPT: client ephemeral PK modulus is not RSA-2048 (n.len=%u)",
-                     (unsigned)ephem_pk.n.len);
-        atchops_rsa_key_public_key_free(&ephem_pk);
-        break;
+      // it does not constrain the actual modulus. atchops_rsa_encrypt imports
+      // the raw modulus via mbedtls, whose ciphertext length is the count of
+      // SIGNIFICANT modulus bytes (leading zeros stripped) — that many bytes
+      // are written into the fixed 256-byte enc_buf in _rsa_encrypt_b64, so a
+      // key whose real modulus is larger than 2048 bits (e.g. RSA-4096 -> 512
+      // bytes) would overflow that stack buffer. Enforce a true 2048-bit
+      // modulus before any encryption is attempted. Note: the DER INTEGER
+      // encoding pads the modulus with a leading 0x00 whenever its MSB is set
+      // (always, for a real modulus), so a valid RSA-2048 key normally arrives
+      // here with n.len == 257 — compare significant bytes, not raw length.
+      {
+        const unsigned char *n_bytes = ephem_pk.n.value;
+        size_t n_sig = ephem_pk.n.len;
+        while (n_sig > 0 && n_bytes[0] == 0x00) { n_bytes++; n_sig--; }
+        if (n_sig != 256) {
+          NOPORTS_LOGE(TAG, "NPT: client ephemeral PK modulus is not RSA-2048 "
+                            "(significant bytes=%u, raw n.len=%u)",
+                       (unsigned)n_sig, (unsigned)ephem_pk.n.len);
+          atchops_rsa_key_public_key_free(&ephem_pk);
+          break;
+        }
       }
 
       session_aes_key_b64 = _rsa_encrypt_b64(&ephem_pk, relay_cfg.session_aes_key);
