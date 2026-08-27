@@ -19,6 +19,6 @@
   "platforms": "espressif32",
   "headers": "NoPorts.h",
   "dependencies": {
-    "atsign/at_client": "0.1.0"
+    "atsign/at_client": "0.1.3"
   }
 }
