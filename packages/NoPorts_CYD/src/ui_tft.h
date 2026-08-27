@@ -26,7 +26,7 @@
 #define TFT_HEIGHT 240
 
 // Application version — shown on every boot/status screen and the dashboard
-#define CYD_APP_VERSION "1.0.1"
+#define CYD_APP_VERSION "1.0.2"
 
 // XPT2046 Touch pins (standard CYD configuration)
 #ifndef TOUCH_CS
