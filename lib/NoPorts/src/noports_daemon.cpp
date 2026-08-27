@@ -239,7 +239,16 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
         return false;
       }
       snprintf(_root_host, sizeof(_root_host), "%.*s", (int)host_len, _config.root_domain);
-      _root_port = (uint16_t)atoi(colon + 1);
+      // atoi silently wraps out-of-range ports (70000 -> 4464) and accepts
+      // trailing garbage (443x) — reject malformed specs instead
+      char *port_end = nullptr;
+      long port_val = strtol(colon + 1, &port_end, 10);
+      if (port_end == colon + 1 || *port_end != '\0' || port_val < 1 || port_val > UINT16_MAX) {
+        _setError("Invalid port in root domain spec");
+        _state = DAEMON_ERROR;
+        return false;
+      }
+      _root_port = (uint16_t)port_val;
     } else {
       snprintf(_root_host, sizeof(_root_host), "%s", _config.root_domain);
       _root_port = NOPORTS_DEFAULT_ROOT_PORT;
