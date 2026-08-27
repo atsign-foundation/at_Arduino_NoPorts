@@ -34,7 +34,7 @@
 #define ATKEYS_PATH_VFS "/littlefs/atkeys.json"  // C fopen() full VFS path
 
 // ─── App version ──────────────────────────────────────────────────────────
-#define POE_APP_VERSION "1.0.0"
+#define POE_APP_VERSION "1.0.1"
 
 // ─── Public API ───────────────────────────────────────────────────────────
 
