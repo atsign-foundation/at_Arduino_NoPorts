@@ -56,19 +56,29 @@ static int  _max_subs      = NOPORTS_MAX_RELAYS;   // 1-NOPORTS_MAX_RELAYS relay
 // Root server spec: host[:port] or proxy:host[:port] for 443-only networks
 static char _root_spec[128] = "";
 static bool _editing_root   = false;
+static int  _cursor         = 0;  // insertion point within _root_spec
+static int  _disp_skip      = 0;  // first visible char when the text overflows
 
 static const char *DEFAULT_ROOT_SPEC = "root.atsign.org";
 
 // Editor keyboard — no SPACE key: spaces are not valid in a root server
-// spec, and the proxy form needs ':' instead.
+// spec, and the proxy form needs ':' instead. Bottom row: cursor arrows,
+// DEL (deletes before the cursor), ':' and DONE — tap the text itself to
+// place the cursor directly.
 static const char* _kb_keys[] = {
   "1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
   "q", "w", "e", "r", "t", "y", "u", "i", "o", "p",
   "a", "s", "d", "f", "g", "h", "j", "k", "l", "@",
   "z", "x", "c", "v", "b", "n", "m", "_", "-", ".",
-  "DEL", ":", "DONE"
+  "<", ">", "DEL", ":", "DONE"
 };
 static const int _kb_key_count = sizeof(_kb_keys) / sizeof(_kb_keys[0]);
+
+// All five bottom-row keys span 2 columns each (5 x 2 = 10 = full row)
+static bool _is_wide_key(const char *k) {
+  return strcmp(k, "<") == 0 || strcmp(k, ">") == 0 ||
+         strcmp(k, "DEL") == 0 || strcmp(k, ":") == 0 || strcmp(k, "DONE") == 0;
+}
 
 // ---------------------------------------------------------------------------
 // Drawing helpers
@@ -216,27 +226,64 @@ static void _draw_screen() {
 // Root server inline editor
 // ---------------------------------------------------------------------------
 
+#define EDITOR_BOX_Y   44
+#define EDITOR_BOX_H   20
+#define EDITOR_TEXT_X  10
+#define EDITOR_MAX_W   (TFT_WIDTH - 26)
+
+// Pixel width of _root_spec[from..to) in font 2
+static int _text_width_range(int from, int to) {
+  char tmp[sizeof(_root_spec)];
+  int n = to - from;
+  if (n <= 0) return 0;
+  memcpy(tmp, _root_spec + from, n);
+  tmp[n] = '\0';
+  return ui_get_tft().textWidth(tmp, 2);
+}
+
 static void _draw_editor_value() {
   TFT_eSPI &tft = ui_get_tft();
-  int y = 44;
+  int len = strlen(_root_spec);
 
-  ui_draw_rounded_rect(5, y, TFT_WIDTH - 10, 20, 4, COLOR_BG_CARD);
+  // Keep the display window valid and the cursor inside it
+  if (_disp_skip > len) _disp_skip = len;
+  if (_cursor < _disp_skip) _disp_skip = _cursor;
+  while (_text_width_range(_disp_skip, _cursor) > EDITOR_MAX_W) _disp_skip++;
 
-  // Show the tail so the cursor position stays visible
-  const char *text = _root_spec;
-  int max_w = TFT_WIDTH - 26;
-  int skip = 0;
-  while (tft.textWidth(text + skip, 2) > max_w && text[skip]) skip++;
+  ui_draw_rounded_rect(5, EDITOR_BOX_Y, TFT_WIDTH - 10, EDITOR_BOX_H, 4, COLOR_BG_CARD);
+
+  // Visible portion, clipped to the box width
+  char visible[sizeof(_root_spec)];
+  strncpy(visible, _root_spec + _disp_skip, sizeof(visible) - 1);
+  visible[sizeof(visible) - 1] = '\0';
+  while (tft.textWidth(visible, 2) > EDITOR_MAX_W && visible[0]) {
+    visible[strlen(visible) - 1] = '\0';
+  }
 
   tft.setTextColor(COLOR_TEXT_WHITE, COLOR_BG_CARD);
   tft.setTextDatum(ML_DATUM);
   tft.setTextSize(1);
-  tft.drawString(text + skip, 10, y + 10, 2);
+  tft.drawString(visible, EDITOR_TEXT_X, EDITOR_BOX_Y + EDITOR_BOX_H / 2, 2);
 
-  // Cursor
-  int cx = 10 + tft.textWidth(text + skip, 2);
+  // Cursor at the insertion point
+  int cx = EDITOR_TEXT_X + _text_width_range(_disp_skip, _cursor);
   if (cx > TFT_WIDTH - 12) cx = TFT_WIDTH - 12;
-  tft.drawLine(cx, y + 3, cx, y + 17, COLOR_PRIMARY);
+  tft.drawLine(cx, EDITOR_BOX_Y + 3, cx, EDITOR_BOX_Y + EDITOR_BOX_H - 3, COLOR_PRIMARY);
+}
+
+// Tap inside the value box → move the cursor to the tapped character
+static void _editor_place_cursor(int16_t tx) {
+  int len = strlen(_root_spec);
+  int best = len;
+  int best_dist = 0x7FFF;
+  for (int i = _disp_skip; i <= len; i++) {
+    int cx = EDITOR_TEXT_X + _text_width_range(_disp_skip, i);
+    if (cx > TFT_WIDTH - 10) break;
+    int dist = abs((int)tx - cx);
+    if (dist < best_dist) { best_dist = dist; best = i; }
+  }
+  _cursor = best;
+  _draw_editor_value();
 }
 
 static void _draw_editor_keyboard() {
@@ -252,15 +299,12 @@ static void _draw_editor_keyboard() {
     int x = x_start + col * (KEY_WIDTH + KEY_SPACING);
     int y = KB_TOP_Y + row * (KEY_HEIGHT + KEY_SPACING) + 2;
 
-    // Wide keys: DEL=3cols, ':'=4cols, DONE=3cols (total 10 = full row)
+    // Bottom-row keys each span 2 columns (5 keys = full row)
     int key_w = KEY_WIDTH;
     int col_span = 1;
-    if (strcmp(_kb_keys[i], "DEL") == 0 || strcmp(_kb_keys[i], "DONE") == 0) {
-      key_w = KEY_WIDTH * 3 + KEY_SPACING * 2;
-      col_span = 3;
-    } else if (strcmp(_kb_keys[i], ":") == 0) {
-      key_w = KEY_WIDTH * 4 + KEY_SPACING * 3;
-      col_span = 4;
+    if (_is_wide_key(_kb_keys[i])) {
+      key_w = KEY_WIDTH * 2 + KEY_SPACING;
+      col_span = 2;
     }
 
     uint16_t bg = (strcmp(_kb_keys[i], "DONE") == 0) ? COLOR_SUCCESS : COLOR_BUTTON_BG;
@@ -289,15 +333,21 @@ static void _draw_editor_screen() {
   tft.setTextColor(COLOR_TEXT_GREY, COLOR_BG_DARK);
   tft.setTextDatum(TL_DATUM);
   tft.setTextSize(1);
-  tft.drawString("atDirectory host, optional :port (default 64).", 8, 72, 1);
-  tft.drawString("proxy:host:port connects the atServer via a", 8, 84, 1);
-  tft.drawString("reverse proxy - for 443-only networks, e.g.", 8, 96, 1);
-  tft.drawString("proxy:proxy0001.atsign.org:443", 8, 108, 1);
+  tft.drawString("Tap the text to place the cursor; < > nudge it.", 8, 72, 1);
+  tft.drawString("atDirectory host, optional :port (default 64).", 8, 84, 1);
+  tft.drawString("proxy:host:port uses a reverse proxy instead -", 8, 96, 1);
+  tft.drawString("443-only networks, e.g. proxy:proxy0001.atsign.org:443", 8, 108, 1);
 
   _draw_editor_keyboard();
 }
 
 static bool _check_editor_press(int16_t tx, int16_t ty) {
+  // Tap in the value box — place the cursor at the tapped character
+  if (ui_touch_in_rect(tx, ty, 5, EDITOR_BOX_Y - 3, TFT_WIDTH - 10, EDITOR_BOX_H + 6)) {
+    _editor_place_cursor(tx);
+    return true;
+  }
+
   int key_idx = 0;
   int row = 0;
   int x_start = 5;
@@ -309,27 +359,38 @@ static bool _check_editor_press(int16_t tx, int16_t ty) {
 
     int key_w = KEY_WIDTH;
     int col_span = 1;
-    if (strcmp(_kb_keys[i], "DEL") == 0 || strcmp(_kb_keys[i], "DONE") == 0) {
-      key_w = KEY_WIDTH * 3 + KEY_SPACING * 2;
-      col_span = 3;
-    } else if (strcmp(_kb_keys[i], ":") == 0) {
-      key_w = KEY_WIDTH * 4 + KEY_SPACING * 3;
-      col_span = 4;
+    if (_is_wide_key(_kb_keys[i])) {
+      key_w = KEY_WIDTH * 2 + KEY_SPACING;
+      col_span = 2;
     }
 
     if (ui_touch_in_rect(tx, ty, x, y, key_w, KEY_HEIGHT)) {
-      size_t len = strlen(_root_spec);
+      int len = strlen(_root_spec);
 
-      if (strcmp(_kb_keys[i], "DEL") == 0) {
-        if (len > 0) _root_spec[len - 1] = '\0';
+      if (strcmp(_kb_keys[i], "<") == 0) {
+        if (_cursor > 0) _cursor--;
+        _draw_editor_value();
+      } else if (strcmp(_kb_keys[i], ">") == 0) {
+        if (_cursor < len) _cursor++;
+        _draw_editor_value();
+      } else if (strcmp(_kb_keys[i], "DEL") == 0) {
+        // Delete the character before the cursor
+        if (_cursor > 0) {
+          memmove(_root_spec + _cursor - 1, _root_spec + _cursor,
+                  len - _cursor + 1);  // +1 moves the NUL too
+          _cursor--;
+        }
         _draw_editor_value();
       } else if (strcmp(_kb_keys[i], "DONE") == 0) {
         _editing_root = false;
         _draw_screen();
       } else {
-        if (len < sizeof(_root_spec) - 1) {
-          _root_spec[len] = _kb_keys[i][0];
-          _root_spec[len + 1] = '\0';
+        // Insert at the cursor
+        if (len < (int)sizeof(_root_spec) - 1) {
+          memmove(_root_spec + _cursor + 1, _root_spec + _cursor,
+                  len - _cursor + 1);  // +1 moves the NUL too
+          _root_spec[_cursor] = _kb_keys[i][0];
+          _cursor++;
         }
         _draw_editor_value();
       }
@@ -428,6 +489,8 @@ bool ui_config_handle_touch(int16_t tx, int16_t ty) {
   y = _root_row_y();
   if (ui_touch_in_rect(tx, ty, 3, y, TFT_WIDTH - 6, ROW_H)) {
     _editing_root = true;
+    _cursor = strlen(_root_spec);
+    _disp_skip = 0;
     _draw_editor_screen();
     return true;
   }
