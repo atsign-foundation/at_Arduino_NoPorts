@@ -56,6 +56,11 @@ void setup() {
   config.manager_list[0] = MANAGER_ATSIGN;
   config.manager_count   = 1;
 
+  // Optional root server spec (default root.atsign.org:64). On networks
+  // where only port 443 egress is allowed, use a protocol-aware reverse
+  // proxy instead — no atDirectory lookup is made:
+  //   config.root_domain = "proxy:proxy0001.atsign.org:443";
+
   // Load keys from SPIFFS
   int res = noports_keys_load_from_file(&config, "/atkeys.json");
   if (res != 0) {

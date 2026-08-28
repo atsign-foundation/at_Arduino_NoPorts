@@ -245,6 +245,11 @@ static void _handle_setup_get() {
   b += "<label>PermitOpen rules <span style='color:#E84040'>*</span>";
   b += "<input id=po placeholder='localhost:22,localhost:2222'></label>";
   b += "<p class=hint>host:port pairs this device will relay. Use *:0 to allow all.</p>";
+  b += "<label>Root server<input id=root placeholder='root.atsign.org' value='";
+  b += nvs_load(NVS_KEY_ROOT); b += "'></label>";
+  b += "<p class=hint>Leave blank for root.atsign.org. Optional :port (default 64). "
+       "On 443-only networks use a reverse proxy with the proxy: prefix, "
+       "e.g. proxy:proxy0001.atsign.org:443 &mdash; skips the atDirectory entirely.</p>";
   b += "<div id=msg></div>";
   b += "<div class=btns><button class='btn pr' onclick=save()>Save &amp; Enrol</button></div>";
   b += "</div>";
@@ -254,13 +259,14 @@ static void _handle_setup_get() {
        "var at=document.getElementById('at').value.trim(),"
        "dev=document.getElementById('dev').value.trim(),"
        "mgrs=document.getElementById('mgrs').value.trim(),"
-       "po=document.getElementById('po').value.trim();"
+       "po=document.getElementById('po').value.trim(),"
+       "root=document.getElementById('root').value.trim();"
        "if(!at||!dev||!mgrs||!po){"
-       "document.getElementById('msg').innerHTML='<div class=\"msg err\">All fields are required.</div>';"
+       "document.getElementById('msg').innerHTML='<div class=\"msg err\">All fields marked * are required.</div>';"
        "return;}"
        "fetch('/api/setup',{method:'POST',"
        "headers:{'Content-Type':'application/json'},"
-       "body:JSON.stringify({at:at,device:dev,managers:mgrs,permitopen:po})})"
+       "body:JSON.stringify({at:at,device:dev,managers:mgrs,permitopen:po,root:root})})"
        ".then(r=>r.json()).then(d=>{"
        "if(d.ok)location.href='/enroll';"
        "else document.getElementById('msg').innerHTML='<div class=\"msg err\">'+d.error+'</div>';"
@@ -290,6 +296,7 @@ static void _handle_setup_post() {
   String dev  = extract("device");
   String mgrs = extract("managers");
   String po   = extract("permitopen");
+  String root = extract("root");
 
   if (at.isEmpty() || dev.isEmpty() || mgrs.isEmpty() || po.isEmpty()) {
     return _send_json(400, "{\"ok\":false,\"error\":\"Missing fields\"}");
@@ -300,6 +307,7 @@ static void _handle_setup_post() {
   nvs_save(NVS_KEY_MANAGERS,  mgrs.c_str());
   nvs_save(NVS_KEY_MANAGER,   mgrs.c_str());  // legacy key
   nvs_save(NVS_KEY_PERMITOPEN, po.c_str());
+  nvs_save(NVS_KEY_ROOT,      root.c_str());   // "" → root.atsign.org
   nvs_save(NVS_KEY_RULES_MODE, "0");           // managers mode
 
   Serial.printf("[web] Setup saved: %s / %s\n", at.c_str(), dev.c_str());
@@ -308,7 +316,7 @@ static void _handle_setup_post() {
 
 // ─── Enrollment (/enroll  +  /api/enroll  +  /api/enroll-status) ─────────
 
-static const char *ROOT_DOMAIN      = "root.atsign.org";
+static const char *DEFAULT_ROOT_SPEC = "root.atsign.org";
 static const char *ENROLL_APP_NAME  = "noports";
 static const char *ENROLL_NS        = "sshnp:rw,sshrvd:rw";
 
@@ -369,6 +377,7 @@ struct EnrollTaskArgs {
   char          atsign[64];
   char          device[64];
   char          otp[32];
+  char          root[128];  // root server spec, e.g. "proxy:proxy0001.atsign.org:443"
   EnrollStatus *enroll;  // pointer back to shared status struct
 };
 
@@ -376,7 +385,7 @@ static void _enroll_task(void *param) {
   EnrollTaskArgs *a = (EnrollTaskArgs *)param;
   EnrollStatus   *e = a->enroll;
 
-  Serial.printf("[enroll] atsign=%s device=%s\n", a->atsign, a->device);
+  Serial.printf("[enroll] atsign=%s device=%s root=%s\n", a->atsign, a->device, a->root);
 
   if (!LittleFS.begin(true)) {
     strlcpy(e->message, "LittleFS mount failed", sizeof(e->message));
@@ -386,7 +395,7 @@ static void _enroll_task(void *param) {
   if (LittleFS.exists(ATKEYS_PATH)) LittleFS.remove(ATKEYS_PATH);
 
   int ret = atauth_enroll_command(
-    a->atsign, ROOT_DOMAIN, ATKEYS_PATH_VFS,
+    a->atsign, a->root, ATKEYS_PATH_VFS,
     a->otp, ENROLL_APP_NAME, a->device, ENROLL_NS, nullptr
   );
 
@@ -437,6 +446,8 @@ static void _handle_enroll_post() {
   strlcpy(args->atsign, nvs_load(NVS_KEY_ATSIGN).c_str(), sizeof(args->atsign));
   strlcpy(args->device, nvs_load(NVS_KEY_DEVICE).c_str(),  sizeof(args->device));
   strlcpy(args->otp,    otp.c_str(),                        sizeof(args->otp));
+  String root = nvs_load(NVS_KEY_ROOT);
+  strlcpy(args->root, root.length() ? root.c_str() : DEFAULT_ROOT_SPEC, sizeof(args->root));
   args->enroll = _enroll;
 
   xTaskCreatePinnedToCore(_enroll_task, "enroll", 32768, args, 5, nullptr, 1);
@@ -465,6 +476,7 @@ static void _handle_settings_get() {
   if (mgrs.isEmpty()) mgrs = nvs_load(NVS_KEY_MANAGER);
   String po      = nvs_load(NVS_KEY_PERMITOPEN);
   String pol_at  = nvs_load(NVS_KEY_POLICY_AT);
+  String root    = nvs_load(NVS_KEY_ROOT);
 
   String b;
   b.reserve(2048);
@@ -492,6 +504,11 @@ static void _handle_settings_get() {
   b += "<p class=hint>This atSign service handles authorization via RPC.</p>";
   b += "</div>";
 
+  b += "<label>Root server<input id=root placeholder='root.atsign.org' value='"; b += root; b += "'></label>";
+  b += "<p class=hint>Leave blank for root.atsign.org. Optional :port (default 64). "
+       "On 443-only networks use a reverse proxy with the proxy: prefix, "
+       "e.g. proxy:proxy0001.atsign.org:443 &mdash; skips the atDirectory entirely.</p>";
+
   b += "<div id=msg></div>";
   b += "<div class=btns>"
        "<button class='btn pr' onclick=save()>Save</button>"
@@ -507,12 +524,13 @@ static void _handle_settings_get() {
        "var mode=document.getElementById('mode').value,"
        "mgrs=document.getElementById('mgrs').value.replace(/\\n/g,','),"
        "po=document.getElementById('po').value.replace(/\\n/g,','),"
-       "pol=document.getElementById('pol_at').value.trim();"
+       "pol=document.getElementById('pol_at').value.trim(),"
+       "root=document.getElementById('root').value.trim();"
        "if(mode==='0'){var m=mgrs.trim();if(!m||m.indexOf('@')<0){"
        "document.getElementById('msg').innerHTML='<div class=\"msg err\">At least one manager atSign (starting with @) is required</div>';return;}}"
        "fetch('/api/settings',{method:'POST',"
        "headers:{'Content-Type':'application/json'},"
-       "body:JSON.stringify({mode:mode,managers:mgrs,permitopen:po,policy_at:pol})})"
+       "body:JSON.stringify({mode:mode,managers:mgrs,permitopen:po,policy_at:pol,root:root})})"
        ".then(r=>r.json()).then(d=>{"
        "if(d.ok){"
        "document.getElementById('msg').innerHTML='<div class=\"msg ok\">Saved. Restarting daemon&#8230;</div>';"
@@ -541,6 +559,7 @@ static void _handle_settings_post() {
   String mgrs = extract("managers");
   String po   = extract("permitopen");
   String pol  = extract("policy_at");
+  String root = extract("root");
 
   if (mode != "1") {
     String m = mgrs; m.trim();
@@ -557,6 +576,7 @@ static void _handle_settings_post() {
     nvs_save(NVS_KEY_MANAGER,   mgrs.c_str());
     nvs_save(NVS_KEY_PERMITOPEN, po.c_str());
   }
+  nvs_save(NVS_KEY_ROOT, root.c_str());  // "" → root.atsign.org
 
   Serial.println("[web] Settings saved — daemon restart deferred to loop()");
   _send_json(200, "{\"ok\":true}");

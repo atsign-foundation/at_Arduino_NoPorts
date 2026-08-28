@@ -15,7 +15,7 @@ extern "C" {
 // ---------------------------------------------------------------------------
 // Enrollment constants
 // ---------------------------------------------------------------------------
-static const char *ROOT_DOMAIN      = "root.atsign.org";
+static const char *DEFAULT_ROOT_SPEC = "root.atsign.org";
 static const char *ENROLL_APP_NAME   = "noports";
 static const char *ENROLL_NAMESPACES = "sshnp:rw,sshrvd:rw";
 
@@ -40,16 +40,18 @@ static char _atsign[64] = "";
 static char _device_name[64] = "";
 static char _otp[16] = "";
 static char _manager[64] = "";
-static int _active_field = 0;  // 0=atsign, 1=device, 2=otp, 3=manager
+static char _root[128] = "";  // root server spec: host[:port] or proxy:host[:port]
+static int _active_field = 0;  // 0=atsign, 1=device, 2=otp, 3=manager, 4=root
 static String _status_msg;
 
-// Simple keyboard (similar to WiFi screen)
+// Simple keyboard (similar to WiFi screen). No SPACE key: spaces are not
+// valid in any field, and the root server spec needs ':' instead.
 static const char* _kb_keys[] = {
   "1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
   "q", "w", "e", "r", "t", "y", "u", "i", "o", "p",
   "a", "s", "d", "f", "g", "h", "j", "k", "l", "@",
   "z", "x", "c", "v", "b", "n", "m", "_", "-", ".",
-  "DEL", "SPACE", "DONE"
+  "DEL", ":", "DONE"
 };
 static const int _kb_key_count = sizeof(_kb_keys) / sizeof(_kb_keys[0]);
 
@@ -68,6 +70,7 @@ static char* _get_active_buffer() {
     case 1: return _device_name;
     case 2: return _otp;
     case 3: return _manager;
+    case 4: return _root;
     default: return nullptr;
   }
 }
@@ -83,6 +86,7 @@ static size_t _get_active_buffer_maxlen() {
     case 1: return sizeof(_device_name) - 1;
     case 2: return sizeof(_otp) - 1;
     case 3: return sizeof(_manager) - 1;
+    case 4: return sizeof(_root) - 1;
     default: return 0;
   }
 }
@@ -98,35 +102,35 @@ static void _draw_form() {
   tft.setTextSize(1);
   tft.drawString("Enrollment", TFT_WIDTH / 2, 5, 4);
   
-  // Fields
-  const char *labels[] = {"atSign:", "Device:", "OTP:", "Manager:"};
-  char *buffers[] = {_atsign, _device_name, _otp, _manager};
-  
-  int y = 35;
-  for (int i = 0; i < 4; i++) {
+  // Fields — 5 rows squeezed between the header and the keyboard (y 33..121)
+  const char *labels[] = {"atSign:", "Device:", "OTP:", "Manager:", "Root:"};
+  char *buffers[] = {_atsign, _device_name, _otp, _manager, _root};
+
+  int y = 33;
+  for (int i = 0; i < 5; i++) {
     // Label
     tft.setTextColor(COLOR_TEXT_GREY);
     tft.setTextDatum(TL_DATUM);
     tft.setTextSize(1);
     tft.drawString(labels[i], 5, y, 2);
-    
+
     // Field background
     uint16_t bg_color = (i == _active_field) ? COLOR_BG_CARD : 0x2104;
-    ui_draw_rounded_rect(75, y - 2, TFT_WIDTH - 80, 18, 4, bg_color);
-    
+    ui_draw_rounded_rect(75, y - 2, TFT_WIDTH - 80, 16, 4, bg_color);
+
     // Field text
     tft.setTextColor(COLOR_TEXT_WHITE);
     tft.setTextDatum(ML_DATUM);
-    tft.drawString(buffers[i], 80, y + 7, 2);
-    
+    tft.drawString(buffers[i], 80, y + 6, 2);
+
     // Cursor on active field
     if (i == _active_field) {
       int tw = tft.textWidth(buffers[i], 2);
       int cursor_x = 80 + tw;
-      tft.drawLine(cursor_x, y + 1, cursor_x, y + 14, COLOR_PRIMARY);
+      tft.drawLine(cursor_x, y, cursor_x, y + 12, COLOR_PRIMARY);
     }
-    
-    y += 22;
+
+    y += 18;
   }
   
   // Note: Enroll button drawn separately at top-right. See _draw_enroll_button().
@@ -173,20 +177,20 @@ static void _draw_keyboard() {
     int x = x_start + col * (KEY_WIDTH + KEY_SPACING);
     int y = kb_start_y + row * (KEY_HEIGHT + KEY_SPACING) + 2;
     
-    // Wide keys: DEL=3cols, SPACE=4cols, DONE=3cols (total 10 = full row)
+    // Wide keys: DEL=3cols, ':'=4cols, DONE=3cols (total 10 = full row)
     int key_w = KEY_WIDTH;
     int col_span = 1;
     if (strcmp(_kb_keys[i], "DEL") == 0) {
       key_w = KEY_WIDTH * 3 + KEY_SPACING * 2;
       col_span = 3;
-    } else if (strcmp(_kb_keys[i], "SPACE") == 0) {
+    } else if (strcmp(_kb_keys[i], ":") == 0) {
       key_w = KEY_WIDTH * 4 + KEY_SPACING * 3;
       col_span = 4;
     } else if (strcmp(_kb_keys[i], "DONE") == 0) {
       key_w = KEY_WIDTH * 3 + KEY_SPACING * 2;
       col_span = 3;
     }
-    
+
     ui_draw_rounded_rect(x, y, key_w, KEY_HEIGHT, 3, COLOR_BUTTON_BG);
     
     tft.setTextColor(COLOR_TEXT_WHITE);
@@ -213,39 +217,34 @@ static bool _check_keyboard_press(int16_t tx, int16_t ty) {
     int x = x_start + col * (KEY_WIDTH + KEY_SPACING);
     int y = kb_start_y + row * (KEY_HEIGHT + KEY_SPACING) + 2;
     
-    // Wide keys: DEL=3cols, SPACE=4cols, DONE=3cols
+    // Wide keys: DEL=3cols, ':'=4cols, DONE=3cols
     int key_w = KEY_WIDTH;
     int col_span = 1;
     if (strcmp(_kb_keys[i], "DEL") == 0) {
       key_w = KEY_WIDTH * 3 + KEY_SPACING * 2;
       col_span = 3;
-    } else if (strcmp(_kb_keys[i], "SPACE") == 0) {
+    } else if (strcmp(_kb_keys[i], ":") == 0) {
       key_w = KEY_WIDTH * 4 + KEY_SPACING * 3;
       col_span = 4;
     } else if (strcmp(_kb_keys[i], "DONE") == 0) {
       key_w = KEY_WIDTH * 3 + KEY_SPACING * 2;
       col_span = 3;
     }
-    
+
     if (ui_touch_in_rect(tx, ty, x, y, key_w, KEY_HEIGHT)) {
       char *buf = _get_active_buffer();
       if (!buf) return false;
-      
+
       int len = _get_active_buffer_len();
       size_t maxlen = _get_active_buffer_maxlen();
-      
+
       if (strcmp(_kb_keys[i], "DEL") == 0) {
         if (len > 0) {
           buf[len - 1] = '\0';
         }
-      } else if (strcmp(_kb_keys[i], "SPACE") == 0) {
-        if (len < maxlen) {
-          buf[len] = ' ';
-          buf[len + 1] = '\0';
-        }
       } else if (strcmp(_kb_keys[i], "DONE") == 0) {
         // Move to next field; if on last field, stop advancing
-        if (_active_field < 3) {
+        if (_active_field < 4) {
           _active_field++;
         }
       } else {
@@ -274,15 +273,16 @@ static bool _check_keyboard_press(int16_t tx, int16_t ty) {
 
 static void _start_enrollment() {
   // Validate fields
-  if (strlen(_atsign) == 0 || strlen(_device_name) == 0 || 
+  if (strlen(_atsign) == 0 || strlen(_device_name) == 0 ||
       strlen(_otp) == 0 || strlen(_manager) == 0) {
     _status_msg = "All fields required!";
+    // Draw the error over the header title; the next redraw restores it
     TFT_eSPI &tft = ui_get_tft();
-    tft.fillRect(0, 30, TFT_WIDTH, 20, COLOR_BG_DARK);
+    tft.fillRect(0, 0, TFT_WIDTH - 90, 28, COLOR_BG_DARK);
     tft.setTextColor(COLOR_ERROR);
-    tft.setTextDatum(TC_DATUM);
+    tft.setTextDatum(TL_DATUM);
     tft.setTextSize(1);
-    tft.drawString(_status_msg.c_str(), TFT_WIDTH / 2, 30, 2);
+    tft.drawString(_status_msg.c_str(), 5, 8, 2);
     return;
   }
   
@@ -304,6 +304,10 @@ static void _start_enrollment() {
   ui_save_string(NVS_KEY_DEVICE, _device_name);
   ui_save_string(NVS_KEY_MANAGER, _manager);
   ui_save_string(NVS_KEY_MANAGERS, _manager);  // also save to new multi-manager key
+  // Persist the root spec only when it differs from the default, so a
+  // default-valued field doesn't shadow a future default change
+  ui_save_string(NVS_KEY_ROOT,
+                 (strcmp(_root, DEFAULT_ROOT_SPEC) == 0) ? "" : _root);
   
   Serial.printf("[ui_enroll] Starting enrollment for %s\n", _atsign);
   Serial.printf("[ui_enroll] Free heap: %u bytes, largest block: %u bytes\n",
@@ -315,8 +319,9 @@ static void _start_enrollment() {
     char device[64];
     char otp[32];
     char manager[64];
+    char root[128];
   };
-  
+
   EnrollTaskArgs *args = (EnrollTaskArgs *)malloc(sizeof(EnrollTaskArgs));
   if (!args) {
     _state = ENROLL_FAILED;
@@ -327,10 +332,12 @@ static void _start_enrollment() {
   strncpy(args->device,  _device_name,  sizeof(args->device) - 1);
   strncpy(args->otp,     _otp,          sizeof(args->otp) - 1);
   strncpy(args->manager, _manager,      sizeof(args->manager) - 1);
+  strncpy(args->root, strlen(_root) ? _root : DEFAULT_ROOT_SPEC, sizeof(args->root) - 1);
   args->atsign[sizeof(args->atsign) - 1]   = '\0';
   args->device[sizeof(args->device) - 1]   = '\0';
   args->otp[sizeof(args->otp) - 1]         = '\0';
   args->manager[sizeof(args->manager) - 1] = '\0';
+  args->root[sizeof(args->root) - 1]       = '\0';
   
   // Run enrollment on a separate FreeRTOS task because it does:
   //   - TLS handshake (mbedtls, needs large stack)
@@ -341,8 +348,8 @@ static void _start_enrollment() {
     [](void *param) {
       EnrollTaskArgs *a = (EnrollTaskArgs *)param;
       
-      Serial.printf("[enroll_task] atsign=%s device=%s otp=%s\n",
-                    a->atsign, a->device, a->otp);
+      Serial.printf("[enroll_task] atsign=%s device=%s otp=%s root=%s\n",
+                    a->atsign, a->device, a->otp, a->root);
       
       // Ensure LittleFS is available for writing atKeys
       if (!LittleFS.begin(true)) {
@@ -366,7 +373,7 @@ static void _start_enrollment() {
       // The Arduino LittleFS API auto-prepends /littlefs, but fopen() does not.
       int ret = atauth_enroll_command(
         a->atsign,           // @alice
-        ROOT_DOMAIN,         // root.atsign.org
+        a->root,             // root spec: host[:port] or proxy:host[:port]
         ATKEYS_PATH_VFS,     // /littlefs/atkeys.json (full VFS path for C fopen)
         a->otp,              // OTP/passcode
         ENROLL_APP_NAME,     // "noports"
@@ -412,6 +419,13 @@ void ui_enroll_create(void (*on_enrolled)()) {
   memset(_device_name, 0, sizeof(_device_name));
   memset(_otp, 0, sizeof(_otp));
   memset(_manager, 0, sizeof(_manager));
+
+  // Prefill root spec: previously saved value, else the default directory.
+  // Editable for 443-only networks, e.g. "proxy:proxy0001.atsign.org:443".
+  String saved_root = ui_load_string(NVS_KEY_ROOT);
+  strncpy(_root, saved_root.length() ? saved_root.c_str() : DEFAULT_ROOT_SPEC,
+          sizeof(_root) - 1);
+  _root[sizeof(_root) - 1] = '\0';
   
   _draw_form();
   _draw_enroll_button();
@@ -523,17 +537,17 @@ bool ui_enroll_handle_touch(int16_t tx, int16_t ty) {
     }
   }
   
-  // Check field selection (35, 57, 79, 101)
-  int y = 35;
-  for (int i = 0; i < 4; i++) {
-    if (ui_touch_in_rect(tx, ty, 75, y - 2, TFT_WIDTH - 80, 18)) {
+  // Check field selection (33, 51, 69, 87, 105)
+  int y = 33;
+  for (int i = 0; i < 5; i++) {
+    if (ui_touch_in_rect(tx, ty, 75, y - 2, TFT_WIDTH - 80, 16)) {
       _active_field = i;
       _draw_form();
       _draw_enroll_button();
       _draw_keyboard();
       return true;
     }
-    y += 22;
+    y += 18;
   }
   
   // Check keyboard

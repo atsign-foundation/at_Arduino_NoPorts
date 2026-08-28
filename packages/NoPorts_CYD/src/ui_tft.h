@@ -26,7 +26,7 @@
 #define TFT_HEIGHT 240
 
 // Application version — shown on every boot/status screen and the dashboard
-#define CYD_APP_VERSION "1.0.2"
+#define CYD_APP_VERSION "1.1.0"
 
 // XPT2046 Touch pins (standard CYD configuration)
 #ifndef TOUCH_CS
@@ -106,6 +106,7 @@ struct UiEvent {
 #define NVS_KEY_RULES_MODE  "rules_mode"  // "0" = managers list, "1" = policy atSign
 #define NVS_KEY_POLICY_AT   "policy_at"   // single policy-service atSign e.g. "@mypolicy"
 #define NVS_KEY_WORKER_KEEPALIVE "worker_ka"  // worker TLS keepalive interval in minutes (0=off)
+#define NVS_KEY_ROOT        "root_spec"   // root server spec: host[:port] or proxy:host[:port]; "" = root.atsign.org
 #define NVS_KEY_MAX_RELAYS       "max_relays"  // max relay sub-connections per session (1-5 on ESP32, 1-6 on S3)
 
 #define PERMITOPEN_PATH   "/permitopen.json"

@@ -108,6 +108,11 @@ struct NoPortsConfig {
   uint8_t     manager_count;
 
   // Optional
+  // Root server spec (Dart AtRootDomain / at_lookup convention):
+  //   host / host:port         → atDirectory lookup (default port 64)
+  //   proxy:host[:port]        → no atDirectory: the atServer address is the
+  //                              reverse proxy itself, for 443-only networks
+  //                              e.g. "proxy:proxy0001.atsign.org:443"
   const char *root_domain;     // NULL → NOPORTS_DEFAULT_ROOT_HOST
   uint16_t    root_port;       // 0   → NOPORTS_DEFAULT_ROOT_PORT
 

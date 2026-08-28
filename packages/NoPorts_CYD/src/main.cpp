@@ -228,6 +228,7 @@ static bool start_daemon() {
   static String policy_at;
   static String permitopen_raw;
   static String po_items[NOPORTS_MAX_PERMITOPEN];
+  static String root_spec;
 
   atsign  = ui_load_string(NVS_KEY_ATSIGN);
   device  = ui_load_string(NVS_KEY_DEVICE);
@@ -264,6 +265,10 @@ static bool start_daemon() {
   noports_config_init(&config);
   config.atsign      = atsign.c_str();
   config.device_name = device.c_str();
+
+  // Root server spec: host[:port] or proxy:host[:port]; empty → root.atsign.org:64
+  root_spec = ui_load_string(NVS_KEY_ROOT);
+  if (root_spec.length() > 0) config.root_domain = root_spec.c_str();
 
   if (policy_mode) {
     // Delegate authorisation to the policy service
