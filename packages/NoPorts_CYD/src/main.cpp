@@ -367,10 +367,14 @@ static void _do_reset() {
     }
   }
   
-  // Clear enrollment config from NVS
+  // Clear enrollment + rules config from NVS — a wipe is a factory reset
   ui_save_string(NVS_KEY_ATSIGN, "");
   ui_save_string(NVS_KEY_DEVICE, "");
   ui_save_string(NVS_KEY_MANAGER, "");
+  ui_save_string(NVS_KEY_MANAGERS, "");
+  ui_save_string(NVS_KEY_PERMITOPEN, "");
+  ui_save_string(NVS_KEY_POLICY_AT, "");
+  ui_save_string(NVS_KEY_RULES_MODE, "");
   ui_save_string(NVS_KEY_ROOT, "");  // back to root.atsign.org
   ui_set_configured(false);
   
