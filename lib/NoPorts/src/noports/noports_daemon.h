@@ -214,9 +214,12 @@ private:
   // Monitor regex
   char *_monitor_regex;
 
-  // Root server (atDirectory)
+  // Root server (atDirectory), or the reverse proxy when _via_proxy is set
   char     _root_host[254];
   uint16_t _root_port;
+  // 'proxy:' root spec — _root_host:_root_port IS the atServer address
+  // (via a protocol-aware reverse proxy); no atDirectory lookups at all
+  bool     _via_proxy;
 
   // Resolved atServer address — populated once at startup via atdirectory_lookup_once().
   // Subsequent pkam_authenticate calls use this directly, avoiding a root TLS

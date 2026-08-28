@@ -26,6 +26,7 @@
 #define NVS_KEY_MAX_RELAYS    "max_relays"
 #define NVS_KEY_WEB_LOCAL     "web_local"   // "1" = only accept localhost connections
 #define NVS_KEY_LED_MODE      "led_mode"    // "0"=off "1"=heartbeat "2"=status "3"=full
+#define NVS_KEY_ROOT          "root_spec"   // root server spec: host[:port] or proxy:host[:port]; "" = root.atsign.org
 #define NVS_KEY_CONFIGURED    "configured"
 #define NVS_KEY_NTP_GOOD      "ntp_good"    // last known-good NTP epoch (monotonic time floor across reboots)
 
@@ -34,7 +35,7 @@
 #define ATKEYS_PATH_VFS "/littlefs/atkeys.json"  // C fopen() full VFS path
 
 // ─── App version ──────────────────────────────────────────────────────────
-#define POE_APP_VERSION "1.0.2"
+#define POE_APP_VERSION "1.1.0"
 
 // ─── Public API ───────────────────────────────────────────────────────────
 

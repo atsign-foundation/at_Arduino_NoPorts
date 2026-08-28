@@ -96,6 +96,7 @@ NoPortsDaemon::NoPortsDaemon()
   , _ping_response(nullptr)
   , _monitor_regex(nullptr)
   , _root_port(0)
+  , _via_proxy(false)
   , _relay_count(0)
   , _timeout_counter(0)
   , _reconnect_failures(0)
@@ -228,17 +229,35 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
   }
 
   // ---- Setup root host/port ----
+  // Spec follows the Dart AtRootDomain / at_lookup convention:
+  //   host             -> ask the atDirectory at host:64
+  //   host:port        -> ask the atDirectory at host:port
+  //   proxy:host       -> no atDirectory: the atServer address is host:64
+  //   proxy:host:port  -> no atDirectory: the atServer address is host:port
+  // The 'proxy:' forms support 443-only networks via a protocol-aware
+  // reverse proxy, e.g. "proxy:proxy0001.atsign.org:443".
+  _via_proxy = false;
   if (_config.root_domain) {
-    // Parse domain:port if colon present
-    const char *colon = strchr(_config.root_domain, ':');
-    if (colon) {
-      size_t host_len = colon - _config.root_domain;
-      if (host_len >= sizeof(_root_host)) {
-        _setError("Root domain host too long");
+    const char *spec = _config.root_domain;
+    if (strncmp(spec, "proxy:", 6) == 0) {
+      _via_proxy = true;
+      spec += 6;
+      if (spec[0] == '\0') {
+        _setError("No host given after 'proxy:' in root domain spec");
         _state = DAEMON_ERROR;
         return false;
       }
-      snprintf(_root_host, sizeof(_root_host), "%.*s", (int)host_len, _config.root_domain);
+    }
+    // Parse host:port if colon present
+    const char *colon = strchr(spec, ':');
+    if (colon) {
+      size_t host_len = colon - spec;
+      if (host_len == 0 || host_len >= sizeof(_root_host)) {
+        _setError("Invalid host in root domain spec");
+        _state = DAEMON_ERROR;
+        return false;
+      }
+      snprintf(_root_host, sizeof(_root_host), "%.*s", (int)host_len, spec);
       // atoi silently wraps out-of-range ports (70000 -> 4464) and accepts
       // trailing garbage (443x) — reject malformed specs instead
       char *port_end = nullptr;
@@ -250,7 +269,7 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
       }
       _root_port = (uint16_t)port_val;
     } else {
-      snprintf(_root_host, sizeof(_root_host), "%s", _config.root_domain);
+      snprintf(_root_host, sizeof(_root_host), "%s", spec);
       _root_port = NOPORTS_DEFAULT_ROOT_PORT;
     }
   } else {
@@ -262,7 +281,8 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
     _root_port = _config.root_port;
   }
 
-  NOPORTS_LOGI(TAG, "Root server: %s:%d", _root_host, _root_port);
+  NOPORTS_LOGI(TAG, "Root server: %s%s:%d", _via_proxy ? "proxy:" : "",
+               _root_host, _root_port);
 
   // ---- Resolve atServer address (once, cached for all reconnects) ----
   // We do a single root-directory TLS lookup here and cache the result.
@@ -270,7 +290,13 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
   // use set_atserver_host/port directly — no further root TLS connections
   // are needed, saving a transient PCB and ~36 KB of TLS handshake heap
   // on every reconnect.
-  {
+  if (_via_proxy) {
+    // No atDirectory: every atServer connection goes to the reverse proxy
+    snprintf(_atserver_host, sizeof(_atserver_host), "%s", _root_host);
+    _atserver_port = _root_port;
+    NOPORTS_LOGI(TAG, "atServer via reverse proxy %s:%d (no atDirectory lookup)",
+                 _atserver_host, _atserver_port);
+  } else {
     char *resolved_host = nullptr;
     uint16_t resolved_port = 0;
     int lookup_res = atdirectory_lookup_once(_root_host, _root_port,
@@ -2339,6 +2365,14 @@ void NoPortsDaemon::_cleanupFinishedRelays() {
 // Re-run root-directory lookup and update cached atServer address.
 // Returns true if a new host/port was discovered (both options structs updated).
 bool NoPortsDaemon::_refreshAtServerCache() {
+  if (_via_proxy) {
+    // The atServer address IS the reverse proxy — there is no directory to
+    // re-ask, and the address never changes.
+    NOPORTS_LOGI(TAG, "atServer is a fixed reverse proxy (%s:%d) — no re-lookup",
+                 _atserver_host, _atserver_port);
+    return false;
+  }
+
   char *resolved_host = nullptr;
   uint16_t resolved_port = 0;
 

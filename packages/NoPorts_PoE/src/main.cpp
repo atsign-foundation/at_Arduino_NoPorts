@@ -135,6 +135,7 @@ static bool start_daemon() {
   static String atsign, device, managers_raw, manager_items[NOPORTS_MAX_MANAGERS];
   static String policy_at, permitopen_raw, po_items[NOPORTS_MAX_PERMITOPEN];
   static String po_hosts[NOPORTS_MAX_PERMITOPEN];
+  static String root_spec;
 
   atsign  = nvs_load(NVS_KEY_ATSIGN);
   device  = nvs_load(NVS_KEY_DEVICE);
@@ -173,6 +174,10 @@ static bool start_daemon() {
   noports_config_init(&cfg);
   cfg.atsign      = atsign.c_str();
   cfg.device_name = device.c_str();
+
+  // Root server spec: host[:port] or proxy:host[:port]; empty → root.atsign.org:64
+  root_spec = nvs_load(NVS_KEY_ROOT);
+  if (root_spec.length() > 0) cfg.root_domain = root_spec.c_str();
 
   if (policy_mode) {
     cfg.policy_atsign = policy_at.length() ? policy_at.c_str() : nullptr;
