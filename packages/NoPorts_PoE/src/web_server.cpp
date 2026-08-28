@@ -754,6 +754,7 @@ static void _handle_reset() {
   nvs_save(NVS_KEY_MANAGERS,  "");
   nvs_save(NVS_KEY_MANAGER,   "");
   nvs_save(NVS_KEY_PERMITOPEN,"");
+  nvs_save(NVS_KEY_ROOT,      "");  // back to root.atsign.org
   nvs_set_configured(false);
 
   delay(500);

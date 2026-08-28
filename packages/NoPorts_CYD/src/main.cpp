@@ -371,6 +371,7 @@ static void _do_reset() {
   ui_save_string(NVS_KEY_ATSIGN, "");
   ui_save_string(NVS_KEY_DEVICE, "");
   ui_save_string(NVS_KEY_MANAGER, "");
+  ui_save_string(NVS_KEY_ROOT, "");  // back to root.atsign.org
   ui_set_configured(false);
   
   Serial.println("[main] NVS cleared — rebooting...");
