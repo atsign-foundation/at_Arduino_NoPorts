@@ -830,9 +830,12 @@ static void _on_wifi_reconnected() {
 }
 
 // Called when user saves settings screen
-static void _on_settings_saved() {
+// Stop and restart the daemon so it picks up changed NVS config, then
+// return to the dashboard. Shared by the Rules save and a root-server
+// change from the Config screen.
+static void _restart_daemon_after_save(const char *saving_msg) {
   // Show status so user knows it's working, not frozen
-  _show_restart_status("Saving rules...", "Restarting daemon");
+  _show_restart_status(saving_msg, "Restarting daemon");
 
   // Daemon restart needed to pick up new config
   if (daemon_running) {
@@ -871,6 +874,10 @@ static void _on_settings_saved() {
   }
 }
 
+static void _on_settings_saved() {
+  _restart_daemon_after_save("Saving rules...");
+}
+
 // Show settings/rules screen (called from dashboard)
 static void _show_settings() {
   current_screen = SCREEN_SETTINGS;
@@ -878,6 +885,10 @@ static void _show_settings() {
 }
 
 // Show config screen (called from dashboard's Settings/Config button)
+// Root spec as it was when the Config screen was opened — used to detect a
+// change on save, which needs a daemon restart (unlike the live-applied tuning)
+static String _root_before_config;
+
 static void _on_config_saved() {
   // Apply new keepalive value to the running daemon — no restart needed
   if (daemon_running) {
@@ -894,12 +905,21 @@ static void _on_config_saved() {
     npDaemon.setMaxRelays(max_r);
     Serial.printf("[main] Max TCP clients updated: %d\n", (int)max_r);
   }
+
+  // A changed root server spec only takes effect on a fresh daemon start
+  if (ui_load_string(NVS_KEY_ROOT) != _root_before_config) {
+    Serial.println("[main] Root server spec changed — restarting daemon");
+    _restart_daemon_after_save("Saving config...");
+    return;
+  }
+
   // Return to dashboard
   current_screen = SCREEN_DASHBOARD;
   ui_dashboard_create(_do_reset, _show_settings, _show_wifi, _show_config);
 }
 
 static void _show_config() {
+  _root_before_config = ui_load_string(NVS_KEY_ROOT);
   current_screen = SCREEN_CONFIG;
   ui_config_create(_on_config_saved);
 }

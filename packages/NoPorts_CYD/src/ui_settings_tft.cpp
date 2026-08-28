@@ -39,13 +39,12 @@ static void (*_on_save_cb)() = nullptr;
 
 // rules_mode: 0 = managers list, 1 = policy atSign
 static int  _rules_mode   = 0;
-// Managers mode: field 0 = Managers, 1 = PermitOpen, 2 = Root server
-// Policy mode:   field 0 = Policy atSign, 1 = Root server
+// Field 0 = Managers -or- Policy atSign depending on _rules_mode
+// Field 1 = PermitOpen (always)
 static int  _active_field = 0;
 static char _managers[256]    = "";
 static char _policy_at[128]   = "";
 static char _permitopen[256]  = "";
-static char _root_spec[128]   = "";  // host[:port] or proxy:host[:port]; "" = root.atsign.org
 
 // Keyboard mode: 0=lowercase, 1=uppercase, 2=symbols
 static int _kb_mode = 0;
@@ -111,23 +110,13 @@ static bool _check_keyboard_press(int16_t tx, int16_t ty);
 // Helpers
 // ---------------------------------------------------------------------------
 
-static int _field_count() {
-  return (_rules_mode == 1) ? 2 : 3;  // policy: Policy+Root; managers: Mgrs+Permit+Root
-}
-
-static bool _active_is_root() {
-  return _active_field == _field_count() - 1;
-}
-
 static char* _get_active_buffer() {
-  if (_active_is_root()) return _root_spec;
   if (_active_field == 0)
     return (_rules_mode == 1) ? _policy_at : _managers;
   return _permitopen;
 }
 
 static size_t _get_active_maxlen() {
-  if (_active_is_root()) return sizeof(_root_spec) - 1;
   if (_active_field == 0)
     return (_rules_mode == 1) ? sizeof(_policy_at) - 1 : sizeof(_managers) - 1;
   return sizeof(_permitopen) - 1;
@@ -196,35 +185,35 @@ static void _draw_fields() {
     char *buf;
   };
 
-  // Compact single-row layout (label left, value box right) so three fields
-  // fit between the mode toggle and the keyboard.
-  FieldInfo fields[3];
-  if (_rules_mode == 1) {
-    fields[0] = {"Policy:", "@policyservice", _policy_at};
-    fields[1] = {"Root:",   "root.atsign.org", _root_spec};
-  } else {
-    fields[0] = {"Managers:", "@alice,@bob", _managers};
-    fields[1] = {"Permit:",   "*:*",         _permitopen};
-    fields[2] = {"Root:",     "root.atsign.org", _root_spec};
-  }
-  int field_count = _field_count();
-
-  const int label_w = 66;   // label column width
-  const int box_x   = 5 + label_w;
-  const int box_w   = TFT_WIDTH - 10 - label_w;
-  const int row_h   = FIELD_HEIGHT + 2;
+  FieldInfo fields[] = {
+    (_rules_mode == 1)
+      ? FieldInfo{"Policy at:", "@policyservice", _policy_at}
+      : FieldInfo{"Managers:",  "@alice,@bob",    _managers},
+    {"Permit:", "*:*", _permitopen},
+  };
 
   int y = FIELD_Y_START;
+  // In policy mode only one field is needed (the policy atSign);
+  // the policy server owns all permitOpen decisions.
+  int field_count = (_rules_mode == 1) ? 1 : 2;
+
   for (int i = 0; i < field_count; i++) {
-    // Label (left of the value box)
-    tft.setTextColor((i == _active_field) ? COLOR_PRIMARY : COLOR_TEXT_GREY);
-    tft.setTextDatum(ML_DATUM);
+    // Label row
+    tft.setTextColor(COLOR_TEXT_GREY);
+    tft.setTextDatum(TL_DATUM);
     tft.setTextSize(1);
-    tft.drawString(fields[i].label, 8, y + row_h / 2, 2);
+    tft.drawString(fields[i].label, 8, y, 2);
+
+    // "Active" indicator
+    if (i == _active_field) {
+      tft.fillCircle(TFT_WIDTH - 12, y + 6, 3, COLOR_PRIMARY);
+    }
+
+    y += 16;
 
     // Value box
     uint16_t bg = (i == _active_field) ? COLOR_BG_CARD : 0x2104;
-    ui_draw_rounded_rect(box_x, y, box_w, row_h, 4, bg);
+    ui_draw_rounded_rect(5, y, TFT_WIDTH - 10, FIELD_HEIGHT, 4, bg);
 
     // Value text (scrolled if long)
     const char *text = fields[i].buf;
@@ -238,7 +227,8 @@ static void _draw_fields() {
 
     // Clip to field bounds
     tft.setTextDatum(ML_DATUM);
-    int max_w = box_w - 10;
+    // Calculate visible portion
+    int max_w = TFT_WIDTH - 20;
     int tw = tft.textWidth(text, 2);
     const char *display_text = text;
     // If text is wider than field, show the tail (so cursor position is visible)
@@ -248,17 +238,17 @@ static void _draw_fields() {
       while (tft.textWidth(text + skip, 2) > max_w && text[skip]) skip++;
       display_text = text + skip;
     }
-    tft.drawString(display_text, box_x + 5, y + row_h / 2, 2);
+    tft.drawString(display_text, 10, y + FIELD_HEIGHT / 2, 2);
 
     // Cursor on active field
     if (i == _active_field && !empty) {
       int disp_w = tft.textWidth(display_text, 2);
-      int cx = box_x + 5 + disp_w;
-      if (cx > TFT_WIDTH - 10) cx = TFT_WIDTH - 10;
-      tft.drawLine(cx, y + 2, cx, y + row_h - 2, COLOR_PRIMARY);
+      int cx = 10 + disp_w;
+      if (cx > TFT_WIDTH - 15) cx = TFT_WIDTH - 15;
+      tft.drawLine(cx, y + 2, cx, y + FIELD_HEIGHT - 2, COLOR_PRIMARY);
     }
 
-    y += row_h + FIELD_GAP + 2;
+    y += FIELD_HEIGHT + FIELD_GAP + 2;
   }
 }
 
@@ -348,8 +338,7 @@ static bool _check_mode_toggle_tap(int16_t tx, int16_t ty) {
 
   if (new_mode >= 0 && new_mode != _rules_mode) {
     _rules_mode = new_mode;
-    // Switching mode changes the field count — keep the selection in range
-    if (_active_field >= _field_count()) _active_field = 0;
+    // Switching mode makes field 0 change meaning; keep the active field
     TFT_eSPI &tft = ui_get_tft();
     tft.fillRect(0, TOGGLE_Y, TFT_WIDTH, KEYBOARD_TOP_Y - TOGGLE_Y, COLOR_BG_DARK);
     _draw_mode_toggle();
@@ -362,12 +351,14 @@ static bool _check_mode_toggle_tap(int16_t tx, int16_t ty) {
 
 static bool _check_field_tap(int16_t tx, int16_t ty) {
   int y0 = FIELD_Y_START;
-  int field_count = _field_count();
-  const int row_h = FIELD_HEIGHT + 2;
+  int field_count = (_rules_mode == 1) ? 1 : 2;
 
   for (int i = 0; i < field_count; i++) {
-    // Check tap anywhere in the row (label or value box)
-    if (ui_touch_in_rect(tx, ty, 3, y0, TFT_WIDTH - 6, row_h)) {
+    int label_y = y0;
+    int field_y = label_y + 16;
+
+    // Check tap in the label or value area
+    if (ui_touch_in_rect(tx, ty, 3, label_y, TFT_WIDTH - 6, 16 + FIELD_HEIGHT)) {
       if (_active_field != i) {
         _active_field = i;
         // Redraw fields area
@@ -380,7 +371,7 @@ static bool _check_field_tap(int16_t tx, int16_t ty) {
       }
     }
 
-    y0 += row_h + FIELD_GAP + 2;
+    y0 += 16 + FIELD_HEIGHT + FIELD_GAP + 2;
   }
 
   return false;
@@ -434,9 +425,9 @@ static bool _check_keyboard_press(int16_t tx, int16_t ty) {
   }
 
   // SPACE inserts a comma separator for multi-entry fields.
-  // Single-value fields (policy atSign, root server) take no comma — ignore it.
+  // In policy-atSign field (single value) a comma makes no sense — ignore it.
   if (ui_touch_in_rect(tx, ty, BROW_SPC_X, brow_y, BROW_SPC_W, KEY_HEIGHT)) {
-    bool comma_ok = !(_rules_mode == 1 && _active_field == 0) && !_active_is_root();
+    bool comma_ok = !(_rules_mode == 1 && _active_field == 0);
     if (comma_ok) {
       char *buf = _get_active_buffer();
       int len = strlen(buf);
@@ -470,15 +461,10 @@ static bool _check_keyboard_press(int16_t tx, int16_t ty) {
     ui_save_string(NVS_KEY_MANAGERS,   _managers);
     ui_save_string(NVS_KEY_POLICY_AT,  _policy_at);
     ui_save_string(NVS_KEY_PERMITOPEN, _permitopen);
-    // Persist the root spec only when it differs from the default, so a
-    // default-valued field doesn't shadow a future default change
-    ui_save_string(NVS_KEY_ROOT,
-                   (strcmp(_root_spec, "root.atsign.org") == 0) ? "" : _root_spec);
     Serial.printf("[settings] Saved rules_mode: %d\n",    _rules_mode);
     Serial.printf("[settings] Saved managers:   %s\n",    _managers);
     Serial.printf("[settings] Saved policy_at:  %s\n",    _policy_at);
     Serial.printf("[settings] Saved permitopen: %s\n",    _permitopen);
-    Serial.printf("[settings] Saved root spec:  %s\n",    _root_spec);
     if (_on_save_cb) {
       _on_save_cb();
     }
@@ -517,13 +503,6 @@ void ui_settings_create(void (*on_save)()) {
   if (po.length() == 0) po = "*:*";
   strncpy(_permitopen, po.c_str(), sizeof(_permitopen) - 1);
   _permitopen[sizeof(_permitopen) - 1] = '\0';
-
-  // Load root server spec (default root.atsign.org; 'proxy:' prefix skips
-  // the atDirectory for 443-only networks)
-  String root = ui_load_string(NVS_KEY_ROOT);
-  if (root.length() == 0) root = "root.atsign.org";
-  strncpy(_root_spec, root.c_str(), sizeof(_root_spec) - 1);
-  _root_spec[sizeof(_root_spec) - 1] = '\0';
 
   _active_field = 0;
 
