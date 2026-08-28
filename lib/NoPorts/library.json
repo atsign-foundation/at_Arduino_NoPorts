@@ -1,6 +1,6 @@
 {
   "name": "NoPorts",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "NoPorts daemon (sshnpd) for Arduino/ESP32 - secure tunneling via the atProtocol. Registers an ESP32 device on the atProtocol network, listens for tunnel requests, and creates encrypted TCP relays to local services.",
   "keywords": ["atsign", "atprotocol", "noports", "ssh", "tunnel", "iot", "security"],
   "repository": {
