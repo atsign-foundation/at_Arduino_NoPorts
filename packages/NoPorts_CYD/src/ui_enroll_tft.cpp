@@ -40,8 +40,12 @@ static char _atsign[64] = "";
 static char _device_name[64] = "";
 static char _otp[16] = "";
 static char _manager[64] = "";
+static char _policy_at[64] = "";
 static char _root[128] = "";  // root server spec: host[:port] or proxy:host[:port]
-static int _active_field = 0;  // 0=atsign, 1=device, 2=otp, 3=manager, 4=root
+static int _active_field = 0;  // 0=atsign, 1=device, 2=otp, 3=manager/policy, 4=root
+// Field 3 mode — tap its label chip to toggle. 0 = manager atSign(s),
+// 1 = policy-service atSign (RPC authorisation). Mirrors the Rules screen.
+static int _rules_mode = 0;
 static String _status_msg;
 
 // Simple keyboard (similar to WiFi screen). No SPACE key: spaces are not
@@ -69,10 +73,15 @@ static char* _get_active_buffer() {
     case 0: return _atsign;
     case 1: return _device_name;
     case 2: return _otp;
-    case 3: return _manager;
+    case 3: return (_rules_mode == 1) ? _policy_at : _manager;
     case 4: return _root;
     default: return nullptr;
   }
+}
+
+// Field 3's value under the current mode (manager list or policy atSign)
+static const char* _rules_value() {
+  return (_rules_mode == 1) ? _policy_at : _manager;
 }
 
 static int _get_active_buffer_len() {
@@ -85,7 +94,7 @@ static size_t _get_active_buffer_maxlen() {
     case 0: return sizeof(_atsign) - 1;
     case 1: return sizeof(_device_name) - 1;
     case 2: return sizeof(_otp) - 1;
-    case 3: return sizeof(_manager) - 1;
+    case 3: return (_rules_mode == 1) ? sizeof(_policy_at) - 1 : sizeof(_manager) - 1;
     case 4: return sizeof(_root) - 1;
     default: return 0;
   }
@@ -103,16 +112,31 @@ static void _draw_form() {
   tft.drawString("Enrollment", TFT_WIDTH / 2, 5, 4);
   
   // Fields — 5 rows squeezed between the header and the keyboard (y 33..121)
-  const char *labels[] = {"atSign:", "Device:", "OTP:", "Manager:", "Root:"};
-  char *buffers[] = {_atsign, _device_name, _otp, _manager, _root};
+  const char *labels[] = {"atSign:", "Device:", "OTP:",
+                          (_rules_mode == 1) ? "Policy:" : "Manager:", "Root:"};
+  char *buffers[] = {_atsign, _device_name, _otp,
+                     (_rules_mode == 1) ? _policy_at : _manager, _root};
 
   int y = 33;
   for (int i = 0; i < 5; i++) {
-    // Label
-    tft.setTextColor(COLOR_TEXT_GREY);
-    tft.setTextDatum(TL_DATUM);
-    tft.setTextSize(1);
-    tft.drawString(labels[i], 5, y, 2);
+    // Label. Field 3's label is a chip — tapping it toggles Manager/Policy
+    if (i == 3) {
+      ui_draw_rounded_rect(2, y - 2, 70, 16, 4, COLOR_BUTTON_BG);
+      tft.setTextColor(COLOR_TEXT_WHITE);
+      tft.setTextDatum(ML_DATUM);
+      tft.setTextSize(1);
+      tft.drawString(labels[i], 6, y + 6, 2);
+      // tiny swap glyph so the chip reads as tappable
+      tft.setTextColor(COLOR_ACCENT);
+      tft.setTextDatum(MR_DATUM);
+      tft.drawString("~", 70, y + 6, 2);
+      tft.setTextDatum(TL_DATUM);
+    } else {
+      tft.setTextColor(COLOR_TEXT_GREY);
+      tft.setTextDatum(TL_DATUM);
+      tft.setTextSize(1);
+      tft.drawString(labels[i], 5, y, 2);
+    }
 
     // Field background
     uint16_t bg_color = (i == _active_field) ? COLOR_BG_CARD : 0x2104;
@@ -146,7 +170,7 @@ static void _draw_enroll_button() {
   
   // Only show when all fields are filled
   if (strlen(_atsign) == 0 || strlen(_device_name) == 0 ||
-      strlen(_otp) == 0 || strlen(_manager) == 0) {
+      strlen(_otp) == 0 || strlen(_rules_value()) == 0) {
     return;
   }
   
@@ -274,7 +298,7 @@ static bool _check_keyboard_press(int16_t tx, int16_t ty) {
 static void _start_enrollment() {
   // Validate fields
   if (strlen(_atsign) == 0 || strlen(_device_name) == 0 ||
-      strlen(_otp) == 0 || strlen(_manager) == 0) {
+      strlen(_otp) == 0 || strlen(_rules_value()) == 0) {
     _status_msg = "All fields required!";
     // Draw the error over the header title; the next redraw restores it
     TFT_eSPI &tft = ui_get_tft();
@@ -302,8 +326,21 @@ static void _start_enrollment() {
   // Save to NVS
   ui_save_string(NVS_KEY_ATSIGN, _atsign);
   ui_save_string(NVS_KEY_DEVICE, _device_name);
-  ui_save_string(NVS_KEY_MANAGER, _manager);
-  ui_save_string(NVS_KEY_MANAGERS, _manager);  // also save to new multi-manager key
+  if (_rules_mode == 1) {
+    // Policy mode: the policy-service atSign authorises via RPC
+    ui_save_string(NVS_KEY_POLICY_AT, _policy_at);
+    ui_save_string(NVS_KEY_RULES_MODE, "1");
+  } else {
+    ui_save_string(NVS_KEY_MANAGER, _manager);
+    ui_save_string(NVS_KEY_MANAGERS, _manager);  // also save to new multi-manager key
+    ui_save_string(NVS_KEY_RULES_MODE, "0");
+    // Managers mode needs permitopen rules to start the daemon; the wipe
+    // clears them, so default to allow-all (same default the Rules screen
+    // offers) — tighten later via Rules.
+    if (ui_load_string(NVS_KEY_PERMITOPEN).length() == 0) {
+      ui_save_string(NVS_KEY_PERMITOPEN, "*:*");
+    }
+  }
   // Persist the root spec only when it differs from the default, so a
   // default-valued field doesn't shadow a future default change
   ui_save_string(NVS_KEY_ROOT,
@@ -419,6 +456,10 @@ void ui_enroll_create(void (*on_enrolled)()) {
   memset(_device_name, 0, sizeof(_device_name));
   memset(_otp, 0, sizeof(_otp));
   memset(_manager, 0, sizeof(_manager));
+  memset(_policy_at, 0, sizeof(_policy_at));
+
+  // Restore the last rules mode (fresh wipe → managers)
+  _rules_mode = (ui_load_string(NVS_KEY_RULES_MODE) == "1") ? 1 : 0;
 
   // Prefill root spec: previously saved value, else the default directory.
   // Editable for 443-only networks, e.g. "proxy:proxy0001.atsign.org:443".
@@ -530,13 +571,23 @@ bool ui_enroll_handle_touch(int16_t tx, int16_t ty) {
   int btn_x = TFT_WIDTH - 85;
   int btn_y = 5;
   if (strlen(_atsign) > 0 && strlen(_device_name) > 0 &&
-      strlen(_otp) > 0 && strlen(_manager) > 0) {
+      strlen(_otp) > 0 && strlen(_rules_value()) > 0) {
     if (ui_touch_in_rect(tx, ty, btn_x, btn_y, 80, 22)) {
       _start_enrollment();
       return true;
     }
   }
   
+  // Field 3's label chip toggles between Manager and Policy atSign
+  if (ui_touch_in_rect(tx, ty, 2, 33 + 3 * 18 - 2, 70, 16)) {
+    _rules_mode = (_rules_mode == 0) ? 1 : 0;
+    _active_field = 3;
+    _draw_form();
+    _draw_enroll_button();
+    _draw_keyboard();
+    return true;
+  }
+
   // Check field selection (33, 51, 69, 87, 105)
   int y = 33;
   for (int i = 0; i < 5; i++) {
