@@ -19,6 +19,6 @@
   "platforms": "espressif32",
   "headers": "NoPorts.h",
   "dependencies": {
-    "atsign/at_client": "0.2.0"
+    "atsign/at_client": "https://github.com/atsign-foundation/at_client_arduino.git#fix/rsa-encrypt-output-bound"
   }
 }
