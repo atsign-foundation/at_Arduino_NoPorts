@@ -1025,15 +1025,17 @@ static bool _atsign_equals(const char *a, const char *b) {
 static char *_rsa_encrypt_b64(atchops_rsa_key_public_key *pk,
                               const unsigned char *plaintext) {
   unsigned char enc_buf[256];
+  size_t enc_len = 0;
   if (atchops_rsa_encrypt(pk, plaintext,
-                          strlen((const char *)plaintext), enc_buf) != 0) {
+                          strlen((const char *)plaintext), enc_buf,
+                          sizeof(enc_buf), &enc_len) != 0) {
     return NULL;
   }
   char *out = (char *)malloc(384);
   if (!out) return NULL;
   memset(out, 0, 384);
   size_t b64_len;
-  if (atchops_base64_encode(enc_buf, 256, out, 384, &b64_len) != 0) {
+  if (atchops_base64_encode(enc_buf, enc_len, out, 384, &b64_len) != 0) {
     free(out);
     return NULL;
   }
@@ -2028,13 +2030,11 @@ void NoPortsDaemon::_continueNptRequest(void *env,
       }
 
       // The "rsa2048" label above is client-supplied and only names the type;
-      // it does not constrain the actual modulus. atchops_rsa_encrypt imports
-      // the raw modulus via mbedtls, whose ciphertext length is the count of
-      // SIGNIFICANT modulus bytes (leading zeros stripped) — that many bytes
-      // are written into the fixed 256-byte enc_buf in _rsa_encrypt_b64, so a
-      // key whose real modulus is larger than 2048 bits (e.g. RSA-4096 -> 512
-      // bytes) would overflow that stack buffer. Enforce a true 2048-bit
-      // modulus before any encryption is attempted. Note: the DER INTEGER
+      // it does not constrain the actual modulus. atchops_rsa_encrypt now
+      // enforces its output-buffer bound itself (at_c#709), so an oversized
+      // modulus can no longer overflow enc_buf in _rsa_encrypt_b64 - but
+      // rejecting it here first gives a precise error before any key
+      // generation work is done. Note: the DER INTEGER
       // encoding pads the modulus with a leading 0x00 whenever its MSB is set
       // (always, for a real modulus), so a valid RSA-2048 key normally arrives
       // here with n.len == 257 — compare significant bytes, not raw length.
