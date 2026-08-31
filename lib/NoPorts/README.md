@@ -95,8 +95,13 @@ brand-new atSign directly on the ESP32.
 Use `noports_keys_set()` with base64-encoded keys extracted from your
 `.atKeys` file. See the top-level README for a Python extraction script.
 
-> **Security:** Hardcoded keys in flash are extractable. Use ESP32 flash
-> encryption for production deployments.
+> **Security:** atSign keys stored on the device — whether hardcoded in the
+> sketch, loaded from the filesystem, or written during enrollment — are
+> recoverable from a flash dump by anyone with physical access, unless ESP32
+> flash encryption is enabled. Because keys are per-device and revocable, the
+> primary mitigation is to rotate/revoke a compromised device's enrollment; for
+> physically untrusted deployments, additionally enable flash encryption. See
+> [docs/security-key-storage.md](../../docs/security-key-storage.md).
 
 ---
 
