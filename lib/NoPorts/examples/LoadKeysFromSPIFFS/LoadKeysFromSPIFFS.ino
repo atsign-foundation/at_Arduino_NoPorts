@@ -15,6 +15,16 @@
  *     in the "data" folder of your sketch, then use Tools > ESP32 Sketch Data Upload
  *   - PlatformIO: Put atkeys.json in the "data" folder, run "pio run -t uploadfs"
  *   - esptool: Use espflash or similar tool
+ *
+ * !! SECURITY WARNING !!
+ *   - atkeys.json contains your atSign's private keys (the self-encryption key
+ *     sits next to the encrypted keys it protects, so the file == the identity).
+ *     Keep it OUT of version control: do not commit the sketch's "data" folder.
+ *     A stray `git add -A` after placing atkeys.json there publishes your keys.
+ *     The repo .gitignore excludes *.atKeys / atkeys.json for this reason.
+ *   - Keys on the filesystem are still readable from flash via
+ *     `esptool.py read_flash` unless you enable ESP32 flash encryption. Enable
+ *     it for production deployments.
  */
 
 #include <WiFi.h>

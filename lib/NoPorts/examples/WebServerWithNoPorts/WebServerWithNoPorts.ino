@@ -31,6 +31,16 @@ const char *DEVICE_ATSIGN = "@your_device_atsign";
 const char *DEVICE_NAME   = "esp32_web";
 const char *MANAGER_ATSIGN = "@your_manager_atsign";
 
+// ============================================================================
+// !! SECURITY WARNING !! The values below are DECRYPTED atSign private keys —
+// anyone who obtains them can fully impersonate this device. NEVER commit this
+// file with real keys (public-repo commits are the #1 IoT key-leak vector), and
+// note that hardcoded keys are baked into the firmware in the CLEAR and are
+// recoverable via `esptool.py read_flash` unless ESP32 flash encryption is
+// enabled. For anything beyond local testing, load keys from a file at runtime
+// (see LoadKeysFromSPIFFS) and enable flash encryption. See README.md.
+// ============================================================================
+
 // Keys - see BasicDaemon example and README.md
 const char *PKAM_PUBLIC_KEY  = "YOUR_KEY_HERE";
 const char *PKAM_PRIVATE_KEY = "YOUR_KEY_HERE";

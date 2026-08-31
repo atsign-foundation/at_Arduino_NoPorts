@@ -1018,6 +1018,19 @@ static bool _atsign_equals(const char *a, const char *b) {
   return strcmp(a, b) == 0;
 }
 
+// Strictly parse a TCP port from a NUL-terminated string. Returns the port in
+// 1..65535, or -1 if the string is not a fully-numeric in-range port. atoi/atol
+// and strtoul-without-end-pointer silently wrap out-of-range values (70000 ->
+// 4464) and accept trailing garbage (22x -> 22), which for a permitOpen rule
+// would *widen* access on a typo — so callers must fail closed on -1.
+static int _parse_port_strict(const char *s) {
+  if (s == nullptr || *s == '\0') return -1;
+  char *end = nullptr;
+  long v = strtol(s, &end, 10);
+  if (end == s || *end != '\0' || v < 1 || v > UINT16_MAX) return -1;
+  return (int)v;
+}
+
 // RSA-encrypt a NUL-terminated base64 key/IV string with the client's
 // ephemeral public key and return the result base64-encoded (malloc'd).
 // Returns NULL on any failure so the caller can reject the whole request
@@ -1753,11 +1766,21 @@ void NoPortsDaemon::_continueNptRequest(void *env,
           if (hlen >= sizeof(h)) continue;
           memcpy(h, entry, hlen); h[hlen] = '\0';
           const char *port_str = colon + 1;
-          uint16_t p = (uint16_t)strtoul(port_str, nullptr, 10);
+          bool port_wildcard = (strcmp(port_str, "*") == 0);
+          int p = port_wildcard ? 0 : _parse_port_strict(port_str);
+          // Fail closed: only the explicit "*" is a wildcard. A malformed port
+          // (empty, non-numeric, or out of range) yields p == -1 and must NOT
+          // match — otherwise a typo like "10.0.0.5:2x2" would silently permit
+          // every port on that host.
+          if (!port_wildcard && p < 0) {
+            NOPORTS_LOGW(TAG, "NPT: policy permitOpen[%d] has invalid port '%s' — skipping rule",
+                         i, port_str);
+            continue;
+          }
           bool hm = (strcmp(h, "*") == 0) || (strcmp(h, rhost) == 0);
-          bool pm = (strcmp(port_str, "*") == 0) || (p == 0) || (p == rport);
-          NOPORTS_LOGI(TAG, "NPT: compare h='%s' p=%u hm=%d pm=%d (rport=%u p=%u)",
-                       h, (unsigned)p, (int)hm, (int)pm, (unsigned)rport, (unsigned)p);
+          bool pm = port_wildcard || ((uint16_t)p == rport);
+          NOPORTS_LOGI(TAG, "NPT: compare h='%s' p=%d hm=%d pm=%d (rport=%u)",
+                       h, p, (int)hm, (int)pm, (unsigned)rport);
           if (hm && pm) {
             NOPORTS_LOGW(TAG, "NPT: POLICY PERMIT — %s:%u matched rule '%s'", rhost, (unsigned)rport, entry);
             permitted = true;
@@ -2188,6 +2211,18 @@ void NoPortsDaemon::_continueNptRequest(void *env,
   if (res != 0) {
     NOPORTS_LOGE(TAG, "NPT: failed to start relay");
     cJSON_Delete(envelope);
+    // Relay start failed, so the relay task will never run to free the config
+    // it took ownership of (noports_relay_start frees its own strdup'd copies on
+    // failure). Free every daemon-owned allocation here, mirroring the e2ee-setup
+    // failure cleanup above, or a relay-start failure — most likely under memory
+    // pressure — leaks the whole session key set and compounds the exhaustion.
+    if (relay_cfg.session_aes_key) free(relay_cfg.session_aes_key);
+    if (relay_cfg.session_iv) free(relay_cfg.session_iv);
+    if (relay_cfg.session_aes_key_d2c) free(relay_cfg.session_aes_key_d2c);
+    if (relay_cfg.session_iv_d2c) free(relay_cfg.session_iv_d2c);
+    if (relay_cfg.relay_auth_aes_key) free(relay_cfg.relay_auth_aes_key);
+    if (relay_cfg.escr_signing_key_uri) free(relay_cfg.escr_signing_key_uri);
+    if (relay_cfg.rvd_auth_string) cJSON_free(relay_cfg.rvd_auth_string);
     if (session_aes_key_b64) free(session_aes_key_b64);
     if (session_iv_b64) free(session_iv_b64);
     if (session_aes_key_d2c_b64) free(session_aes_key_d2c_b64);
@@ -2200,6 +2235,21 @@ void NoPortsDaemon::_continueNptRequest(void *env,
       cJSON_GetStringValue(requested_host),
       (uint16_t)cJSON_GetNumberValue(requested_port),
       relay_cfg.session_id);
+  }
+
+  // noports_relay_start deep-copies (strdup) relay_auth_aes_key and
+  // escr_signing_key_uri into the relay's own config, and the relay task frees
+  // those copies on teardown — so the daemon still owns these originals and must
+  // free them here, or they leak on every ESCR tunnel. (session_aes_key/iv and
+  // rvd_auth_string are NOT copied: the relay takes over the daemon's pointers
+  // and frees them in its own cleanup, so they must not be freed here.)
+  if (relay_cfg.relay_auth_aes_key) {
+    free(relay_cfg.relay_auth_aes_key);
+    relay_cfg.relay_auth_aes_key = NULL;
+  }
+  if (relay_cfg.escr_signing_key_uri) {
+    free(relay_cfg.escr_signing_key_uri);
+    relay_cfg.escr_signing_key_uri = NULL;
   }
 
   if (session_aes_key_b64) free(session_aes_key_b64);
@@ -2315,11 +2365,20 @@ bool NoPortsDaemon::_verifyEnvelopeContents(void *env, int payload_type) {
 
   if (payload_type == 1) { // NPT
     if (!cJSON_IsString(cJSON_GetObjectItem(payload, "rvdHost"))) return false;
-    if (!cJSON_IsNumber(cJSON_GetObjectItem(payload, "rvdPort"))) return false;
     if (!cJSON_IsString(cJSON_GetObjectItem(payload, "requestedHost"))) return false;
 
+    // Ports are cast to uint16_t downstream, which silently wraps out-of-range
+    // values (70000 -> 4464). Enforce 1..65535 here so a bad port is rejected
+    // rather than dialed as some other, wrapped port.
+    cJSON *rvp = cJSON_GetObjectItem(payload, "rvdPort");
+    if (!cJSON_IsNumber(rvp)) return false;
+    double rvpv = cJSON_GetNumberValue(rvp);
+    if (rvpv < 1 || rvpv > UINT16_MAX) return false;
+
     cJSON *rp = cJSON_GetObjectItem(payload, "requestedPort");
-    if (!cJSON_IsNumber(rp) || cJSON_GetNumberValue(rp) <= 0) return false;
+    if (!cJSON_IsNumber(rp)) return false;
+    double rpv = cJSON_GetNumberValue(rp);
+    if (rpv < 1 || rpv > UINT16_MAX) return false;
   }
 
   return true;
