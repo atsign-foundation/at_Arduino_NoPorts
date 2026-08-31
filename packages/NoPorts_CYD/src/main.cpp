@@ -284,24 +284,45 @@ static bool start_daemon() {
 
   // Populate permitopen rules
   static String po_hosts[NOPORTS_MAX_PERMITOPEN]; // keep alive
+  int po_valid = 0;
   for (int i = 0; i < po_count; i++) {
     int colon = po_items[i].indexOf(':');
+    String host;
+    uint16_t port;
     if (colon > 0) {
-      po_hosts[i] = po_items[i].substring(0, colon);
-      config.permitopen[i].host = po_hosts[i].c_str();
-      config.permitopen[i].port = (uint16_t)po_items[i].substring(colon + 1).toInt();
+      host = po_items[i].substring(0, colon);
+      String port_str = po_items[i].substring(colon + 1);
+      if (port_str == "*") {
+        port = 0;  // explicit port wildcard
+      } else {
+        // Strict parse, fail closed. String::toInt() stops at the first
+        // non-digit ("2x2" -> 2) and the cast wraps out-of-range values
+        // ("70000" -> 4464), and an empty port ("host:") -> 0 would become a
+        // wildcard — any of which silently *widens* a rule on a typo. Reject
+        // the whole rule instead of matching every port on the host.
+        char *end = nullptr;
+        long v = strtol(port_str.c_str(), &end, 10);
+        if (end == port_str.c_str() || *end != '\0' || v < 1 || v > UINT16_MAX) {
+          Serial.printf("[main] permitopen rule '%s' has invalid port — skipping\n",
+                        po_items[i].c_str());
+          continue;
+        }
+        port = (uint16_t)v;
+      }
     } else if (po_items[i] == "*") {
-      po_hosts[i] = "*";
-      config.permitopen[i].host = "*";
-      config.permitopen[i].port = 0;  // wildcard
+      host = "*";
+      port = 0;  // wildcard
     } else {
-      po_hosts[i] = po_items[i];
-      config.permitopen[i].host = po_hosts[i].c_str();
-      config.permitopen[i].port = 0;
+      host = po_items[i];
+      port = 0;
     }
+    po_hosts[po_valid] = host;
+    config.permitopen[po_valid].host = po_hosts[po_valid].c_str();
+    config.permitopen[po_valid].port = port;
+    po_valid++;
   }
-  config.permitopen_count = po_count;
-  Serial.printf("[main] %d permitopen rule(s) configured\n", po_count);
+  config.permitopen_count = po_valid;
+  Serial.printf("[main] %d permitopen rule(s) configured\n", po_valid);
 
   // Callbacks
   config.on_tunnel_open  = on_tunnel_open;

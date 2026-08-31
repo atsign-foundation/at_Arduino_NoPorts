@@ -1329,7 +1329,11 @@ static void _relay_task_inner(NoPortsRelay *relay) {
       connect_msg[cmsg_len - 1] = '\0';
     connect_msg[cmsg_len] = '\0';
 
-    NOPORTS_LOGI(TAG, "Received: %s", connect_msg);
+    // Do NOT log connect_msg verbatim — it carries the per-session data-channel
+    // AES keys and IVs (connect:keyC2D:ivC2D[:keyD2C:ivD2C]). Logging them at the
+    // default INFO level would leak the session keys to anyone reading the serial
+    // console, defeating the relay's end-to-end encryption. Log length only.
+    NOPORTS_LOGI(TAG, "Received connect message (%d bytes)", cmsg_len);
 
     if (strncmp(connect_msg, "connect:", 8) != 0) {
       NOPORTS_LOGE(TAG, "Invalid connect message (expected 'connect:' prefix)");
@@ -1829,7 +1833,10 @@ static void _relay_task_inner_multi(NoPortsRelay *relay) {
             idle_since = millis();
             activity = true;
           } else {
-            NOPORTS_LOGW(TAG, "Multi: unknown ctrl msg: %s", ctrl_msg);
+            // Never log the message body: after a CTR keystream desync a
+            // corrupted connect: line (which carries session keys) can land
+            // here, so dumping it verbatim would leak key material. Length only.
+            NOPORTS_LOGW(TAG, "Multi: unknown ctrl msg (%d bytes)", ctrl_msg_pos);
           }
         }
         ctrl_msg_pos = 0;
@@ -2470,6 +2477,26 @@ int noports_relay_start(NoPortsRelay *relay, const NoPortsRelayConfig *config) {
       mbedtls_aes_free(&((aes_ctr_state *)relay->decrypter)->ctx);
       free(relay->decrypter);
       relay->decrypter = NULL;
+    }
+    // The task never ran, so its teardown will not free the copies made above.
+    // Free them here so the caller only has to free its own originals. Only the
+    // strdup'd copies are freed — session_aes_key/iv and rvd_auth_string are the
+    // caller's pointers (shallow-copied via memcpy) and remain caller-owned.
+    if (relay->config.rvd_host) {
+      free((void *)relay->config.rvd_host);
+      relay->config.rvd_host = NULL;
+    }
+    if (relay->config.local_host) {
+      free((void *)relay->config.local_host);
+      relay->config.local_host = NULL;
+    }
+    if (relay->config.relay_auth_aes_key) {
+      free(relay->config.relay_auth_aes_key);
+      relay->config.relay_auth_aes_key = NULL;
+    }
+    if (relay->config.escr_signing_key_uri) {
+      free(relay->config.escr_signing_key_uri);
+      relay->config.escr_signing_key_uri = NULL;
     }
     return -1;
   }

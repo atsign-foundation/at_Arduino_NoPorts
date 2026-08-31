@@ -186,18 +186,40 @@ static bool start_daemon() {
     cfg.manager_count = mgr_count;
   }
 
+  int po_valid = 0;
   for (int i = 0; i < po_count; i++) {
     int colon = po_items[i].indexOf(':');
     if (colon > 0) {
-      po_hosts[i] = po_items[i].substring(0, colon);
-      cfg.permitopen[i].host = po_hosts[i].c_str();
-      cfg.permitopen[i].port = (uint16_t)po_items[i].substring(colon + 1).toInt();
+      String port_str = po_items[i].substring(colon + 1);
+      uint16_t port;
+      if (port_str == "*") {
+        port = 0;  // explicit port wildcard
+      } else {
+        // Strict parse, fail closed: toInt() stops at the first non-digit
+        // ("2x2" -> 2) and the cast wraps out-of-range values ("70000" ->
+        // 4464), either of which would silently widen a rule on a typo. Reject
+        // the rule instead of permitting an unintended port.
+        char *end = nullptr;
+        long v = strtol(port_str.c_str(), &end, 10);
+        if (end == port_str.c_str() || *end != '\0' || v < 1 || v > UINT16_MAX) {
+          Serial.printf("[main] permitopen rule '%s' has invalid port — skipping\n",
+                        po_items[i].c_str());
+          continue;
+        }
+        port = (uint16_t)v;
+      }
+      po_hosts[po_valid] = po_items[i].substring(0, colon);
+      cfg.permitopen[po_valid].host = po_hosts[po_valid].c_str();
+      cfg.permitopen[po_valid].port = port;
+      po_valid++;
     } else if (po_items[i] == "*") {
-      po_hosts[i] = "*";
-      cfg.permitopen[i] = { "*", 0 };
+      po_hosts[po_valid] = "*";
+      cfg.permitopen[po_valid].host = po_hosts[po_valid].c_str();
+      cfg.permitopen[po_valid].port = 0;
+      po_valid++;
     }
   }
-  cfg.permitopen_count = po_count;
+  cfg.permitopen_count = po_valid;
 
   cfg.on_tunnel_open  = on_tunnel_open;
   cfg.on_tunnel_close = on_tunnel_close;

@@ -42,6 +42,22 @@ const char *DEVICE_NAME   = "esp32";
 // Manager atSign (the atSign you connect FROM, e.g., your laptop's atSign)
 const char *MANAGER_ATSIGN = "@your_manager_atsign";
 
+// ============================================================================
+// !! SECURITY WARNING — READ BEFORE PASTING KEYS BELOW !!
+// ----------------------------------------------------------------------------
+// The values below are your atSign's DECRYPTED private keys. Anyone who obtains
+// them can fully impersonate this device on the atProtocol network.
+//
+//   * NEVER commit this file with real keys. Committing to a public repo is the
+//     single most common way IoT keys leak. Keep it out of version control.
+//   * Hardcoded keys are baked into the firmware binary in the CLEAR and are
+//     recoverable from flash with `esptool.py read_flash` unless you enable
+//     ESP32 flash encryption. Do not ship production images this way.
+//   * For anything beyond quick local testing, prefer loading keys from a file
+//     at runtime (see the LoadKeysFromSPIFFS example) and enable flash
+//     encryption — see README.md.
+// ============================================================================
+
 // Decrypted atKeys - paste your base64-encoded keys here.
 // See README.md section "Extracting Keys" for instructions.
 const char *PKAM_PUBLIC_KEY  = "PASTE_YOUR_PKAM_PUBLIC_KEY_BASE64_HERE";
