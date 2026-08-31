@@ -3,6 +3,9 @@
  * @brief HTTP server for NoPorts PoE setup and monitoring UI
  *
  * Serves a dark-themed web app on port 80.  Routes:
+ *   GET  /login         → PIN sign-in form (only unauthenticated page)
+ *   POST /api/login     → exchange PIN for a session cookie → 200 JSON
+ *   POST /api/logout    → invalidate session → 200 JSON
  *   GET  /              → dashboard (auto-refreshes via /api/status)
  *   GET  /setup         → first-run setup form
  *   POST /api/setup     → save initial config → 200 JSON
@@ -15,6 +18,12 @@
  *   POST /api/config    → save config → 200 JSON
  *   POST /api/reset     → factory reset → 200 JSON
  *   GET  /api/status    → live daemon stats → 200 JSON
+ *
+ * Access control: every route except /login and /api/login requires a valid
+ * session cookie, obtained by posting the device admin PIN (auto-generated on
+ * first boot and printed to the serial console) to /api/login. The session
+ * cookie is HttpOnly + SameSite=Strict; requests are additionally Host- and
+ * Origin-checked to defend against DNS-rebinding and CSRF.
  */
 
 #ifndef WEB_SERVER_H

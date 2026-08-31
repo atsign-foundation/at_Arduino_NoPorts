@@ -29,6 +29,7 @@
 #define NVS_KEY_ROOT          "root_spec"   // root server spec: host[:port] or proxy:host[:port]; "" = root.atsign.org
 #define NVS_KEY_CONFIGURED    "configured"
 #define NVS_KEY_NTP_GOOD      "ntp_good"    // last known-good NTP epoch (monotonic time floor across reboots)
+#define NVS_KEY_WEB_PIN       "web_pin"     // admin PIN gating the web UI; auto-generated on first boot, printed to serial
 
 // ─── Filesystem paths ─────────────────────────────────────────────────────
 #define ATKEYS_PATH     "/atkeys.json"           // Arduino LittleFS API path

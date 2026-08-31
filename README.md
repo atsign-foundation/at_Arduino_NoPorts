@@ -97,9 +97,9 @@ at_Arduino_NoPorts/
 ### M5Stack Unit PoE-P4 Quick Start
 
 1. Clone the repo and open `packages/NoPorts_PoE` in PlatformIO (uses the [pioarduino](https://github.com/pioarduino/platform-espressif32) platform for ESP32-P4 support).
-2. Flash firmware via USB-C.
+2. Flash firmware via USB-C. **Note the web UI admin PIN** printed to the serial console at boot (`pio device monitor`) — it is generated once and required to sign in to the config UI.
 3. Plug an Ethernet cable into the RJ45 port (PoE switch recommended — no USB power needed).
-4. Navigate to the device's IP address in a browser to complete configuration.
+4. Navigate to the device's IP address in a browser, sign in with the admin PIN, and complete configuration.
 
 ### Browser-based Firmware Installer
 
