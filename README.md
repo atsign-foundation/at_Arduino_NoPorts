@@ -138,6 +138,11 @@ Or use the hosted installer at [cyd.crushware.com](https://cyd.crushware.com).
 - **RSA operations are slow** — envelope verification takes 1–2 seconds
 - **Limited concurrent tunnels** — realistically 2–4 simultaneous connections
 - **NoPorts_PoE requires pioarduino** — the official espressif32 PlatformIO platform does not yet support ESP32-P4
+- **Keys are not encrypted at rest by default** — atSign keys and WiFi
+  credentials are recoverable from a flash dump by anyone with physical access
+  unless ESP32 flash encryption is enabled. Keys are per-device and revocable;
+  see [docs/security-key-storage.md](docs/security-key-storage.md) for the threat
+  model and mitigations.
 
 ---
 
@@ -169,3 +174,7 @@ Copyright (c) 2022, The Atsign Foundation.
 
 If you discover a security vulnerability, please see [SECURITY.md](SECURITY.md)
 for responsible disclosure instructions.
+
+For how the firmware stores atSign keys and WiFi credentials, what a physical
+attacker can recover, and how to mitigate it (key rotation/revocation and ESP32
+flash encryption), see [docs/security-key-storage.md](docs/security-key-storage.md).

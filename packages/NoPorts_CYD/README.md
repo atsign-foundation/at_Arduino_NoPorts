@@ -202,6 +202,17 @@ Client ──► SRVD ◄── Control Channel ──► ESP32
 `NOPORTS_MAX_RELAYS = 4` concurrent NPT connections. Constrained by ESP32 lwIP
 TCP PCB limit (default 10 sockets).
 
+## Security
+
+The atSign keys written during enrollment (`atkeys.json` on LittleFS) and the
+WiFi credentials and config stored in NVS are **not encrypted at rest** by
+default, so anyone with physical/USB access to the board can recover them from a
+flash dump. Because each device has its own revocable enrollment, the primary
+mitigation is to **rotate/revoke** a lost or decommissioned device's enrollment;
+for physically untrusted deployments, additionally enable ESP32 flash
+encryption. See [docs/security-key-storage.md](../../docs/security-key-storage.md)
+for the threat model and mitigations.
+
 ## Performance
 
 - **Frame Rate**: 60 FPS (flicker-free partial updates)
