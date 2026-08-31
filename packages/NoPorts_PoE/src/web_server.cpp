@@ -2,6 +2,7 @@
 #include "nvsconfig.h"
 #include <LittleFS.h>
 #include <Arduino.h>
+#include <esp_random.h>
 #ifdef NOPORTS_POE_P4
 #include <ETH.h>
 #include "led.h"
@@ -24,6 +25,162 @@ static bool     _restart_pending = false; // set by settings POST, cleared by lo
 static bool     _localhost_only  = false; // mirrors NVS_KEY_WEB_LOCAL; set at bind time
 
 static void _rebind(bool local);  // forward declaration — defined near web_server_begin()
+static void _send_page(const String &title, const String &body);  // forward decls used by auth guard
+static void _send_json(int code, const String &json);
+
+// ═══ Authentication ════════════════════════════════════════════════════════
+// The web UI gates every route (except the login page itself) behind an admin
+// PIN. On success the server issues a random session token, delivered as a
+// HttpOnly, SameSite=Strict cookie; SameSite=Strict means the cookie is never
+// sent on cross-site requests, which is the primary CSRF defense. Host- and
+// Origin-header checks add defense in depth (anti DNS-rebinding / anti-CSRF).
+
+#define SESSION_TTL_MS     (60UL * 60UL * 1000UL)  // 1 hour
+#define SESSION_MAX        4                        // concurrent sessions
+#define PIN_GEN_LEN        8                        // digits in the auto-generated initial PIN
+#define PIN_MIN_LEN        6                        // shortest user-chosen PIN
+#define PIN_MAX_LEN        63                       // longest user-chosen PIN (fits NVS + buffer)
+#define LOGIN_MAX_FAILS    5                        // before lockout
+#define LOGIN_LOCKOUT_MS   (60UL * 1000UL)         // lockout window
+
+struct Session { char token[33]; uint32_t expires_ms; };
+static Session _sessions[SESSION_MAX];
+static char    _web_pin[PIN_MAX_LEN + 1] = {0};
+static uint8_t  _web_pin_len    = 0;
+static bool     _pin_must_change = false;  // true until the operator sets their own PIN
+static uint8_t  _login_fails    = 0;
+static uint32_t _lockout_until  = 0;
+
+// Constant-time compare over n bytes — avoids leaking the PIN via response timing.
+static bool _ct_equal(const char *a, const char *b, size_t n) {
+  uint8_t diff = 0;
+  for (size_t i = 0; i < n; i++) diff |= (uint8_t)a[i] ^ (uint8_t)b[i];
+  return diff == 0;
+}
+
+// Load the admin PIN from NVS. On first boot (no stored PIN) generate a random
+// 8-digit initial PIN and flag it must-change; the operator is forced to set
+// their own PIN at first login. The initial PIN is printed to serial so a
+// headless operator can retrieve it during USB flashing — but once the operator
+// has set their own PIN we do NOT print it, to avoid leaking their credential.
+static void _load_or_create_pin() {
+  String pin = nvs_load(NVS_KEY_WEB_PIN);
+  if (pin.length() >= PIN_MIN_LEN && pin.length() <= PIN_MAX_LEN) {
+    strlcpy(_web_pin, pin.c_str(), sizeof(_web_pin));
+  } else {
+    for (int i = 0; i < PIN_GEN_LEN; i++) _web_pin[i] = '0' + (esp_random() % 10);
+    _web_pin[PIN_GEN_LEN] = '\0';
+    nvs_save(NVS_KEY_WEB_PIN, _web_pin);
+    nvs_save(NVS_KEY_WEB_PIN_SET, "0");  // mark as still the device-issued initial PIN
+  }
+  _web_pin_len = strlen(_web_pin);
+  _pin_must_change = (nvs_load(NVS_KEY_WEB_PIN_SET) != "1");
+
+  if (_pin_must_change) {
+    Serial.println("[web] ─────────────────────────────────────────");
+    Serial.printf ("[web]  Web UI initial PIN: %s\n", _web_pin);
+    Serial.println("[web]  Log in with this, then set your own PIN.");
+    Serial.println("[web] ─────────────────────────────────────────");
+  } else {
+    Serial.println("[web] Web UI protected by admin PIN (operator-set).");
+  }
+}
+
+static void _new_token(char *out /* [33] */) {
+  static const char hex[] = "0123456789abcdef";
+  for (int i = 0; i < 32; i++) out[i] = hex[esp_random() & 0x0F];
+  out[32] = '\0';
+}
+
+// Read the np_sess cookie and return true if it names a live session.
+static bool _authed() {
+  if (!_srv->hasHeader("Cookie")) return false;
+  String cookie = _srv->header("Cookie");
+  int p = cookie.indexOf("np_sess=");
+  if (p < 0) return false;
+  p += 8;
+  int e = cookie.indexOf(';', p);
+  String tok = (e < 0) ? cookie.substring(p) : cookie.substring(p, e);
+  tok.trim();
+  if (tok.length() != 32) return false;
+  uint32_t now = millis();
+  for (int i = 0; i < SESSION_MAX; i++) {
+    if (_sessions[i].token[0] && _ct_equal(_sessions[i].token, tok.c_str(), 32)) {
+      if ((int32_t)(now - _sessions[i].expires_ms) >= 0) { _sessions[i].token[0] = '\0'; return false; }
+      _sessions[i].expires_ms = now + SESSION_TTL_MS;  // sliding expiry
+      return true;
+    }
+  }
+  return false;
+}
+
+// Compare a header host[:port] against this device's legitimate names. Blocks
+// DNS-rebinding: an attacker page carries its own domain in Host/Origin, which
+// will not match the device IP / mDNS name / loopback.
+static bool _host_allowed(const String &raw) {
+  if (raw.isEmpty()) return true;  // some clients omit it; cookie+SameSite still gate
+  String h = raw;
+  int scheme = h.indexOf("://");     // strip scheme if this came from Origin
+  if (scheme >= 0) h = h.substring(scheme + 3);
+  int colon = h.indexOf(':');        // strip :port
+  if (colon >= 0) h = h.substring(0, colon);
+  h.toLowerCase();
+  if (h == "localhost" || h == "127.0.0.1") return true;
+  if (h == "noports-poe.local") return true;
+#ifdef NOPORTS_POE_P4
+  if (h == ETH.localIP().toString()) return true;
+#endif
+#ifdef NOPORTS_TEST_WIFI_AP
+  if (h == WiFi.softAPIP().toString()) return true;
+#endif
+  return false;
+}
+
+// Access guard invoked by every protected route. Order: Host allowlist (all
+// requests) → Origin/Referer check (state-changing methods) → session check.
+// Returns false and sends the appropriate response if access is denied.
+static bool _guard(bool require_auth) {
+  if (!_host_allowed(_srv->hostHeader())) {
+    _srv->send(403, "text/plain", "Forbidden");
+    return false;
+  }
+  if (_srv->method() != HTTP_GET) {
+    // Prefer Origin; fall back to Referer. If neither is present the
+    // SameSite=Strict session cookie is the CSRF backstop, so allow.
+    String origin = _srv->hasHeader("Origin")  ? _srv->header("Origin")  : "";
+    String ref    = _srv->hasHeader("Referer") ? _srv->header("Referer") : "";
+    String check  = origin.length() ? origin : ref;
+    if (check.length() && !_host_allowed(check)) {
+      _send_json(403, "{\"ok\":false,\"error\":\"Bad origin\"}");
+      return false;
+    }
+  }
+  if (require_auth && !_authed()) {
+    if (_srv->uri().startsWith("/api/")) {
+      _send_json(401, "{\"ok\":false,\"error\":\"Authentication required\"}");
+    } else {
+      _srv->sendHeader("Location", "/login");
+      _srv->send(302, "text/plain", "");
+    }
+    return false;
+  }
+  // Forced PIN change: while the device still has its initial PIN, an
+  // authenticated operator may only reach the change-PIN surface (and log out).
+  // Everything else is funnelled to /change-pin.
+  if (require_auth && _pin_must_change) {
+    String uri = _srv->uri();
+    if (uri != "/change-pin" && uri != "/api/change-pin" && uri != "/api/logout") {
+      if (uri.startsWith("/api/")) {
+        _send_json(403, "{\"ok\":false,\"error\":\"Set a new PIN first\",\"must_change\":true}");
+      } else {
+        _srv->sendHeader("Location", "/change-pin");
+        _srv->send(302, "text/plain", "");
+      }
+      return false;
+    }
+  }
+  return true;
+}
 
 // ─── Common page chrome ───────────────────────────────────────────────────
 // CSS is deliberately compact (fits ~1.5 KB) so pages render fast over 100 Mbps Ethernet.
@@ -82,7 +239,10 @@ static void _send_page(const String &title, const String &body) {
   page += "<style>"; page += CSS; page += "</style></head><body>";
   page += "<nav class=nav><span class=logo>NoPorts PoE</span>";
   page += "<a href='/'>Dashboard</a><a href='/settings'>Settings</a>";
-  page += "<a href='/config'>Config</a></nav>";
+  page += "<a href='/config'>Config</a>";
+  page += "<a href='/change-pin'>PIN</a>";
+  page += "<a href='#' style='margin-left:auto' onclick=\"fetch('/api/logout',{method:'POST'})"
+          ".then(()=>location.href='/login');return false\">Sign Out</a></nav>";
   page += "<div class=ctr>"; page += body; page += "</div></body></html>";
   _srv->send(200, "text/html; charset=utf-8", page);
 }
@@ -763,6 +923,249 @@ static void _handle_reset() {
   ESP.restart();
 }
 
+// ─── Login / logout (/login  +  /api/login  +  /api/logout) ───────────────
+
+static void _handle_login_get() {
+  // Already logged in? Go straight to the dashboard.
+  if (_authed()) { _srv->sendHeader("Location", "/"); _srv->send(302, "text/plain", ""); return; }
+
+  String b;
+  b.reserve(1024);
+  b  = "<div class=card>";
+  b += "<h1>Sign In</h1>";
+  b += "<p class=sub>Enter the device admin PIN. On first use, log in with the "
+       "initial PIN from the serial console &mdash; you'll then set your own.</p>";
+  b += "<label>Admin PIN<input id=pin type=password autocomplete=off "
+       "placeholder='PIN'></label>";
+  b += "<div id=msg></div>";
+  b += "<div class=btns><button class='btn pr' onclick=login()>Sign In</button></div>";
+  b += "</div>";
+  b += "<script>"
+       "function login(){"
+       "var pin=document.getElementById('pin').value.trim();"
+       "if(!pin){document.getElementById('msg').innerHTML='<div class=\"msg err\">Enter the PIN.</div>';return;}"
+       "fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},"
+       "body:JSON.stringify({pin:pin})}).then(r=>r.json()).then(d=>{"
+       "if(d.ok)location.href=d.must_change?'/change-pin':'/';"
+       "else document.getElementById('msg').innerHTML='<div class=\"msg err\">'+(d.error||'Login failed')+'</div>';"
+       "}).catch(e=>{document.getElementById('msg').innerHTML='<div class=\"msg err\">'+e+'</div>';});}"
+       "document.addEventListener('keydown',function(e){if(e.key==='Enter')login();});"
+       "</script>";
+
+  // Minimal page (no nav — user is not authenticated yet).
+  String page;
+  page.reserve(2048);
+  page  = "<!DOCTYPE html><html><head><meta charset=UTF-8>";
+  page += "<meta name=viewport content='width=device-width,initial-scale=1'>";
+  page += "<title>NoPorts PoE &#8212; Sign In</title>";
+  page += "<style>"; page += CSS; page += "</style></head><body>";
+  page += "<nav class=nav><span class=logo>NoPorts PoE</span></nav>";
+  page += "<div class=ctr>"; page += b; page += "</div></body></html>";
+  _srv->send(200, "text/html; charset=utf-8", page);
+}
+
+static void _handle_login_post() {
+  uint32_t now = millis();
+  if (_lockout_until && (int32_t)(now - _lockout_until) < 0) {
+    return _send_json(429, "{\"ok\":false,\"error\":\"Too many attempts — wait a minute\"}");
+  }
+  if (!_srv->hasArg("plain")) return _send_json(400, "{\"ok\":false,\"error\":\"No body\"}");
+  String body = _srv->arg("plain");
+  int p = body.indexOf("\"pin\":\"");
+  String pin = "";
+  if (p >= 0) { p += 7; int e = body.indexOf('"', p); if (e >= 0) pin = body.substring(p, e); }
+
+  bool ok = (pin.length() == _web_pin_len) &&
+            _ct_equal(pin.c_str(), _web_pin, _web_pin_len);
+  if (!ok) {
+    if (++_login_fails >= LOGIN_MAX_FAILS) {
+      _lockout_until = now + LOGIN_LOCKOUT_MS;
+      _login_fails   = 0;
+      Serial.println("[web] Login lockout: too many failed PIN attempts");
+    }
+    return _send_json(401, "{\"ok\":false,\"error\":\"Invalid PIN\"}");
+  }
+
+  _login_fails   = 0;
+  _lockout_until = 0;
+
+  // Allocate a session slot (reuse an empty or the soonest-expiring one).
+  int slot = 0;
+  uint32_t soonest = 0xFFFFFFFF;
+  for (int i = 0; i < SESSION_MAX; i++) {
+    if (!_sessions[i].token[0]) { slot = i; break; }
+    if (_sessions[i].expires_ms < soonest) { soonest = _sessions[i].expires_ms; slot = i; }
+  }
+  _new_token(_sessions[slot].token);
+  _sessions[slot].expires_ms = now + SESSION_TTL_MS;
+
+  String cookie = "np_sess=";
+  cookie += _sessions[slot].token;
+  cookie += "; Path=/; HttpOnly; SameSite=Strict; Max-Age=3600";
+  _srv->sendHeader("Set-Cookie", cookie);
+  Serial.println("[web] Admin login OK");
+  // Signal the client to route to the change-PIN page while the device still
+  // has its initial PIN.
+  _send_json(200, _pin_must_change ? "{\"ok\":true,\"must_change\":true}"
+                                   : "{\"ok\":true}");
+}
+
+static void _handle_logout() {
+  // Invalidate the caller's session, if any.
+  if (_srv->hasHeader("Cookie")) {
+    String cookie = _srv->header("Cookie");
+    int p = cookie.indexOf("np_sess=");
+    if (p >= 0) {
+      p += 8; int e = cookie.indexOf(';', p);
+      String tok = (e < 0) ? cookie.substring(p) : cookie.substring(p, e);
+      tok.trim();
+      for (int i = 0; i < SESSION_MAX; i++)
+        if (_sessions[i].token[0] && _ct_equal(_sessions[i].token, tok.c_str(), 32))
+          _sessions[i].token[0] = '\0';
+    }
+  }
+  _srv->sendHeader("Set-Cookie", "np_sess=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+  _send_json(200, "{\"ok\":true}");
+}
+
+// ─── Change PIN (/change-pin  +  /api/change-pin) ─────────────────────────
+
+// Copy the caller's np_sess token into out[33]; out[0]='\0' if none.
+static void _caller_token(char *out /* [33] */) {
+  out[0] = '\0';
+  if (!_srv->hasHeader("Cookie")) return;
+  String cookie = _srv->header("Cookie");
+  int p = cookie.indexOf("np_sess=");
+  if (p < 0) return;
+  p += 8;
+  int e = cookie.indexOf(';', p);
+  String tok = (e < 0) ? cookie.substring(p) : cookie.substring(p, e);
+  tok.trim();
+  if (tok.length() == 32) strlcpy(out, tok.c_str(), 33);
+}
+
+static void _handle_change_pin_get() {
+  String b;
+  b.reserve(1536);
+  b  = "<div class=card>";
+  b += "<h1>Set Admin PIN</h1>";
+  if (_pin_must_change) {
+    b += "<p class=sub>This device is still using its initial PIN. Choose your own "
+         "PIN to continue.</p>";
+  } else {
+    b += "<p class=sub>Change the PIN used to sign in to this web UI.</p>";
+  }
+  b += "<label>Current PIN<input id=cur type=password autocomplete=off></label>";
+  b += "<label>New PIN<input id=np type=password autocomplete=new-password "
+       "placeholder='6&#8211;63 characters'></label>";
+  b += "<label>Confirm new PIN<input id=np2 type=password autocomplete=new-password></label>";
+  b += "<div id=msg></div>";
+  b += "<div class=btns><button class='btn pr' onclick=chg()>Save PIN</button>";
+  if (!_pin_must_change) b += "<a class='btn sc' href='/'>Cancel</a>";
+  b += "</div></div>";
+  b += "<script>"
+       "function chg(){"
+       "var cur=document.getElementById('cur').value,"
+       "np=document.getElementById('np').value,"
+       "np2=document.getElementById('np2').value,"
+       "m=document.getElementById('msg');"
+       "if(!cur||!np){m.innerHTML='<div class=\"msg err\">All fields are required.</div>';return;}"
+       "if(np!==np2){m.innerHTML='<div class=\"msg err\">New PINs do not match.</div>';return;}"
+       "if(np.length<6){m.innerHTML='<div class=\"msg err\">New PIN must be at least 6 characters.</div>';return;}"
+       "fetch('/api/change-pin',{method:'POST',headers:{'Content-Type':'application/json'},"
+       "body:JSON.stringify({current:cur,pin:np})}).then(r=>r.json()).then(d=>{"
+       "if(d.ok){m.innerHTML='<div class=\"msg ok\">PIN updated.</div>';setTimeout(()=>location.href='/',1200);}"
+       "else m.innerHTML='<div class=\"msg err\">'+(d.error||'Failed')+'</div>';"
+       "}).catch(e=>{m.innerHTML='<div class=\"msg err\">'+e+'</div>';});}"
+       "</script>";
+
+  // Standalone page during forced change (no nav to other sections yet).
+  if (_pin_must_change) {
+    String page;
+    page.reserve(2560);
+    page  = "<!DOCTYPE html><html><head><meta charset=UTF-8>";
+    page += "<meta name=viewport content='width=device-width,initial-scale=1'>";
+    page += "<title>NoPorts PoE &#8212; Set PIN</title>";
+    page += "<style>"; page += CSS; page += "</style></head><body>";
+    page += "<nav class=nav><span class=logo>NoPorts PoE</span>";
+    page += "<a href='#' style='margin-left:auto' onclick=\"fetch('/api/logout',{method:'POST'})"
+            ".then(()=>location.href='/login');return false\">Sign Out</a></nav>";
+    page += "<div class=ctr>"; page += b; page += "</div></body></html>";
+    return _srv->send(200, "text/html; charset=utf-8", page);
+  }
+  _send_page("Set PIN", b);
+}
+
+// Reject control chars and characters that would break the naive JSON parsing
+// / NVS round-trip; allow the rest of printable ASCII so passphrases work.
+static bool _pin_chars_ok(const String &s) {
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c < 0x20 || c == 0x7F) return false;   // control chars
+    if (c == '"' || c == '\\') return false;    // break JSON body parsing
+    if (c == ' ') return false;                 // avoid confusing trailing spaces
+  }
+  return true;
+}
+
+static void _handle_change_pin_post() {
+  uint32_t now = millis();
+  if (_lockout_until && (int32_t)(now - _lockout_until) < 0) {
+    return _send_json(429, "{\"ok\":false,\"error\":\"Too many attempts — wait a minute\"}");
+  }
+  if (!_srv->hasArg("plain")) return _send_json(400, "{\"ok\":false,\"error\":\"No body\"}");
+  String body = _srv->arg("plain");
+  auto extract = [&](const char *key) -> String {
+    String k = "\""; k += key; k += "\":\"";
+    int p = body.indexOf(k);
+    if (p < 0) return "";
+    p += k.length();
+    int e = body.indexOf('"', p);
+    return e < 0 ? "" : body.substring(p, e);
+  };
+  String current = extract("current");
+  String newpin  = extract("pin");
+
+  // Verify the current PIN (constant-time), rate-limited like login.
+  bool cur_ok = (current.length() == _web_pin_len) &&
+                _ct_equal(current.c_str(), _web_pin, _web_pin_len);
+  if (!cur_ok) {
+    if (++_login_fails >= LOGIN_MAX_FAILS) {
+      _lockout_until = now + LOGIN_LOCKOUT_MS;
+      _login_fails   = 0;
+    }
+    return _send_json(401, "{\"ok\":false,\"error\":\"Current PIN is incorrect\"}");
+  }
+  _login_fails = 0;
+
+  if (newpin.length() < PIN_MIN_LEN || newpin.length() > PIN_MAX_LEN) {
+    return _send_json(400, "{\"ok\":false,\"error\":\"New PIN must be 6-63 characters\"}");
+  }
+  if (!_pin_chars_ok(newpin)) {
+    return _send_json(400, "{\"ok\":false,\"error\":\"New PIN contains invalid characters\"}");
+  }
+  if (newpin.length() == _web_pin_len && _ct_equal(newpin.c_str(), _web_pin, _web_pin_len)) {
+    return _send_json(400, "{\"ok\":false,\"error\":\"New PIN must differ from the current one\"}");
+  }
+
+  // Persist and activate the new PIN.
+  strlcpy(_web_pin, newpin.c_str(), sizeof(_web_pin));
+  _web_pin_len = strlen(_web_pin);
+  nvs_save(NVS_KEY_WEB_PIN, _web_pin);
+  nvs_save(NVS_KEY_WEB_PIN_SET, "1");
+  _pin_must_change = false;
+
+  // Invalidate every other session; keep the caller signed in.
+  char keep[33]; _caller_token(keep);
+  for (int i = 0; i < SESSION_MAX; i++) {
+    if (_sessions[i].token[0] && !(keep[0] && _ct_equal(_sessions[i].token, keep, 32)))
+      _sessions[i].token[0] = '\0';
+  }
+
+  Serial.println("[web] Admin PIN changed by operator");
+  _send_json(200, "{\"ok\":true}");
+}
+
 // ─── 404 ──────────────────────────────────────────────────────────────────
 
 static void _handle_not_found() {
@@ -771,21 +1174,44 @@ static void _handle_not_found() {
 
 // ─── Internal helpers ─────────────────────────────────────────────────────
 
+// Register a route behind the access guard. `auth` = false for the login
+// endpoints (still Host/Origin-checked, but reachable without a session).
+static void _guarded(const char *uri, HTTPMethod method, void (*handler)(), bool auth) {
+  _srv->on(uri, method, [handler, auth]() {
+    if (!_guard(auth)) return;   // sends 401/403/redirect on denial
+    handler();
+  });
+}
+
 static void _register_routes() {
-  _srv->on("/",                   HTTP_GET,  _handle_dashboard);
-  _srv->on("/setup",              HTTP_GET,  _handle_setup_get);
-  _srv->on("/enroll",             HTTP_GET,  _handle_enroll_get);
-  _srv->on("/settings",           HTTP_GET,  _handle_settings_get);
-  _srv->on("/config",             HTTP_GET,  _handle_config_get);
-  _srv->on("/api/status",         HTTP_GET,  _handle_status);
-  _srv->on("/api/enroll-status",  HTTP_GET,  _handle_enroll_status);
-  _srv->on("/api/setup",          HTTP_POST, _handle_setup_post);
-  _srv->on("/api/enroll",         HTTP_POST, _handle_enroll_post);
-  _srv->on("/api/settings",       HTTP_POST, _handle_settings_post);
-  _srv->on("/api/config",         HTTP_POST, _handle_config_post);
-  _srv->on("/api/reset",          HTTP_POST, _handle_reset);
+  // Headers the guard/auth logic needs (Arduino WebServer ignores others).
+  static const char *WANT_HEADERS[] = {"Cookie", "Origin", "Referer"};
+  _srv->collectHeaders(WANT_HEADERS, sizeof(WANT_HEADERS) / sizeof(WANT_HEADERS[0]));
+
+  // Unauthenticated (login surface only).
+  _guarded("/login",              HTTP_GET,  _handle_login_get,     false);
+  _guarded("/api/login",          HTTP_POST, _handle_login_post,    false);
+  _guarded("/api/logout",         HTTP_POST, _handle_logout,        false);
+
+  // Change-PIN surface — requires a session; reachable during forced change.
+  _guarded("/change-pin",         HTTP_GET,  _handle_change_pin_get,  true);
+  _guarded("/api/change-pin",     HTTP_POST, _handle_change_pin_post, true);
+
+  // Everything else requires a valid session.
+  _guarded("/",                   HTTP_GET,  _handle_dashboard,     true);
+  _guarded("/setup",              HTTP_GET,  _handle_setup_get,     true);
+  _guarded("/enroll",             HTTP_GET,  _handle_enroll_get,    true);
+  _guarded("/settings",           HTTP_GET,  _handle_settings_get,  true);
+  _guarded("/config",             HTTP_GET,  _handle_config_get,    true);
+  _guarded("/api/status",         HTTP_GET,  _handle_status,        true);
+  _guarded("/api/enroll-status",  HTTP_GET,  _handle_enroll_status, true);
+  _guarded("/api/setup",          HTTP_POST, _handle_setup_post,    true);
+  _guarded("/api/enroll",         HTTP_POST, _handle_enroll_post,   true);
+  _guarded("/api/settings",       HTTP_POST, _handle_settings_post, true);
+  _guarded("/api/config",         HTTP_POST, _handle_config_post,   true);
+  _guarded("/api/reset",          HTTP_POST, _handle_reset,         true);
 #ifdef NOPORTS_POE_P4
-  _srv->on("/api/identify",       HTTP_POST, _handle_identify);
+  _guarded("/api/identify",       HTTP_POST, _handle_identify,      true);
 #endif
   _srv->onNotFound(_handle_not_found);
 }
@@ -822,6 +1248,9 @@ void web_server_begin(NoPortsDaemon *daemon,
 
   _enroll->phase      = ENROLL_IDLE;
   _enroll->message[0] = '\0';
+
+  for (int i = 0; i < SESSION_MAX; i++) _sessions[i].token[0] = '\0';
+  _load_or_create_pin();
 
   _localhost_only = (nvs_load(NVS_KEY_WEB_LOCAL) == "1");
   // Safety: localhost-only with no daemon configured = permanent lockout. Fall back.

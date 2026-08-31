@@ -97,9 +97,49 @@ at_Arduino_NoPorts/
 ### M5Stack Unit PoE-P4 Quick Start
 
 1. Clone the repo and open `packages/NoPorts_PoE` in PlatformIO (uses the [pioarduino](https://github.com/pioarduino/platform-espressif32) platform for ESP32-P4 support).
-2. Flash firmware via USB-C.
+2. Flash firmware via USB-C. **Note the web UI admin PIN** printed to the serial console at boot (see below) — it is required to sign in to the config UI.
 3. Plug an Ethernet cable into the RJ45 port (PoE switch recommended — no USB power needed).
-4. Navigate to the device's IP address in a browser to complete configuration.
+4. Navigate to the device's IP address in a browser, sign in with the admin PIN, and complete configuration.
+
+#### Web UI admin PIN
+
+The config web UI is protected by an admin PIN. On first boot the device
+generates a random 8-digit **initial PIN** and prints it to the serial console.
+You log in with that once, and are then **required to set your own PIN** before
+you can use the UI.
+
+To read the initial PIN, connect over USB-C and open the serial monitor:
+
+```bash
+pio device monitor -e esp32p4    # or: pio device monitor -b 115200
+```
+
+Look for this block in the boot log:
+
+```
+[web] ─────────────────────────────────────────
+[web]  Web UI initial PIN: 12345678
+[web]  Log in with this, then set your own PIN.
+[web] ─────────────────────────────────────────
+```
+
+Then browse to the device's IP address, sign in with the initial PIN, and set
+your own PIN (6–63 characters) on the page that follows. After that:
+
+- Sign in at the device IP with **your** PIN. A session lasts one hour.
+- You can change the PIN any time from the **PIN** link in the top nav.
+
+Notes:
+
+- Once you've set your own PIN it is **never printed to serial** — only the
+  temporary initial PIN is, and only until you replace it.
+- The PIN persists across reboots and factory reset, so a headless/PoE-only
+  device stays reachable.
+- **Forgot your PIN?** Because your PIN is never printed, recovery requires
+  physical access: erase it so a fresh initial PIN is generated — e.g.
+  `pio run -e esp32p4 -t erase` then re-flash (this also clears other config),
+  or clear the `web_pin` and `web_pin_ok` NVS keys with your own tooling. The
+  device will then prompt for a new PIN at the next login.
 
 ### Browser-based Firmware Installer
 
