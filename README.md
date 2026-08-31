@@ -97,9 +97,43 @@ at_Arduino_NoPorts/
 ### M5Stack Unit PoE-P4 Quick Start
 
 1. Clone the repo and open `packages/NoPorts_PoE` in PlatformIO (uses the [pioarduino](https://github.com/pioarduino/platform-espressif32) platform for ESP32-P4 support).
-2. Flash firmware via USB-C. **Note the web UI admin PIN** printed to the serial console at boot (`pio device monitor`) — it is generated once and required to sign in to the config UI.
+2. Flash firmware via USB-C. **Note the web UI admin PIN** printed to the serial console at boot (see below) — it is required to sign in to the config UI.
 3. Plug an Ethernet cable into the RJ45 port (PoE switch recommended — no USB power needed).
 4. Navigate to the device's IP address in a browser, sign in with the admin PIN, and complete configuration.
+
+#### Web UI admin PIN
+
+The config web UI is protected by an 8-digit admin PIN. The PIN is generated
+once on first boot, stored on the device, and **printed to the serial console
+every boot** so you can always retrieve it.
+
+To read it, connect over USB-C and open the serial monitor:
+
+```bash
+pio device monitor -e esp32p4    # or: pio device monitor -b 115200
+```
+
+Look for this block in the boot log:
+
+```
+[web] ─────────────────────────────────────────
+[web]  Web UI admin PIN: 12345678
+[web]  (enter this to log in at the device IP)
+[web] ─────────────────────────────────────────
+```
+
+Then browse to the device's IP address, enter the PIN on the sign-in page, and
+you're in. A session lasts one hour.
+
+Notes:
+
+- The PIN is **stable** — it persists across reboots and even a factory reset,
+  so a headless/PoE-only device is never locked out.
+- **Forgot the PIN?** Reconnect USB-C and reboot the device with the serial
+  monitor open — the PIN is reprinted on every boot.
+- **Rotate the PIN:** erase it and let a new one generate on the next boot, e.g.
+  `pio run -e esp32p4 -t erase` then re-flash (this also clears other config), or
+  clear just the `web_pin` NVS key with your own tooling.
 
 ### Browser-based Firmware Installer
 
