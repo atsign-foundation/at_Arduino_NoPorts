@@ -103,11 +103,12 @@ at_Arduino_NoPorts/
 
 #### Web UI admin PIN
 
-The config web UI is protected by an 8-digit admin PIN. The PIN is generated
-once on first boot, stored on the device, and **printed to the serial console
-every boot** so you can always retrieve it.
+The config web UI is protected by an admin PIN. On first boot the device
+generates a random 8-digit **initial PIN** and prints it to the serial console.
+You log in with that once, and are then **required to set your own PIN** before
+you can use the UI.
 
-To read it, connect over USB-C and open the serial monitor:
+To read the initial PIN, connect over USB-C and open the serial monitor:
 
 ```bash
 pio device monitor -e esp32p4    # or: pio device monitor -b 115200
@@ -117,23 +118,28 @@ Look for this block in the boot log:
 
 ```
 [web] ─────────────────────────────────────────
-[web]  Web UI admin PIN: 12345678
-[web]  (enter this to log in at the device IP)
+[web]  Web UI initial PIN: 12345678
+[web]  Log in with this, then set your own PIN.
 [web] ─────────────────────────────────────────
 ```
 
-Then browse to the device's IP address, enter the PIN on the sign-in page, and
-you're in. A session lasts one hour.
+Then browse to the device's IP address, sign in with the initial PIN, and set
+your own PIN (6–63 characters) on the page that follows. After that:
+
+- Sign in at the device IP with **your** PIN. A session lasts one hour.
+- You can change the PIN any time from the **PIN** link in the top nav.
 
 Notes:
 
-- The PIN is **stable** — it persists across reboots and even a factory reset,
-  so a headless/PoE-only device is never locked out.
-- **Forgot the PIN?** Reconnect USB-C and reboot the device with the serial
-  monitor open — the PIN is reprinted on every boot.
-- **Rotate the PIN:** erase it and let a new one generate on the next boot, e.g.
-  `pio run -e esp32p4 -t erase` then re-flash (this also clears other config), or
-  clear just the `web_pin` NVS key with your own tooling.
+- Once you've set your own PIN it is **never printed to serial** — only the
+  temporary initial PIN is, and only until you replace it.
+- The PIN persists across reboots and factory reset, so a headless/PoE-only
+  device stays reachable.
+- **Forgot your PIN?** Because your PIN is never printed, recovery requires
+  physical access: erase it so a fresh initial PIN is generated — e.g.
+  `pio run -e esp32p4 -t erase` then re-flash (this also clears other config),
+  or clear the `web_pin` and `web_pin_ok` NVS keys with your own tooling. The
+  device will then prompt for a new PIN at the next login.
 
 ### Browser-based Firmware Installer
 
