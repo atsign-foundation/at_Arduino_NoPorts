@@ -193,6 +193,15 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
   _state = DAEMON_INITIALIZING;
   memcpy(&_config, &config, sizeof(NoPortsConfig));
 
+  // Seed the policy-RPC reqId counter with a random 32-bit base rather than
+  // restarting from 0 on every boot. The Dart AtRpc server keeps a per-reqId
+  // mutex/dedup for 30 s; if the daemon restarts and reissues low reqIds (1,2,
+  // 3…) within that window — the normal flash-and-retest cycle — the policy
+  // server treats them as duplicates and drops them, so the first several
+  // ping/NPT auth checks time out until the counter climbs past the previous
+  // run's highest reqId. A fresh random base each boot avoids the collision.
+  s_policy_req_counter = esp_random();
+
   // enrollment_id is a heap string freed by noports_keys_free() after begin() returns.
   // Deep-copy it so the daemon owns a persistent copy for the lifetime of the session.
   if (_config.enrollment_id)
