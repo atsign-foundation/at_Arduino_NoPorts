@@ -66,6 +66,15 @@ extern "C" {
 // per-request mutex (keyed on reqId, TTL=30 s) does not block the next check.
 static uint32_t s_policy_req_counter = 0;
 
+// Next policy reqId, never 0. The counter is seeded randomly at begin() and
+// increments per request; on the 2^32 wrap `++` yields 0, which we skip so a
+// reqId can never collide with the "uninitialised id" value on either side.
+static uint32_t _next_policy_req_id() {
+  uint32_t id = ++s_policy_req_counter;
+  if (id == 0) id = ++s_policy_req_counter;
+  return id;
+}
+
 // Notification key string mapping (from daemon.c)
 static const struct {
   const char *str;
@@ -1262,7 +1271,7 @@ void NoPortsDaemon::_handlePing(void *msg) {
     }
     _policy_pending.in_use          = true;
     _policy_pending.type            = NOPORTS_POLICY_PING;
-    _policy_pending.req_id          = ++s_policy_req_counter;
+    _policy_pending.req_id          = _next_policy_req_id();
     _policy_pending.sent_at_ms      = millis();
     _policy_pending.envelope        = nullptr;
     strncpy(_policy_pending.requesting_atsign, from,
@@ -1347,7 +1356,7 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
     }
     _policy_pending.in_use          = true;
     _policy_pending.type            = NOPORTS_POLICY_NPT;
-    _policy_pending.req_id          = ++s_policy_req_counter;
+    _policy_pending.req_id          = _next_policy_req_id();
     _policy_pending.sent_at_ms      = millis();
     _policy_pending.envelope        = envelope;  // ownership transferred
     strncpy(_policy_pending.requesting_atsign, requesting_atsign,
