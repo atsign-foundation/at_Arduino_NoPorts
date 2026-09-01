@@ -3,9 +3,12 @@
 # Build context is the repo root so the Dockerfile can access lib/ and
 # packages/NoPorts_PoE/.
 #
-# WebSerial requires a secure context.  On the same machine http://localhost:8080
-# works fine.  Over a local network use HTTPS or set the browser flag
-# chrome://flags/#unsafely-treat-insecure-origin-as-secure for quick testing.
+# The port is bound to 127.0.0.1 only, so the flasher is reachable from this
+# machine but NOT the local network. WebSerial needs a secure context, which
+# http://localhost:8080 satisfies. To flash from another machine, change the
+# bind below AND serve it over HTTPS (a plain-HTTP flasher on the LAN is unsafe;
+# the chrome://flags insecure-origin workaround weakens the browser and is not
+# recommended).
 
 services:
   flasher:
@@ -13,5 +16,5 @@ services:
       context: ../..
       dockerfile: packages/NoPorts_PoE/Dockerfile
     ports:
-      - "8080:80"
+      - "127.0.0.1:8080:80"
     restart: unless-stopped

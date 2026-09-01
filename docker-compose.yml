@@ -2,7 +2,12 @@
 #
 #   docker compose up --build
 #
-# Then browse to http://localhost:8080
+# Then browse to http://localhost:8081
+#
+# The router port is bound to 127.0.0.1 only, so the flasher is reachable from
+# this machine but NOT the local network. WebSerial flashing needs a secure
+# context, which localhost satisfies. To expose it on the network, change the
+# bind below AND put it behind HTTPS (a plain-HTTP flasher on the LAN is unsafe).
 #
 # The router nginx serves a landing page and proxies:
 #   /cyd/  →  NoPorts CYD (ESP32 / ESP32-S3 display variants)
@@ -31,7 +36,7 @@ services:
       context: web
       dockerfile: Dockerfile
     ports:
-      - "8081:80"
+      - "127.0.0.1:8081:80"
     depends_on:
       - cyd-flasher
       - poe-flasher
