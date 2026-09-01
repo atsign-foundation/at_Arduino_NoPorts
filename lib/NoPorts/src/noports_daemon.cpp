@@ -22,7 +22,8 @@
 #include "noports/noports_daemon.h"
 #include "noports/noports_log.h"
 #include <stdarg.h>
-#include <esp_system.h>   // esp_restart()
+#include <sys/time.h>     // gettimeofday() for the policy reqId seed
+#include <esp_system.h>   // esp_restart(), esp_random()
 #include <esp_heap_caps.h> // heap_caps_get_largest_free_block()
 
 // === Embedded atSDK includes ===
@@ -65,6 +66,15 @@ extern "C" {
 // Each ping AND npt check must use a unique reqId so the Dart AtRpc server's
 // per-request mutex (keyed on reqId, TTL=30 s) does not block the next check.
 static uint32_t s_policy_req_counter = 0;
+
+// Next policy reqId, never 0. The counter is seeded randomly at begin() and
+// increments per request; on the 2^32 wrap `++` yields 0, which we skip so a
+// reqId can never collide with the "uninitialised id" value on either side.
+static uint32_t _next_policy_req_id() {
+  uint32_t id = ++s_policy_req_counter;
+  if (id == 0) id = ++s_policy_req_counter;
+  return id;
+}
 
 // Notification key string mapping (from daemon.c)
 static const struct {
@@ -192,6 +202,28 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
 
   _state = DAEMON_INITIALIZING;
   memcpy(&_config, &config, sizeof(NoPortsConfig));
+
+  // Seed the policy-RPC reqId counter so a restart never reuses reqIds the Dart
+  // AtRpc server still holds in its 30 s dedup window (a plain reset to 0 makes
+  // the first requests 1,2,3… again — the normal flash-and-retest cycle — which
+  // the policy server drops as duplicates, timing out the first several checks).
+  //
+  // Prefer the wall clock, like the C sshnpd (which uses gettimeofday micros):
+  // the base then always advances across reboots. at_c's reqId is uint32_t so we
+  // can't carry full epoch-micros; the low 32 bits advance ~1 MHz and wrap only
+  // every ~71 min, far longer than the 30 s window, so a reboot always lands
+  // clear of the previous run's recent reqIds. Fall back to the hardware RNG if
+  // the clock is not NTP-synced yet (e.g. no network at startup).
+  {
+    struct timeval tv;
+    if (gettimeofday(&tv, nullptr) == 0 &&
+        (unsigned long)tv.tv_sec > 1735689600UL /* 2025-01-01: clock is set */) {
+      uint64_t epoch_us = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+      s_policy_req_counter = (uint32_t)epoch_us;
+    } else {
+      s_policy_req_counter = esp_random();
+    }
+  }
 
   // enrollment_id is a heap string freed by noports_keys_free() after begin() returns.
   // Deep-copy it so the daemon owns a persistent copy for the lifetime of the session.
@@ -1253,7 +1285,7 @@ void NoPortsDaemon::_handlePing(void *msg) {
     }
     _policy_pending.in_use          = true;
     _policy_pending.type            = NOPORTS_POLICY_PING;
-    _policy_pending.req_id          = ++s_policy_req_counter;
+    _policy_pending.req_id          = _next_policy_req_id();
     _policy_pending.sent_at_ms      = millis();
     _policy_pending.envelope        = nullptr;
     strncpy(_policy_pending.requesting_atsign, from,
@@ -1338,7 +1370,7 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
     }
     _policy_pending.in_use          = true;
     _policy_pending.type            = NOPORTS_POLICY_NPT;
-    _policy_pending.req_id          = ++s_policy_req_counter;
+    _policy_pending.req_id          = _next_policy_req_id();
     _policy_pending.sent_at_ms      = millis();
     _policy_pending.envelope        = envelope;  // ownership transferred
     strncpy(_policy_pending.requesting_atsign, requesting_atsign,
