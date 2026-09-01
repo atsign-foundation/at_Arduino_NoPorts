@@ -150,6 +150,11 @@ docker compose up --build
 # Then open http://localhost:8081
 ```
 
+The flasher binds to `127.0.0.1` only, so it's reachable from the machine
+running it but not the local network — `localhost` is also the secure context
+WebSerial requires. To flash from another machine, change the port bind in the
+compose file and serve it over HTTPS.
+
 Or use the hosted installer at [cyd.crushware.com](https://cyd.crushware.com).
 
 ---
