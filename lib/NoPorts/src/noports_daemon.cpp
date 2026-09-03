@@ -191,6 +191,21 @@ NoPortsDaemon::~NoPortsDaemon() {
   _freeResources();
 }
 
+// atchops_rsa_sign writes modulus-size bytes into the caller's buffer, and
+// every sign site in the daemon and relay uses a fixed 256-byte buffer - so a
+// signing key with a larger modulus (e.g. RSA-4096 atKeys) would smash the
+// stack/heap at first use. Checking once here, right after the keys are
+// cloned, covers all of them. The DER INTEGER encoding pads the modulus with
+// a leading 0x00 whenever its MSB is set (always, for a real modulus), so a
+// valid RSA-2048 key normally arrives with n.len == 257 - compare significant
+// bytes, not raw length.
+static bool _is_rsa2048_private_key(const atchops_rsa_key_private_key *key) {
+  const unsigned char *n_bytes = key->n.value;
+  size_t n_sig = key->n.len;
+  while (n_sig > 0 && n_bytes[0] == 0x00) { n_bytes++; n_sig--; }
+  return n_sig == 256;
+}
+
 // ============================================================================
 // Public API
 // ============================================================================
@@ -439,6 +454,11 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
     _state = DAEMON_ERROR;
     return false;
   }
+  if (!_is_rsa2048_private_key((atchops_rsa_key_private_key *)_signing_key)) {
+    _setError("Encrypt private key is not RSA-2048; refusing to sign with it");
+    _state = DAEMON_ERROR;
+    return false;
+  }
 
   // ---- Create APKAM signing key copy (from pkam private key, for ESCR auth) ----
   _pkam_signing_key = calloc(1, sizeof(atchops_rsa_key_private_key));
@@ -452,6 +472,11 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
                                           (atchops_rsa_key_private_key *)_pkam_signing_key);
   if (res != 0) {
     _setError("Failed to clone PKAM signing key: %d", res);
+    _state = DAEMON_ERROR;
+    return false;
+  }
+  if (!_is_rsa2048_private_key((atchops_rsa_key_private_key *)_pkam_signing_key)) {
+    _setError("PKAM private key is not RSA-2048; refusing to sign with it");
     _state = DAEMON_ERROR;
     return false;
   }
