@@ -570,6 +570,15 @@ static void _zero_free_key(void *p) {
   }
 }
 
+// Wipe and free the Phase-2 connect: line buffers (they carry the decrypted
+// per-session data-channel AES keys). Both are 256-byte calloc'd buffers.
+static void _free_cmsgs(char *a, char *b) {
+  mbedtls_platform_zeroize(a, 256);
+  mbedtls_platform_zeroize(b, 256);
+  free(a);
+  free(b);
+}
+
 static bool _peer_closed(WiFiClient &client) {
   int fd = client.fd();
   if (fd < 0) return true;
@@ -1325,6 +1334,7 @@ static void _relay_task_inner(NoPortsRelay *relay) {
 
       if (!sockA.connected() && !relay->rvd_client.connected()) {
         NOPORTS_LOGE(TAG, "Both SRVD sockets disconnected while waiting for connect:");
+        _free_cmsgs(cmsgA, cmsgB);
         relay->state = RELAY_ERROR;
         goto cleanup;
       }
@@ -1335,6 +1345,7 @@ static void _relay_task_inner(NoPortsRelay *relay) {
     if (!got_connect || !connect_msg) {
       NOPORTS_LOGE(TAG, "Timed out waiting for connect: on both sockets (A=%d B=%d)",
                    posA, posB);
+      _free_cmsgs(cmsgA, cmsgB);
       relay->state = RELAY_ERROR;
       goto cleanup;
     }
@@ -1353,6 +1364,7 @@ static void _relay_task_inner(NoPortsRelay *relay) {
 
     if (strncmp(connect_msg, "connect:", 8) != 0) {
       NOPORTS_LOGE(TAG, "Invalid connect message (expected 'connect:' prefix)");
+      _free_cmsgs(cmsgA, cmsgB);
       relay->state = RELAY_ERROR;
       goto cleanup;
     }
@@ -1379,6 +1391,7 @@ static void _relay_task_inner(NoPortsRelay *relay) {
 
       if (nfields < 2) {
         NOPORTS_LOGE(TAG, "Invalid connect message (need at least key:iv, got %d fields)", nfields);
+        _free_cmsgs(cmsgA, cmsgB);
         relay->state = RELAY_ERROR;
         goto cleanup;
       }
@@ -1399,13 +1412,13 @@ static void _relay_task_inner(NoPortsRelay *relay) {
                                      &data_enc, &data_dec);
       if (enc_res != 0) {
         NOPORTS_LOGE(TAG, "Failed to create data channel AES-CTR state");
+        _free_cmsgs(cmsgA, cmsgB);
         relay->state = RELAY_ERROR;
         goto cleanup;
       }
       data_encrypted = true;
     }
-    free(cmsgA);
-    free(cmsgB);
+    _free_cmsgs(cmsgA, cmsgB);
   }
 
   // ======================================================================
