@@ -1137,8 +1137,23 @@ void NoPortsDaemon::_handleNotification(void *msg) {
     return;
   }
 
-  if (!has_key || strcmp(message->notification->id, "-1") == 0) {
-    NOPORTS_LOGD(TAG, "Skipping notification (no key or id=-1)");
+  // Guard every field this handler dereferences: the notification comes off
+  // the wire, and a missing id/from/to would otherwise be a strcmp/strlen on
+  // NULL - an ESP32 panic and reboot loop any sender can trigger.
+  bool has_id = atclient_atnotification_is_id_initialized(message->notification) &&
+                message->notification->id != NULL;
+  bool has_from = atclient_atnotification_is_from_initialized(message->notification) &&
+                  message->notification->from != NULL;
+  bool has_to = atclient_atnotification_is_to_initialized(message->notification) &&
+                message->notification->to != NULL;
+
+  if (!has_key || !has_id || strcmp(message->notification->id, "-1") == 0) {
+    NOPORTS_LOGD(TAG, "Skipping notification (no key, no id, or id=-1)");
+    return;
+  }
+
+  if (!has_from || !has_to) {
+    NOPORTS_LOGD(TAG, "Skipping notification (missing from/to)");
     return;
   }
 
