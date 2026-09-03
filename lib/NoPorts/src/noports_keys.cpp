@@ -24,6 +24,7 @@
 
 // cJSON and atchops are bundled directly in this library
 #include <mbedtls/aes.h>
+#include <mbedtls/platform_util.h>  // mbedtls_platform_zeroize
 
 extern "C" {
   #include "atclient/json.h"
@@ -63,6 +64,7 @@ static int _decrypt_key(const char *encrypted_base64, const char *self_enc_key_b
                               encrypted, enc_max_len, &encrypted_len);
   if (res != 0) {
     NOPORTS_LOGE(TAG, "Failed to decode encrypted key");
+    mbedtls_platform_zeroize(aes_key, sizeof(aes_key));
     free(encrypted);
     return -1;
   }
@@ -74,6 +76,7 @@ static int _decrypt_key(const char *encrypted_base64, const char *self_enc_key_b
   size_t plaintext_size = encrypted_len + 1;
   unsigned char *plaintext = (unsigned char *)malloc(plaintext_size);
   if (plaintext == NULL) {
+    mbedtls_platform_zeroize(aes_key, sizeof(aes_key));
     free(encrypted);
     return -1;
   }
@@ -82,6 +85,8 @@ static int _decrypt_key(const char *encrypted_base64, const char *self_enc_key_b
   res = atchops_aes_ctr_decrypt(aes_key, ATCHOPS_AES_256, iv,
                                 encrypted, encrypted_len,
                                 plaintext, plaintext_size, &plaintext_len);
+  // the decoded self-encryption key is no longer needed on the stack
+  mbedtls_platform_zeroize(aes_key, sizeof(aes_key));
   free(encrypted);
 
   if (res != 0) {
