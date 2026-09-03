@@ -1646,11 +1646,17 @@ void NoPortsDaemon::_handlePolicyResponse(void *msg) {
               const char *s = cJSON_GetStringValue(item);
               NOPORTS_LOGI(TAG, "Policy RPC: permitOpen[%d] type=%d val='%s'",
                            i, item ? item->type : -1, s ? s : "(null)");
-              if (s) {
-                strncpy(po_buf[po_count], s, 63);
-                po_buf[po_count][63] = '\0';
+              // Reject entries that don't fit the buffer instead of
+              // truncating: truncation can land mid-port and silently
+              // rewrite the rule (e.g. a 58-char host + ":12345" becomes
+              // "...:123", permitting port 123 instead of 12345).
+              if (s && strlen(s) < sizeof(po_buf[0])) {
+                strcpy(po_buf[po_count], s);
                 po_ptrs[po_count]    = po_buf[po_count];
                 po_count++;
+              } else if (s) {
+                NOPORTS_LOGW(TAG, "Policy RPC: permitOpen[%d] longer than %u chars - skipping rule",
+                             i, (unsigned)(sizeof(po_buf[0]) - 1));
               }
             }
           }
