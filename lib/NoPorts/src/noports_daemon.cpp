@@ -2040,10 +2040,15 @@ void NoPortsDaemon::_continueNptRequest(void *env,
         unsigned char signature[256];
         memset(signature, 0, 256);
 
-        res = atchops_rsa_sign(skey, ATCHOPS_MD_SHA256,
-                               (unsigned char *)signing_input,
-                               strlen(signing_input), signature);
-        cJSON_free(signing_input);
+        // cJSON_PrintUnformatted returns NULL on OOM (realistic mid-session
+        // on an ESP32) - strlen(NULL) here would panic the daemon
+        res = -1;
+        if (signing_input) {
+          res = atchops_rsa_sign(skey, ATCHOPS_MD_SHA256,
+                                 (unsigned char *)signing_input,
+                                 strlen(signing_input), signature);
+          cJSON_free(signing_input);
+        }
 
         if (res == 0) {
           char b64sig[384];
@@ -2237,10 +2242,15 @@ void NoPortsDaemon::_continueNptRequest(void *env,
     unsigned char signature[256];
     memset(signature, 0, 256);
 
-    res = atchops_rsa_sign(skey, ATCHOPS_MD_SHA256,
-                           (unsigned char *)signing_input,
-                           strlen(signing_input), signature);
-    cJSON_free(signing_input);
+    // cJSON_PrintUnformatted returns NULL on OOM (realistic mid-session on an
+    // ESP32) - strlen(NULL) here would panic the daemon
+    res = -1;
+    if (signing_input) {
+      res = atchops_rsa_sign(skey, ATCHOPS_MD_SHA256,
+                             (unsigned char *)signing_input,
+                             strlen(signing_input), signature);
+      cJSON_free(signing_input);
+    }
 
     if (res == 0) {
       char b64sig[384];
@@ -2260,7 +2270,7 @@ void NoPortsDaemon::_continueNptRequest(void *env,
 
       size_t klen = strlen(identifier) + strlen(_config.device_name) + 2;
       char *kname = (char *)malloc(klen);
-      if (kname) {
+      if (kname && res_value) {
         snprintf(kname, klen, "%s.%s", identifier, _config.device_name);
 
         atclient_atkey_create_shared_key(&res_atkey, kname, _config.atsign,
@@ -2293,6 +2303,9 @@ void NoPortsDaemon::_continueNptRequest(void *env,
 
         atclient_notify_params_free(&nparams);
         free(kname);
+      } else {
+        NOPORTS_LOGE(TAG, "NPT: failed to build success response (OOM)");
+        free(kname); // free(NULL) is a no-op
       }
 
       atclient_atkey_free(&res_atkey);
