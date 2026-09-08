@@ -23,6 +23,7 @@
 #include "noports/noports_log.h"
 #include <stdarg.h>
 #include <sys/time.h>     // gettimeofday() for the policy reqId seed
+#include <mbedtls/platform_util.h> // mbedtls_platform_zeroize
 #include <esp_system.h>   // esp_restart(), esp_random()
 #include <esp_heap_caps.h> // heap_caps_get_largest_free_block()
 
@@ -189,6 +190,31 @@ void NoPortsDaemon::_freeResources() {
 NoPortsDaemon::~NoPortsDaemon() {
   stop();
   _freeResources();
+}
+
+// atchops_rsa_sign writes modulus-size bytes into the caller's buffer, and
+// every sign site in the daemon and relay uses a fixed 256-byte buffer - so a
+// signing key with a larger modulus (e.g. RSA-4096 atKeys) would smash the
+// stack/heap at first use. Checking once here, right after the keys are
+// cloned, covers all of them. The DER INTEGER encoding pads the modulus with
+// a leading 0x00 whenever its MSB is set (always, for a real modulus), so a
+// valid RSA-2048 key normally arrives with n.len == 257 - compare significant
+// bytes, not raw length.
+static bool _is_rsa2048_private_key(const atchops_rsa_key_private_key *key) {
+  const unsigned char *n_bytes = key->n.value;
+  size_t n_sig = key->n.len;
+  while (n_sig > 0 && n_bytes[0] == 0x00) { n_bytes++; n_sig--; }
+  return n_sig == 256;
+}
+
+// Wipe a NUL-terminated key/IV string before freeing it: on a single-address-
+// space MCU freed heap holding live session keys can surface in later
+// allocations or crash dumps. mbedtls_platform_zeroize is never optimized away.
+static void _zero_free_key(void *p) {
+  if (p) {
+    mbedtls_platform_zeroize(p, strlen((char *)p));
+    free(p);
+  }
 }
 
 // ============================================================================
@@ -439,6 +465,11 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
     _state = DAEMON_ERROR;
     return false;
   }
+  if (!_is_rsa2048_private_key((atchops_rsa_key_private_key *)_signing_key)) {
+    _setError("Encrypt private key is not RSA-2048; refusing to sign with it");
+    _state = DAEMON_ERROR;
+    return false;
+  }
 
   // ---- Create APKAM signing key copy (from pkam private key, for ESCR auth) ----
   _pkam_signing_key = calloc(1, sizeof(atchops_rsa_key_private_key));
@@ -452,6 +483,11 @@ bool NoPortsDaemon::begin(const NoPortsConfig &config) {
                                           (atchops_rsa_key_private_key *)_pkam_signing_key);
   if (res != 0) {
     _setError("Failed to clone PKAM signing key: %d", res);
+    _state = DAEMON_ERROR;
+    return false;
+  }
+  if (!_is_rsa2048_private_key((atchops_rsa_key_private_key *)_pkam_signing_key)) {
+    _setError("PKAM private key is not RSA-2048; refusing to sign with it");
     _state = DAEMON_ERROR;
     return false;
   }
@@ -1137,8 +1173,23 @@ void NoPortsDaemon::_handleNotification(void *msg) {
     return;
   }
 
-  if (!has_key || strcmp(message->notification->id, "-1") == 0) {
-    NOPORTS_LOGD(TAG, "Skipping notification (no key or id=-1)");
+  // Guard every field this handler dereferences: the notification comes off
+  // the wire, and a missing id/from/to would otherwise be a strcmp/strlen on
+  // NULL - an ESP32 panic and reboot loop any sender can trigger.
+  bool has_id = atclient_atnotification_is_id_initialized(message->notification) &&
+                message->notification->id != NULL;
+  bool has_from = atclient_atnotification_is_from_initialized(message->notification) &&
+                  message->notification->from != NULL;
+  bool has_to = atclient_atnotification_is_to_initialized(message->notification) &&
+                message->notification->to != NULL;
+
+  if (!has_key || !has_id || strcmp(message->notification->id, "-1") == 0) {
+    NOPORTS_LOGD(TAG, "Skipping notification (no key, no id, or id=-1)");
+    return;
+  }
+
+  if (!has_from || !has_to) {
+    NOPORTS_LOGD(TAG, "Skipping notification (missing from/to)");
     return;
   }
 
@@ -1631,11 +1682,17 @@ void NoPortsDaemon::_handlePolicyResponse(void *msg) {
               const char *s = cJSON_GetStringValue(item);
               NOPORTS_LOGI(TAG, "Policy RPC: permitOpen[%d] type=%d val='%s'",
                            i, item ? item->type : -1, s ? s : "(null)");
-              if (s) {
-                strncpy(po_buf[po_count], s, 63);
-                po_buf[po_count][63] = '\0';
+              // Reject entries that don't fit the buffer instead of
+              // truncating: truncation can land mid-port and silently
+              // rewrite the rule (e.g. a 58-char host + ":12345" becomes
+              // "...:123", permitting port 123 instead of 12345).
+              if (s && strlen(s) < sizeof(po_buf[0])) {
+                strcpy(po_buf[po_count], s);
                 po_ptrs[po_count]    = po_buf[po_count];
                 po_count++;
+              } else if (s) {
+                NOPORTS_LOGW(TAG, "Policy RPC: permitOpen[%d] longer than %u chars - skipping rule",
+                             i, (unsigned)(sizeof(po_buf[0]) - 1));
               }
             }
           }
@@ -1983,10 +2040,15 @@ void NoPortsDaemon::_continueNptRequest(void *env,
         unsigned char signature[256];
         memset(signature, 0, 256);
 
-        res = atchops_rsa_sign(skey, ATCHOPS_MD_SHA256,
-                               (unsigned char *)signing_input,
-                               strlen(signing_input), signature);
-        cJSON_free(signing_input);
+        // cJSON_PrintUnformatted returns NULL on OOM (realistic mid-session
+        // on an ESP32) - strlen(NULL) here would panic the daemon
+        res = -1;
+        if (signing_input) {
+          res = atchops_rsa_sign(skey, ATCHOPS_MD_SHA256,
+                                 (unsigned char *)signing_input,
+                                 strlen(signing_input), signature);
+          cJSON_free(signing_input);
+        }
 
         if (res == 0) {
           char b64sig[384];
@@ -2037,12 +2099,17 @@ void NoPortsDaemon::_continueNptRequest(void *env,
       // Base64 encode plaintext keys for relay's control channel
       relay_cfg.session_aes_key = (unsigned char *)malloc(49);
       relay_cfg.session_iv = (unsigned char *)malloc(25);
-      if (!relay_cfg.session_aes_key || !relay_cfg.session_iv) break;
+      if (!relay_cfg.session_aes_key || !relay_cfg.session_iv) {
+        mbedtls_platform_zeroize(aes_key, sizeof(aes_key));
+        break;
+      }
       memset(relay_cfg.session_aes_key, 0, 49);
       memset(relay_cfg.session_iv, 0, 25);
       size_t len;
       atchops_base64_encode(aes_key, 32, (char *)relay_cfg.session_aes_key, 49, &len);
       atchops_base64_encode(iv, 16, (char *)relay_cfg.session_iv, 25, &len);
+      // the b64 copies in relay_cfg are the working set; wipe the raw key
+      mbedtls_platform_zeroize(aes_key, sizeof(aes_key));
 
       if (twin_keys) {
         // Generate D2C session AES key and IV
@@ -2054,11 +2121,15 @@ void NoPortsDaemon::_continueNptRequest(void *env,
 
         relay_cfg.session_aes_key_d2c = (unsigned char *)malloc(49);
         relay_cfg.session_iv_d2c = (unsigned char *)malloc(25);
-        if (!relay_cfg.session_aes_key_d2c || !relay_cfg.session_iv_d2c) break;
+        if (!relay_cfg.session_aes_key_d2c || !relay_cfg.session_iv_d2c) {
+          mbedtls_platform_zeroize(aes_key_d2c, sizeof(aes_key_d2c));
+          break;
+        }
         memset(relay_cfg.session_aes_key_d2c, 0, 49);
         memset(relay_cfg.session_iv_d2c, 0, 25);
         atchops_base64_encode(aes_key_d2c, 32, (char *)relay_cfg.session_aes_key_d2c, 49, &len);
         atchops_base64_encode(iv_d2c, 16, (char *)relay_cfg.session_iv_d2c, 25, &len);
+        mbedtls_platform_zeroize(aes_key_d2c, sizeof(aes_key_d2c));
       }
 
       NOPORTS_LOGI(TAG, "NPT: generated %s session keys",
@@ -2124,11 +2195,11 @@ void NoPortsDaemon::_continueNptRequest(void *env,
       NOPORTS_LOGE(TAG, "NPT: session key setup failed, rejecting request");
       _sendNptError(requesting_atsign, session_id_str,
                     "Failed to set up session encryption");
-      if (relay_cfg.session_aes_key) free(relay_cfg.session_aes_key);
-      if (relay_cfg.session_iv) free(relay_cfg.session_iv);
-      if (relay_cfg.session_aes_key_d2c) free(relay_cfg.session_aes_key_d2c);
-      if (relay_cfg.session_iv_d2c) free(relay_cfg.session_iv_d2c);
-      if (relay_cfg.relay_auth_aes_key) free(relay_cfg.relay_auth_aes_key);
+      _zero_free_key(relay_cfg.session_aes_key);
+      _zero_free_key(relay_cfg.session_iv);
+      _zero_free_key(relay_cfg.session_aes_key_d2c);
+      _zero_free_key(relay_cfg.session_iv_d2c);
+      _zero_free_key(relay_cfg.relay_auth_aes_key);
       if (relay_cfg.escr_signing_key_uri) free(relay_cfg.escr_signing_key_uri);
       if (relay_cfg.rvd_auth_string) cJSON_free(relay_cfg.rvd_auth_string);
       if (session_aes_key_b64) free(session_aes_key_b64);
@@ -2171,10 +2242,15 @@ void NoPortsDaemon::_continueNptRequest(void *env,
     unsigned char signature[256];
     memset(signature, 0, 256);
 
-    res = atchops_rsa_sign(skey, ATCHOPS_MD_SHA256,
-                           (unsigned char *)signing_input,
-                           strlen(signing_input), signature);
-    cJSON_free(signing_input);
+    // cJSON_PrintUnformatted returns NULL on OOM (realistic mid-session on an
+    // ESP32) - strlen(NULL) here would panic the daemon
+    res = -1;
+    if (signing_input) {
+      res = atchops_rsa_sign(skey, ATCHOPS_MD_SHA256,
+                             (unsigned char *)signing_input,
+                             strlen(signing_input), signature);
+      cJSON_free(signing_input);
+    }
 
     if (res == 0) {
       char b64sig[384];
@@ -2194,7 +2270,7 @@ void NoPortsDaemon::_continueNptRequest(void *env,
 
       size_t klen = strlen(identifier) + strlen(_config.device_name) + 2;
       char *kname = (char *)malloc(klen);
-      if (kname) {
+      if (kname && res_value) {
         snprintf(kname, klen, "%s.%s", identifier, _config.device_name);
 
         atclient_atkey_create_shared_key(&res_atkey, kname, _config.atsign,
@@ -2227,6 +2303,9 @@ void NoPortsDaemon::_continueNptRequest(void *env,
 
         atclient_notify_params_free(&nparams);
         free(kname);
+      } else {
+        NOPORTS_LOGE(TAG, "NPT: failed to build success response (OOM)");
+        free(kname); // free(NULL) is a no-op
       }
 
       atclient_atkey_free(&res_atkey);
@@ -2248,11 +2327,11 @@ void NoPortsDaemon::_continueNptRequest(void *env,
     // failure). Free every daemon-owned allocation here, mirroring the e2ee-setup
     // failure cleanup above, or a relay-start failure — most likely under memory
     // pressure — leaks the whole session key set and compounds the exhaustion.
-    if (relay_cfg.session_aes_key) free(relay_cfg.session_aes_key);
-    if (relay_cfg.session_iv) free(relay_cfg.session_iv);
-    if (relay_cfg.session_aes_key_d2c) free(relay_cfg.session_aes_key_d2c);
-    if (relay_cfg.session_iv_d2c) free(relay_cfg.session_iv_d2c);
-    if (relay_cfg.relay_auth_aes_key) free(relay_cfg.relay_auth_aes_key);
+    _zero_free_key(relay_cfg.session_aes_key);
+    _zero_free_key(relay_cfg.session_iv);
+    _zero_free_key(relay_cfg.session_aes_key_d2c);
+    _zero_free_key(relay_cfg.session_iv_d2c);
+    _zero_free_key(relay_cfg.relay_auth_aes_key);
     if (relay_cfg.escr_signing_key_uri) free(relay_cfg.escr_signing_key_uri);
     if (relay_cfg.rvd_auth_string) cJSON_free(relay_cfg.rvd_auth_string);
     if (session_aes_key_b64) free(session_aes_key_b64);

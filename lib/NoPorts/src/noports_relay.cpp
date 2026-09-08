@@ -18,6 +18,7 @@
 #include <WiFiClient.h>
 #include <mbedtls/aes.h>
 #include <mbedtls/base64.h>
+#include <mbedtls/platform_util.h>  // mbedtls_platform_zeroize
 #include <lwip/sockets.h>   // recv, MSG_PEEK, MSG_DONTWAIT, lwip_send
 #include <esp_heap_caps.h>  // heap_caps_get_largest_free_block()
 #include <esp_system.h>     // esp_random() for ESCR IV generation
@@ -411,6 +412,7 @@ static bool _escr_authenticate(WiFiClient *sock, const NoPortsRelayConfig *cfg) 
           (const unsigned char *)cfg->relay_auth_aes_key,
           strlen(cfg->relay_auth_aes_key)) != 0 || aes_key_len != 32) {
       NOPORTS_LOGE(TAG, "ESCR: AES key decode failed");
+      mbedtls_platform_zeroize(aes_key, sizeof(aes_key)); // may hold partial key bytes
       goto escr_cleanup;
     }
 
@@ -450,6 +452,7 @@ static bool _escr_authenticate(WiFiClient *sock, const NoPortsRelayConfig *cfg) 
                              stream_block, (unsigned char *)env64, encrypted);
       mbedtls_aes_free(&aes_ctx);
     }
+    mbedtls_platform_zeroize(aes_key, sizeof(aes_key)); // raw key no longer needed
     free(env64); env64 = NULL;
 
     // ---- Step 10: Base64-encode IV and ciphertext ----
@@ -557,6 +560,25 @@ escr_cleanup:
 // recv(fd, dummy, 0) and erroneously returns ENOTCONN on idle sockets.
 //  - Returns true  when FIN received (peer closed) or socket error
 //  - Returns false when socket is alive (data available or EAGAIN)
+// Wipe a NUL-terminated key/IV string before freeing it: on a single-address-
+// space MCU freed heap holding live session keys can surface in later
+// allocations or crash dumps. mbedtls_platform_zeroize is never optimized away.
+static void _zero_free_key(void *p) {
+  if (p) {
+    mbedtls_platform_zeroize(p, strlen((char *)p));
+    free(p);
+  }
+}
+
+// Wipe and free the Phase-2 connect: line buffers (they carry the decrypted
+// per-session data-channel AES keys). Both are 256-byte calloc'd buffers.
+static void _free_cmsgs(char *a, char *b) {
+  mbedtls_platform_zeroize(a, 256);
+  mbedtls_platform_zeroize(b, 256);
+  free(a);
+  free(b);
+}
+
 static bool _peer_closed(WiFiClient &client) {
   int fd = client.fd();
   if (fd < 0) return true;
@@ -589,12 +611,15 @@ static int _init_aes_ctr_state(aes_ctr_state *state,
                               iv_b64, strlen((const char *)iv_b64));
   if (res != 0 || olen != 16) {
     NOPORTS_LOGE(TAG, "Failed to decode IV (res=%d, len=%u)", res, (unsigned)olen);
+    mbedtls_platform_zeroize(aes_key, sizeof(aes_key));
     return -1;
   }
 
   memset(state, 0, sizeof(*state));
   mbedtls_aes_init(&state->ctx);
   res = mbedtls_aes_setkey_enc(&state->ctx, aes_key, 256);
+  // the key schedule now lives in state->ctx; the raw key is no longer needed
+  mbedtls_platform_zeroize(aes_key, sizeof(aes_key));
   if (res != 0) {
     mbedtls_aes_free(&state->ctx);
     return -1;
@@ -1309,6 +1334,7 @@ static void _relay_task_inner(NoPortsRelay *relay) {
 
       if (!sockA.connected() && !relay->rvd_client.connected()) {
         NOPORTS_LOGE(TAG, "Both SRVD sockets disconnected while waiting for connect:");
+        _free_cmsgs(cmsgA, cmsgB);
         relay->state = RELAY_ERROR;
         goto cleanup;
       }
@@ -1319,6 +1345,7 @@ static void _relay_task_inner(NoPortsRelay *relay) {
     if (!got_connect || !connect_msg) {
       NOPORTS_LOGE(TAG, "Timed out waiting for connect: on both sockets (A=%d B=%d)",
                    posA, posB);
+      _free_cmsgs(cmsgA, cmsgB);
       relay->state = RELAY_ERROR;
       goto cleanup;
     }
@@ -1337,6 +1364,7 @@ static void _relay_task_inner(NoPortsRelay *relay) {
 
     if (strncmp(connect_msg, "connect:", 8) != 0) {
       NOPORTS_LOGE(TAG, "Invalid connect message (expected 'connect:' prefix)");
+      _free_cmsgs(cmsgA, cmsgB);
       relay->state = RELAY_ERROR;
       goto cleanup;
     }
@@ -1363,6 +1391,7 @@ static void _relay_task_inner(NoPortsRelay *relay) {
 
       if (nfields < 2) {
         NOPORTS_LOGE(TAG, "Invalid connect message (need at least key:iv, got %d fields)", nfields);
+        _free_cmsgs(cmsgA, cmsgB);
         relay->state = RELAY_ERROR;
         goto cleanup;
       }
@@ -1383,13 +1412,13 @@ static void _relay_task_inner(NoPortsRelay *relay) {
                                      &data_enc, &data_dec);
       if (enc_res != 0) {
         NOPORTS_LOGE(TAG, "Failed to create data channel AES-CTR state");
+        _free_cmsgs(cmsgA, cmsgB);
         relay->state = RELAY_ERROR;
         goto cleanup;
       }
       data_encrypted = true;
     }
-    free(cmsgA);
-    free(cmsgB);
+    _free_cmsgs(cmsgA, cmsgB);
   }
 
   // ======================================================================
@@ -1618,7 +1647,7 @@ cleanup:
     relay->config.rvd_auth_string = NULL;
   }
   if (relay->config.relay_auth_aes_key) {
-    free(relay->config.relay_auth_aes_key);
+    _zero_free_key(relay->config.relay_auth_aes_key);
     relay->config.relay_auth_aes_key = NULL;
   }
   if (relay->config.escr_signing_key_uri) {
@@ -1635,19 +1664,19 @@ cleanup:
     relay->config.local_host = NULL;
   }
   if (relay->config.session_aes_key) {
-    free(relay->config.session_aes_key);
+    _zero_free_key(relay->config.session_aes_key);
     relay->config.session_aes_key = NULL;
   }
   if (relay->config.session_iv) {
-    free(relay->config.session_iv);
+    _zero_free_key(relay->config.session_iv);
     relay->config.session_iv = NULL;
   }
   if (relay->config.session_aes_key_d2c) {
-    free(relay->config.session_aes_key_d2c);
+    _zero_free_key(relay->config.session_aes_key_d2c);
     relay->config.session_aes_key_d2c = NULL;
   }
   if (relay->config.session_iv_d2c) {
-    free(relay->config.session_iv_d2c);
+    _zero_free_key(relay->config.session_iv_d2c);
     relay->config.session_iv_d2c = NULL;
   }
 
@@ -2336,7 +2365,7 @@ cleanup:
     relay->config.rvd_auth_string = NULL;
   }
   if (relay->config.relay_auth_aes_key) {
-    free(relay->config.relay_auth_aes_key);
+    _zero_free_key(relay->config.relay_auth_aes_key);
     relay->config.relay_auth_aes_key = NULL;
   }
   if (relay->config.escr_signing_key_uri) {
@@ -2353,19 +2382,19 @@ cleanup:
     relay->config.local_host = NULL;
   }
   if (relay->config.session_aes_key) {
-    free(relay->config.session_aes_key);
+    _zero_free_key(relay->config.session_aes_key);
     relay->config.session_aes_key = NULL;
   }
   if (relay->config.session_iv) {
-    free(relay->config.session_iv);
+    _zero_free_key(relay->config.session_iv);
     relay->config.session_iv = NULL;
   }
   if (relay->config.session_aes_key_d2c) {
-    free(relay->config.session_aes_key_d2c);
+    _zero_free_key(relay->config.session_aes_key_d2c);
     relay->config.session_aes_key_d2c = NULL;
   }
   if (relay->config.session_iv_d2c) {
-    free(relay->config.session_iv_d2c);
+    _zero_free_key(relay->config.session_iv_d2c);
     relay->config.session_iv_d2c = NULL;
   }
 
@@ -2491,7 +2520,7 @@ int noports_relay_start(NoPortsRelay *relay, const NoPortsRelayConfig *config) {
       relay->config.local_host = NULL;
     }
     if (relay->config.relay_auth_aes_key) {
-      free(relay->config.relay_auth_aes_key);
+      _zero_free_key(relay->config.relay_auth_aes_key);
       relay->config.relay_auth_aes_key = NULL;
     }
     if (relay->config.escr_signing_key_uri) {
