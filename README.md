@@ -10,11 +10,11 @@
 
 ## What Is This?
 
-at_Arduino_NoPorts is a collection of Arduino/PlatformIO libraries and ready-to-flash
-packages that let ESP32 devices participate in the atProtocol network. The
-headline application is **NoPorts on ESP32** — an encrypted TCP relay daemon
-(`sshnpd`) that lets you SSH into machines on your local network *through* an
-ESP32, with **no open ports, no public IP, and no VPN**.
+at_Arduino_NoPorts is a collection of Arduino/PlatformIO libraries and
+ready-to-flash packages that let ESP32 devices participate in the atProtocol
+network. The headline application is **NoPorts on ESP32** — an encrypted TCP
+relay daemon (`sshnpd`) that lets you SSH into machines on your local network 
+through* an ESP32, with **no open ports, no public IP, and no VPN**.
 
 All tunnel traffic is **end-to-end encrypted** (AES-256-CTR) and
 **RSA-2048 signed**.
@@ -23,6 +23,7 @@ All tunnel traffic is **end-to-end encrypted** (AES-256-CTR) and
 
 ## Supported Hardware
 
+<!-- pyml disable-num-lines 5 md013-->
 | Device | Chip | Connectivity | UI | Package |
 |---|---|---|---|---|
 | **CYD** (ESP32-2432S028R / v2) | ESP32 | WiFi | 2.8" touchscreen | `NoPorts_CYD` |
@@ -31,7 +32,8 @@ All tunnel traffic is **end-to-end encrypted** (AES-256-CTR) and
 
 ### CYD — Cheap Yellow Display
 
-The [ESP32-2432S028R](https://github.com/witnessmenow/ESP32-Cheap-Yellow-Display)
+The
+[ESP32-2432S028R](https://github.com/witnessmenow/ESP32-Cheap-Yellow-Display)
 is an inexpensive (~$15) ESP32 board with a built-in 2.8" ILI9341 TFT
 touchscreen. It provides a full onboard UI for WiFi setup, atSign enrollment,
 and a live dashboard showing tunnel activity and system stats.
@@ -50,7 +52,7 @@ network. Designed for always-on, unattended deployment.
 
 ## Repository Structure
 
-```
+```txt
 at_Arduino_NoPorts/
 ├── lib/                        # Reusable Arduino libraries
 │   └── NoPorts/                # NoPorts daemon library (sshnpd for ESP32)
@@ -62,11 +64,13 @@ at_Arduino_NoPorts/
 └── web/                        # Browser-based firmware installer (docker compose)
 ```
 
-> **Note:** The `at_client` Arduino library (atSDK for ESP32) lives in its own repository:
+> **Note:** The `at_client` Arduino library (atSDK for ESP32) lives in
+> its own repository:
 > [github.com/atsign-foundation/at_client_arduino](https://github.com/atsign-foundation/at_client_arduino)
 
 ### Libraries (`lib/`)
 
+<!-- pyml disable-num-lines 4 md013-->
 | Library | Description |
 |---|---|
 | **[NoPorts](lib/NoPorts/)** | NoPorts daemon (`sshnpd`) library — registers on the atProtocol network, accepts encrypted tunnel requests, and relays TCP traffic to local network services. |
@@ -74,6 +78,7 @@ at_Arduino_NoPorts/
 
 ### Packages (`packages/`)
 
+<!-- pyml disable-num-lines 4 md013-->
 | Package | Target hardware | Description |
 |---|---|---|
 | **[NoPorts_CYD](packages/NoPorts_CYD/)** | ESP32-2432S028R, ESP32-S3 CYD variants | Touchscreen UI — WiFi setup, enrollment, live dashboard. |
@@ -85,21 +90,30 @@ at_Arduino_NoPorts/
 
 ### Prerequisites
 
-- [PlatformIO](https://docs.platformio.org/en/latest/core/installation.html) (CLI or VS Code extension)
-- Two **atSigns** — one for the ESP32 (device) and one for your laptop (manager). Get free atSigns at [atsign.com](https://atsign.com).
+- [PlatformIO](https://docs.platformio.org/en/latest/core/installation.html)
+(CLI or VS Code extension)
+- Two **atSigns** — one for the ESP32 (device) and one for your laptop
+(manager). Get free atSigns at [atsign.com](https://atsign.com).
 
 ### CYD Quick Start
 
 1. Clone the repo and open `packages/NoPorts_CYD` in PlatformIO.
-2. Flash firmware — WiFi credentials and atSign enrollment are configured via the touchscreen on first boot.
+2. Flash firmware — WiFi credentials and atSign enrollment are configured via
+the touchscreen on first boot.
 3. Requires a **2.4 GHz WiFi** network (ESP32 does not support 5 GHz).
 
 ### M5Stack Unit PoE-P4 Quick Start
 
-1. Clone the repo and open `packages/NoPorts_PoE` in PlatformIO (uses the [pioarduino](https://github.com/pioarduino/platform-espressif32) platform for ESP32-P4 support).
-2. Flash firmware via USB-C. **Note the web UI admin PIN** printed to the serial console at boot (see below) — it is required to sign in to the config UI.
-3. Plug an Ethernet cable into the RJ45 port (PoE switch recommended — no USB power needed).
-4. Navigate to the device's IP address in a browser, sign in with the admin PIN, and complete configuration.
+1. Clone the repo and open `packages/NoPorts_PoE` in PlatformIO (uses the
+[pioarduino](https://github.com/pioarduino/platform-espressif32) platform for
+ESP32-P4 support).
+2. Flash firmware via USB-C. **Note the web UI admin PIN** printed to the
+serial console at boot (see below) — it is required to sign in to the config
+UI.
+3. Plug an Ethernet cable into the RJ45 port (PoE switch recommended — no
+USB power needed).
+4. Navigate to the device's IP address in a browser, sign in with the admin
+PIN, and complete configuration.
 
 #### Web UI admin PIN
 
@@ -116,7 +130,7 @@ pio device monitor -e esp32p4    # or: pio device monitor -b 115200
 
 Look for this block in the boot log:
 
-```
+```log
 [web] ─────────────────────────────────────────
 [web]  Web UI initial PIN: 12345678
 [web]  Log in with this, then set your own PIN.
@@ -143,7 +157,8 @@ Notes:
 
 ### Browser-based Firmware Installer
 
-A Docker-based web flasher lets you flash either device directly from a browser (Chrome/Edge) over WebSerial — no local toolchain needed:
+A Docker-based web flasher lets you flash either device directly from a
+browser (Chrome/Edge) over WebSerial — no local toolchain needed:
 
 ```bash
 docker compose up --build
@@ -182,7 +197,8 @@ Or use the hosted installer at [cyd.crushware.com](https://cyd.crushware.com).
 - **No SSH server on-device** — tunnels to TCP services on the local network
 - **RSA operations are slow** — envelope verification takes 1–2 seconds
 - **Limited concurrent tunnels** — realistically 2–4 simultaneous connections
-- **NoPorts_PoE requires pioarduino** — the official espressif32 PlatformIO platform does not yet support ESP32-P4
+- **NoPorts_PoE requires pioarduino** — the official espressif32 PlatformIO
+platform does not yet support ESP32-P4
 - **Keys are not encrypted at rest by default** — atSign keys and WiFi
   credentials are recoverable from a flash dump by anyone with physical access
   unless ESP32 flash encryption is enabled. Keys are per-device and revocable;
