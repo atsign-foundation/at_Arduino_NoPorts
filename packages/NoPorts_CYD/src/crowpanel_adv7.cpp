@@ -23,8 +23,12 @@ constexpr int LCD_G0 = 9,  LCD_G1 = 10, LCD_G2 = 11, LCD_G3 = 12, LCD_G4 = 13, L
 constexpr int LCD_B0 = 21, LCD_B1 = 47, LCD_B2 = 48, LCD_B3 = 45, LCD_B4 = 38;
 constexpr int LCD_DE = 42, LCD_VSYNC = 41, LCD_HSYNC = 40, LCD_PCLK = 39;
 
-// Elecrow LOWERED the pixel clock between V1.2 and V1.3.
-#if CROWPANEL_ADVANCE_REV >= 130
+// Elecrow LOWERED the pixel clock between V1.2 and V1.3.  Lower still trades
+// refresh rate (16 MHz ≈ 39 Hz, 14 MHz ≈ 34 Hz) for tolerance of PSRAM
+// contention; override with -DCROWPANEL_PCLK_HZ.
+#if defined(CROWPANEL_PCLK_HZ)
+constexpr uint32_t LCD_PCLK_HZ = CROWPANEL_PCLK_HZ;
+#elif CROWPANEL_ADVANCE_REV >= 130
 constexpr uint32_t LCD_PCLK_HZ = 16000000;
 #else
 constexpr uint32_t LCD_PCLK_HZ = 21000000;
@@ -100,7 +104,11 @@ uint8_t     g_gt911    = 0;          // address that answered, 0 = none
 bool        g_pressed  = false;
 int16_t     g_tx = 0, g_ty = 0;      // panel coordinates of last press
 uint32_t    g_last_poll_ms = 0;
-volatile bool g_dirty = true;        // set by CrowCanvas draw calls
+// Dirty row range, inclusive.  Written from the UI task (core 1) through the
+// CrowCanvas wrappers, consumed by the flush task (core 0).
+portMUX_TYPE g_dirty_mux = portMUX_INITIALIZER_UNLOCKED;
+int32_t g_dirty_y0 = 0;
+int32_t g_dirty_y1 = CROW_CANVAS_H - 1;   // start fully dirty
 
 // ---- companion MCU ---------------------------------------------------------
 bool mcu_send(uint8_t b) {           // one bare byte, no register address
@@ -183,10 +191,10 @@ uint16_t *g_row_src = nullptr;   // 320 px, internal RAM
 uint16_t *g_row_dst = nullptr;   // 640 x 2 px, internal RAM
 uint16_t *g_shadow  = nullptr;   // 320 x 240, PSRAM: last rows pushed
 
-void flush_canvas() {
+void flush_canvas(int32_t y0, int32_t y1) {
   if (!g_lcd_ok || !g_canvas || !g_row_src || !g_row_dst || !g_shadow) return;
   g_lcd.startWrite();
-  for (int y = 0; y < CROW_CANVAS_H; y++) {
+  for (int y = y0; y <= y1; y++) {
     g_canvas->readRect(0, y, CROW_CANVAS_W, 1, g_row_src);
     uint16_t *shadow = g_shadow + (size_t)y * CROW_CANVAS_W;
     if (memcmp(shadow, g_row_src, CROW_CANVAS_W * sizeof(uint16_t)) == 0) continue;
@@ -207,9 +215,15 @@ void flush_canvas() {
 void flush_task(void *) {
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(FLUSH_PERIOD_MS));
-    if (!g_dirty) continue;
-    g_dirty = false;          // clear first: a draw during the flush re-arms it
-    flush_canvas();
+    // Take the dirty range and reset it BEFORE reading, so a draw that lands
+    // while we flush re-arms its rows for the next tick instead of being lost.
+    int32_t y0, y1;
+    portENTER_CRITICAL(&g_dirty_mux);
+    y0 = g_dirty_y0; y1 = g_dirty_y1;
+    g_dirty_y0 = CROW_CANVAS_H; g_dirty_y1 = -1;
+    portEXIT_CRITICAL(&g_dirty_mux);
+    if (y0 > y1) continue;    // nothing drawn since last flush
+    flush_canvas(y0, y1);
   }
 }
 
@@ -268,7 +282,7 @@ bool crow_display_init(CrowCanvas &canvas) {
   g_row_dst = (uint16_t *)heap_caps_malloc(CROW_CANVAS_W * CROW_SCALE * CROW_SCALE * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   g_shadow  = (uint16_t *)heap_caps_calloc((size_t)CROW_CANVAS_W * CROW_CANVAS_H, sizeof(uint16_t), MALLOC_CAP_SPIRAM);
   if (g_shadow) memset(g_shadow, 0xFF, (size_t)CROW_CANVAS_W * CROW_CANVAS_H * sizeof(uint16_t));  // first flush pushes every row
-  g_dirty = true;
+  crow_mark_dirty();
 
   if (i2c_probe(PANEL_MCU_ADDR)) {
     Serial.printf("[crow] companion MCU at 0x%02X (driving as V%d.%d — if the screen stays dark, set -DCROWPANEL_ADVANCE_REV=%d)\n",
@@ -287,6 +301,7 @@ bool crow_display_init(CrowCanvas &canvas) {
   // Flush task on core 0 (the Arduino loop and UI drawing run on core 1).
   xTaskCreatePinnedToCore(flush_task, "crow_flush", 4096, nullptr, 1, nullptr, 0);
 
+  Serial.printf("[crow] pclk %u Hz\n", (unsigned)LCD_PCLK_HZ);
   Serial.printf("[crow] panel %s, canvas %dx%d @%dx → %dx%d at (%d,%d)\n",
                 g_lcd_ok ? "up" : "DOWN", CROW_CANVAS_W, CROW_CANVAS_H, CROW_SCALE,
                 CROW_CANVAS_W * CROW_SCALE, CROW_CANVAS_H * CROW_SCALE, CROW_OFFSET_X, CROW_OFFSET_Y);
@@ -308,8 +323,18 @@ bool crow_touch_read(int16_t *x, int16_t *y) {
   return true;
 }
 
+void crow_mark_dirty_rows(int32_t y0, int32_t y1) {
+  if (y0 < 0) y0 = 0;
+  if (y1 > CROW_CANVAS_H - 1) y1 = CROW_CANVAS_H - 1;
+  if (y0 > y1) return;
+  portENTER_CRITICAL(&g_dirty_mux);
+  if (y0 < g_dirty_y0) g_dirty_y0 = y0;
+  if (y1 > g_dirty_y1) g_dirty_y1 = y1;
+  portEXIT_CRITICAL(&g_dirty_mux);
+}
+
 void crow_mark_dirty() {
-  g_dirty = true;
+  crow_mark_dirty_rows(0, CROW_CANVAS_H - 1);
 }
 
 #endif  // CROWPANEL_ADVANCE_7
