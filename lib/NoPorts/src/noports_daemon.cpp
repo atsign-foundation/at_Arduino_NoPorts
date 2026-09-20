@@ -1383,6 +1383,13 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
     return;
   }
 
+  // Heap trace: the NPT path does two RSA ops, key lookups over the worker
+  // and finally an 8 KB relay task stack.  Logging free/largest here and
+  // after the signature check pinpoints which step exhausts a tight heap.
+  NOPORTS_LOGI(TAG, "NPT: heap at entry free=%u largest=%u",
+               (unsigned)esp_get_free_heap_size(),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+
   cJSON *envelope = cJSON_Parse(message->notification->decrypted_value);
   if (envelope == NULL) {
     NOPORTS_LOGE(TAG, "NPT: failed to parse envelope JSON");
@@ -1396,6 +1403,9 @@ void NoPortsDaemon::_handleNptRequest(void *msg) {
     cJSON_Delete(envelope);
     return;
   }
+  NOPORTS_LOGI(TAG, "NPT: heap after signature verify free=%u largest=%u",
+               (unsigned)esp_get_free_heap_size(),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
   // Authorise the requesting atSign.
   // Two modes: manager-list check (default) or policy-service RPC.
@@ -2061,6 +2071,12 @@ void NoPortsDaemon::_continueNptRequest(void *env,
             cJSON_AddStringToObject(auth_envelope, "signingAlgo",  "rsa2048");
             relay_cfg.rvd_auth_string = cJSON_PrintUnformatted(auth_envelope);
           }
+        } else {
+          // Without this string the relay connects to the SRVD unauthenticated
+          // and is rejected — make the root cause visible instead of silent.
+          NOPORTS_LOGE(TAG, "NPT: RVD auth signature failed (res=%d, heap free=%u largest=%u)",
+                       res, (unsigned)esp_get_free_heap_size(),
+                       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         }
 
         cJSON_Delete(auth_payload);
@@ -2250,6 +2266,11 @@ void NoPortsDaemon::_continueNptRequest(void *env,
                              (unsigned char *)signing_input,
                              strlen(signing_input), signature);
       cJSON_free(signing_input);
+    }
+    if (res != 0) {
+      NOPORTS_LOGE(TAG, "NPT: response signature failed (res=%d, heap free=%u largest=%u)",
+                   res, (unsigned)esp_get_free_heap_size(),
+                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     }
 
     if (res == 0) {
@@ -2616,6 +2637,15 @@ bool NoPortsDaemon::_reconnectMonitor() {
 
   NOPORTS_LOGI(TAG, "Reconnecting monitor...");
 
+  atclient *monitor = (atclient *)_monitor_ctx;
+  atclient_atkeys *keys = (atclient_atkeys *)_atkeys;
+
+  // Tear down the old monitor connection before waiting for heap — the dead
+  // session's TLS buffers are the largest single thing we can give back
+  // (see _reconnectWorker for the numbers).
+  atclient_monitor_free(monitor);
+  atclient_monitor_init(monitor);
+
   // Wait for heap only when the relay has just stopped (pcbs <= 1).
   // When pcbs > 1 the relay is actively running and holds pbufs that fragment
   // the heap — those pbufs will NOT be released until sessions close, so
@@ -2650,13 +2680,6 @@ bool NoPortsDaemon::_reconnectMonitor() {
     NOPORTS_LOGD(TAG, "Monitor reconnect: relay active (pcbs=%d), skipping heap wait",
                  noports_relay_get_pcb_count());
   }
-
-  atclient *monitor = (atclient *)_monitor_ctx;
-  atclient_atkeys *keys = (atclient_atkeys *)_atkeys;
-
-  // Fully tear down the old monitor connection before re-auth
-  atclient_monitor_free(monitor);
-  atclient_monitor_init(monitor);
 
   int res = atclient_monitor_pkam_authenticate(
     monitor, _config.atsign, keys,
@@ -2702,6 +2725,18 @@ bool NoPortsDaemon::_reconnectMonitor() {
 bool NoPortsDaemon::_reconnectWorker() {
   NOPORTS_LOGI(TAG, "Reconnecting worker...");
 
+  atclient *worker = (atclient *)_worker_ctx;
+  atclient_atkeys *keys = (atclient_atkeys *)_atkeys;
+
+  // Fully tear down the old worker connection FIRST.  A dead TLS session
+  // still owns ~45 KB (two 16 KB record buffers + context) on targets with
+  // static mbedTLS buffers; on a classic ESP32 that alone keeps total free
+  // heap under NOPORTS_TLS_MIN_FREE_HEAP, so waiting before freeing spun
+  // for the full 30 s and then failed anyway (observed on a WROOM-32:
+  // total=39.7 KB vs 40 KB threshold, relay_pcbs=0).
+  atclient_free(worker);
+  atclient_init(worker);
+
   // Same logic as monitor reconnect: skip heap wait when relay is active.
   if (noports_relay_get_pcb_count() <= 1) {
     uint32_t ws = millis();
@@ -2731,13 +2766,6 @@ bool NoPortsDaemon::_reconnectWorker() {
     NOPORTS_LOGD(TAG, "Worker reconnect: relay active (pcbs=%d), skipping heap wait",
                  noports_relay_get_pcb_count());
   }
-
-  atclient *worker = (atclient *)_worker_ctx;
-  atclient_atkeys *keys = (atclient_atkeys *)_atkeys;
-
-  // Fully tear down the old worker connection
-  atclient_free(worker);
-  atclient_init(worker);
 
   int res = atclient_pkam_authenticate(
     worker, _config.atsign, keys,

@@ -119,6 +119,44 @@ USB power needed).
 4. Navigate to the device's IP address in a browser, sign in with the admin
 PIN, and complete configuration.
 
+### Stock ESP32 Quick Start (WiFi)
+
+The PoE firmware also runs on any off-the-shelf ESP32 dev board (ESP32-WROOM-32
+with 4 MB flash, no PSRAM needed) or ESP32-S3, using WiFi instead of Ethernet.
+You get the same web UI, admin PIN and OTP enrolment flow as the PoE-P4, so no
+`.atKeys` file has to be prepared on your laptop.
+
+1. Clone the repo and open `packages/NoPorts_PoE` in PlatformIO.
+2. Build and flash with your **2.4 GHz** WiFi credentials passed through the
+shell environment (they are compiled in and never written to git):
+
+   ```bash
+   cd packages/NoPorts_PoE
+   NOPORTS_WIFI_SSID='MyNetwork' NOPORTS_WIFI_PASS='MyPassword' \
+     pio run -e esp32_wifi --target upload
+   pio device monitor
+   ```
+
+3. Note the web UI admin PIN printed to the serial console at boot.
+4. Browse to `http://noports-poe.local` (or the IP printed on serial), sign in
+with the admin PIN, complete setup, then enrol with an OTP from your atSign app.
+
+The build fails with a clear message if `NOPORTS_WIFI_SSID` is unset.
+On-device WiFi provisioning (no rebuild to change networks) is planned as a
+follow-up.
+
+#### Headroom on a WROOM-32
+
+Without PSRAM the daemon's two TLS sessions leave roughly 25 KB of heap free
+with one tunnel open, which is fine for a single interactive session and
+marginal for heavy transfers or several sessions at once. The limit comes from
+fixed 16 KB TLS buffers baked into the prebuilt Arduino framework. An
+experimental `esp32_wifi_tuned` environment rebuilds the ESP-IDF libraries from
+`packages/NoPorts_PoE/sdkconfig.noports`; today only the lwIP part of that
+tuning can be applied (see the notes in that file), so it is not yet a net win
+and `esp32_wifi` remains the recommended target. For more than light use,
+prefer an ESP32-S3 board with PSRAM.
+
 #### Web UI admin PIN
 
 The config web UI is protected by an admin PIN. On first boot the device

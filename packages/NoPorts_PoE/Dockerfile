@@ -51,7 +51,7 @@ WORKDIR /build
 # ---------------------------------------------------------------------------
 COPY packages/NoPorts_PoE/platformio.ini      packages/NoPorts_PoE/platformio.ini
 COPY packages/NoPorts_PoE/partitions_16mb.csv packages/NoPorts_PoE/partitions_16mb.csv
-COPY packages/NoPorts_PoE/sdkconfig.defaults  packages/NoPorts_PoE/sdkconfig.defaults
+COPY packages/NoPorts_PoE/sdkconfig.noports   packages/NoPorts_PoE/sdkconfig.noports
 
 # Stub so lib_extra_dirs (../../lib) resolves during pkg install without
 # copying the full library yet (keeps this expensive layer cached).

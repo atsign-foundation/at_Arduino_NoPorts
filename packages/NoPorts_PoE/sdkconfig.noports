@@ -1,0 +1,37 @@
+# NoPorts tuning for the ESP-IDF libraries behind arduino-esp32.
+#
+# Applied ONLY by pioarduino envs that set `custom_sdkconfig = file://sdkconfig.noports`
+# (currently [env:esp32_wifi_tuned]).  The prebuilt framework used by the
+# other envs ignores this file entirely — check the "Compile Arduino IDF
+# libs" step in the build log if you doubt an option took effect, and read
+# the resulting values back from
+#   ~/.platformio/packages/framework-arduinoespressif32-libs/<mcu>/sdkconfig
+# Kconfig silently drops values that violate a range or an unmet dependency.
+#
+# ── mbedTLS ── NOT TUNABLE VIA pioarduino custom_sdkconfig (Sept 2026) ──────
+# Tried: CONFIG_MBEDTLS_DYNAMIC_BUFFER=y (+ CONFIG_MBEDTLS_SSL_PROTO_DTLS=n, which
+# it depends on).  The IDF rebuild honours it, but pioarduino's idf_lib_copy()
+# only copies archives from the top level of each component folder, so the
+# upstream mbedTLS libraries built under esp-idf/mbedtls/mbedtls/library/
+# (installed as libmbedtls_2.a, libmbedcrypto.a, libmbedx509.a) are never
+# refreshed, and the -Wl,--wrap=mbedtls_ssl_* options the dynamic mode needs
+# are not exported to the app link.  Result: headers compiled for dynamic
+# buffers against a static-buffer library → InstrFetchProhibited (PC=0) on the
+# first TLS handshake, boot loop.  The same applies to SSL_IN/OUT_CONTENT_LEN
+# and VARIABLE_BUFFER_LENGTH.  Until pioarduino copies nested archives, keep
+# mbedTLS at the framework defaults here.
+#
+# Full Mozilla CA bundle (~130 roots) stored in flash — zero heap cost.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+
+# ── lwIP ──────────────────────────────────────────────────────────────────
+# Per-socket send buffer / receive window.  Default is 4 x MSS = 5760 bytes
+# each way; Kconfig's floor is 2440, so the 1 x MSS (1460) the CYD notes asked
+# for is rejected and falls back to 5760.  2 x MSS is the smallest legal
+# value and halves the pbuf budget of every relay socket.
+CONFIG_LWIP_TCP_WND_DEFAULT=2920
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2920
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=12
+# Shorten TIME_WAIT from 60 s to 5 s so closed PCB slots recycle quickly.
+CONFIG_LWIP_TCP_MSL=5000

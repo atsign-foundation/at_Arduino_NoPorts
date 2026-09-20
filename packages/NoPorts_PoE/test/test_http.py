@@ -9,7 +9,8 @@ Run against a device flashed with the test_esp32 build:
     # 3. python test_http.py                        # default 192.168.4.1
     # 4. python test_http.py --host 10.0.0.42       # production IP
 
-Also works against the production (esp32p4) build on a local network:
+Also works against the production (esp32p4) build or the stock-ESP32 WiFi
+build (esp32_wifi) on a local network:
     python test_http.py --host noports-poe.local
 
 Exit code 0 = all tests passed, non-zero = failures.

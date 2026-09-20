@@ -3,7 +3,7 @@
  * @brief NoPorts PoE — headless daemon for M5Stack Unit PoE (ESP32-P4)
  *
  * Boot flow:
- *   1. Init Ethernet (DHCP) — or WiFi AP in test_esp32 build
+ *   1. Init Ethernet (DHCP) — or WiFi station (esp32_wifi) / WiFi AP (test_esp32)
  *   2. Start web server on port 80 immediately
  *   3. After network is up: mDNS, NTP, daemon (if already configured)
  *   4. loop(): web_server_handle(), npDaemon.loop(), Ethernet watchdog
@@ -12,9 +12,15 @@
  *   Browse to http://noports-poe.local  (or device IP printed on serial)
  *   Complete /setup → /enroll → dashboard
  *
+ * Stock ESP32 build (NOPORTS_WIFI_STA):
+ *   Compile env=esp32_wifi with NOPORTS_WIFI_SSID / NOPORTS_WIFI_PASS in the
+ *   shell.  Device joins that network as a client, so it has a real internet
+ *   route and the full setup → enrol → daemon flow works, same as on PoE.
+ *
  * Test build (NOPORTS_TEST_WIFI_AP):
  *   Compile env=test_esp32, flash any ESP32.
  *   Connect laptop to "NoPorts-Test" AP, browse to 192.168.4.1
+ *   (AP only — no upstream route, so enrolment cannot complete)
  */
 
 #include <Arduino.h>
@@ -35,11 +41,28 @@ extern "C" {
 #include "web_server.h"
 #include "led.h"
 #include <esp_task_wdt.h>
+#include <esp_heap_caps.h>
+// Bluetooth memory release is only possible where the controller library
+// exists.  CONFIG_BT_ENABLED alone is not enough: the ESP32-P4 libs define it
+// (hosted-BT plumbing) but ship no esp_bt.h and have no radio to release.
+#if defined(CONFIG_BT_ENABLED) && __has_include(<esp_bt.h>)
+  #define NOPORTS_RELEASE_BT_MEM 1
+  #include <esp_bt.h>          // esp_bt_controller_mem_release()
+#endif
 
-// ─── Network includes — ETH for P4, WiFi for test build ───────────────────
-#ifdef NOPORTS_TEST_WIFI_AP
+// ─── Network mode ─────────────────────────────────────────────────────────
+// Exactly one of:
+//   NOPORTS_NET_ETH   Ethernet (PoE-P4 production)          — default
+//   NOPORTS_WIFI_STA  WiFi station, joins an existing LAN   — esp32_wifi env
+//   NOPORTS_TEST_WIFI_AP  WiFi access point, no upstream    — test_* envs
+#if defined(NOPORTS_TEST_WIFI_AP) && defined(NOPORTS_WIFI_STA)
+  #error "NOPORTS_TEST_WIFI_AP and NOPORTS_WIFI_STA are mutually exclusive"
+#endif
+#if defined(NOPORTS_TEST_WIFI_AP) || defined(NOPORTS_WIFI_STA)
+  #define NOPORTS_NET_WIFI 1
   #include <WiFi.h>
 #else
+  #define NOPORTS_NET_ETH 1
   #include <ETH.h>
 
   // ESP32-P4 built-in EMAC (RMII) + IP101GRI PHY
@@ -63,6 +86,20 @@ extern "C" {
   #define ETH_CLK_MODE   EMAC_CLK_EXT_IN  // 50 MHz ref clock IN from IP101GRI on G50
 #endif
 
+#ifdef NOPORTS_WIFI_STA
+  // Credentials are injected from the shell via ${sysenv.*} in platformio.ini.
+  // An unset variable expands to "" — catch that at compile time instead of
+  // shipping a board that silently never connects.
+  #ifndef WIFI_STA_SSID
+    #error "NOPORTS_WIFI_STA requires WIFI_STA_SSID (set NOPORTS_WIFI_SSID in the shell)"
+  #endif
+  #ifndef WIFI_STA_PASS
+    #define WIFI_STA_PASS ""   // open network
+  #endif
+  static_assert(sizeof(WIFI_STA_SSID) > 1,
+    "WIFI_STA_SSID is empty — run: NOPORTS_WIFI_SSID=<ssid> NOPORTS_WIFI_PASS=<pass> pio run -e esp32_wifi");
+#endif
+
 // ─── Globals ──────────────────────────────────────────────────────────────
 static NoPortsDaemon npDaemon;
 static bool          daemon_running = false;
@@ -82,9 +119,29 @@ static uint32_t g_last_eth_check = 0;
 
 // Heap recovery thresholds.  AES DMA needs ~30 KB contiguous; below that
 // TLS starts failing.  Thresholds are conservative to catch slow leaks early.
-#define HEAP_WARN_BYTES         50000   // log warning only
-#define HEAP_RECOVER_BYTES      30000   // restart daemon to free relay buffers
-#define HEAP_REBOOT_BYTES       15000   // unrecoverable — reboot
+//
+// All heap figures in this sketch are MALLOC_CAP_8BIT — the pool malloc()
+// actually serves.  ESP.getFreeHeap() on arduino-esp32 2.x reports
+// MALLOC_CAP_INTERNAL, which also counts the IRAM heap (32-bit access only,
+// ~55 KB on a classic ESP32) that no byte buffer, TLS record or task stack
+// can ever use.  Measured on a WROOM-32: ESP.getFreeHeap() said 77 KB while
+// the daemon saw 13 KB and the relay task could not be created.
+#if CONFIG_IDF_TARGET_ESP32
+  // Classic ESP32, no PSRAM: ~80 KB of real DRAM left with both TLS sessions
+  // up (after the Bluetooth memory release below).  Relay traffic legitimately
+  // dips into the 20s, so the recovery thresholds sit well below that.
+  #define HEAP_WARN_BYTES       25000   // log warning only
+  #define HEAP_RECOVER_BYTES    12000   // restart daemon to free relay buffers
+  #define HEAP_REBOOT_BYTES      6000   // unrecoverable — reboot
+#else
+  #define HEAP_WARN_BYTES       50000   // log warning only
+  #define HEAP_RECOVER_BYTES    30000   // restart daemon to free relay buffers
+  #define HEAP_REBOOT_BYTES     15000   // unrecoverable — reboot
+#endif
+
+static inline uint32_t heap_free8()    { return heap_caps_get_free_size(MALLOC_CAP_8BIT); }
+static inline uint32_t heap_min8()     { return heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT); }
+static inline uint32_t heap_largest8() { return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT); }
 
 // Daemon supervision.  The Linux sshnpd relies on systemd Restart=always to
 // come back after any stop; on ESP32 this sketch is the supervisor.  If the
@@ -115,12 +172,12 @@ static void reboot_with_reason(const char *reason) {
 static void on_tunnel_open(const char *host, uint16_t port, const char *) {
   g_stats.total_tunnels++;
   led_on_tunnel_event();
-  Serial.printf("[np] Tunnel open %s:%u  free=%u\n", host, port, ESP.getFreeHeap());
+  Serial.printf("[np] Tunnel open %s:%u  free=%u\n", host, port, heap_free8());
 }
 
 static void on_tunnel_close(const char *) {
   led_on_tunnel_event();
-  Serial.printf("[np] Tunnel closed  free=%u\n", ESP.getFreeHeap());
+  Serial.printf("[np] Tunnel closed  free=%u\n", heap_free8());
 }
 
 static void on_ping(const char *from) {
@@ -164,7 +221,7 @@ static bool start_daemon() {
     bool ui_covered = false;
     for (int i = 0; i < po_count && !ui_covered; i++) {
       String s = po_items[i]; s.trim();
-      if (s == "*" || s == "127.0.0.1:80") ui_covered = true;
+      if (s == "*" || s == "*:*" || s == "*:0" || s == "127.0.0.1:80") ui_covered = true;
     }
     if (!ui_covered && po_count < NOPORTS_MAX_PERMITOPEN)
       po_items[po_count++] = "127.0.0.1:80";
@@ -192,8 +249,11 @@ static bool start_daemon() {
     if (colon > 0) {
       String port_str = po_items[i].substring(colon + 1);
       uint16_t port;
-      if (port_str == "*") {
-        port = 0;  // explicit port wildcard
+      if (port_str == "*" || port_str == "0") {
+        // Explicit port wildcard.  "0" is accepted alongside "*" because the
+        // web UI hint used to say "*:0" and devices provisioned that way have
+        // it stored in NVS; port 0 is never a real target so this is unambiguous.
+        port = 0;
       } else {
         // Strict parse, fail closed: toInt() stops at the first non-digit
         // ("2x2" -> 2) and the cast wraps out-of-range values ("70000" ->
@@ -381,7 +441,7 @@ static void post_network_setup() {
 #ifdef NOPORTS_TEST_WIFI_AP
       "noports-test";
 #else
-      "noports-poe";
+      "noports-poe";   // Ethernet and WiFi station builds
 #endif
     if (MDNS.begin(hostname)) {
       MDNS.addService("http", "tcp", 80);
@@ -407,8 +467,54 @@ static void post_network_setup() {
   }
 }
 
+// Shared teardown when the network goes away (link down, IP lost, AP gone).
+// Stops the daemon and re-arms post_network_setup() so that the next GOT_IP
+// event brings mDNS, NTP and the daemon back cleanly.
+static void on_network_down(const char *why) {
+  Serial.println(why);
+  g_net_up        = false;
+  g_post_net_done = false;
+  if (daemon_running) { npDaemon.stop(); daemon_running = false; }
+}
+
+// ─── WiFi station event handler (esp32_wifi build) ────────────────────────
+#ifdef NOPORTS_WIFI_STA
+static void on_wifi_event(arduino_event_id_t event, arduino_event_info_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_START:
+      Serial.println("[WiFi] Started");
+      break;
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.printf("[WiFi] Associated with \"%s\"\n", WIFI_STA_SSID);
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      g_net_up = true;
+      Serial.printf("[WiFi] IP: %s  RSSI: %d dBm\n",
+                    WiFi.localIP().toString().c_str(), WiFi.RSSI());
+      break;
+    case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+      on_network_down("[WiFi] IP lost (DHCP lease expired)");
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      // reason codes: see wifi_err_reason_t (2=auth expire, 15=4way timeout,
+      // 201=no AP found, 202=auth fail).  The stack auto-reconnects.
+      {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "[WiFi] Disconnected (reason %u) — reconnecting",
+                 (unsigned)info.wifi_sta_disconnected.reason);
+        on_network_down(buf);
+      }
+      break;
+    case ARDUINO_EVENT_WIFI_STA_STOP:
+      on_network_down("[WiFi] Stopped");
+      break;
+    default: break;
+  }
+}
+#endif
+
 // ─── Ethernet event handler (production build only) ───────────────────────
-#ifndef NOPORTS_TEST_WIFI_AP
+#ifdef NOPORTS_NET_ETH
 static void on_eth_event(arduino_event_id_t event, arduino_event_info_t) {
   switch (event) {
     case ARDUINO_EVENT_ETH_START:
@@ -427,24 +533,14 @@ static void on_eth_event(arduino_event_id_t event, arduino_event_info_t) {
       break;
     case ARDUINO_EVENT_ETH_LOST_IP:
       // DHCP lease expired and renewal failed — IP is gone, link may still be up.
-      // Treat identically to link-down: stop daemon and re-arm post-network setup
-      // so that when GOT_IP fires again (renewed lease) the daemon restarts cleanly.
-      Serial.println("[ETH] IP lost (DHCP lease expired)");
-      g_net_up        = false;
-      g_post_net_done = false;
-      if (daemon_running) { npDaemon.stop(); daemon_running = false; }
+      // Treat identically to link-down so the next GOT_IP restarts cleanly.
+      on_network_down("[ETH] IP lost (DHCP lease expired)");
       break;
     case ARDUINO_EVENT_ETH_DISCONNECTED:
-      Serial.println("[ETH] Link down");
-      g_net_up       = false;
-      g_post_net_done = false;  // allow full re-init (mDNS, NTP, daemon) on reconnect
-      if (daemon_running) { npDaemon.stop(); daemon_running = false; }
+      on_network_down("[ETH] Link down");
       break;
     case ARDUINO_EVENT_ETH_STOP:
-      Serial.println("[ETH] Stopped");
-      g_net_up        = false;
-      g_post_net_done = false;
-      if (daemon_running) { npDaemon.stop(); daemon_running = false; }
+      on_network_down("[ETH] Stopped");
       break;
     default: break;
   }
@@ -486,6 +582,24 @@ void setup() {
     Serial.printf("[wdt] Hardware watchdog: %u s\n", WDT_TIMEOUT_MS / 1000);
   }
 
+#ifdef NOPORTS_RELEASE_BT_MEM
+  // Return the Bluetooth controller's DRAM to the heap.  This firmware never
+  // uses BT, and on a classic ESP32 the reservation is ~30-60 KB of the
+  // byte-addressable pool the daemon's two TLS sessions and the relay need.
+  // Irreversible until reboot, which is fine.  (The CYD firmware does the
+  // same; the P4 has no radio so this block compiles out there.)
+  {
+    uint32_t before = heap_free8();
+  #if CONFIG_IDF_TARGET_ESP32
+    esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);   // classic + BLE
+  #else
+    esp_bt_controller_mem_release(ESP_BT_MODE_BLE);    // BLE-only parts (S3, C3)
+  #endif
+    Serial.printf("[main] Bluetooth memory released: heap %u -> %u bytes\n",
+                  (unsigned)before, (unsigned)heap_free8());
+  }
+#endif
+
   if (!LittleFS.begin(true)) {
     Serial.println("[main] LittleFS init failed — halting");
     while (true) delay(1000);
@@ -497,7 +611,7 @@ void setup() {
     led_init(mode);
   }
 
-#ifdef NOPORTS_TEST_WIFI_AP
+#if defined(NOPORTS_TEST_WIFI_AP)
   // ── Test mode: create a WiFi AP ─────────────────────────────────────────
   Serial.println("[test] Starting WiFi AP: " TEST_WIFI_SSID);
   WiFi.mode(WIFI_AP);
@@ -505,6 +619,17 @@ void setup() {
   Serial.printf("[test] AP IP: %s\n", WiFi.softAPIP().toString().c_str());
   Serial.println("[test] Connect to '" TEST_WIFI_SSID "' then browse to http://192.168.4.1");
   g_net_up = true;  // AP is immediately available
+#elif defined(NOPORTS_WIFI_STA)
+  // ── Stock ESP32: join an existing WiFi network ──────────────────────────
+  // Non-blocking: GOT_IP sets g_net_up and loop() runs post_network_setup().
+  WiFi.onEvent(on_wifi_event);
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname("noports-poe");
+  WiFi.setSleep(false);            // modem sleep adds latency to relay traffic
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);          // credentials live in the firmware, not NVS
+  WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASS);
+  Serial.println("[WiFi] Connecting to \"" WIFI_STA_SSID "\" — waiting for DHCP...");
 #else
   // ── Production: Ethernet ─────────────────────────────────────────────────
   Network.onEvent(on_eth_event);
@@ -516,14 +641,16 @@ void setup() {
   // Start web server immediately (reachable once IP is assigned)
   web_server_begin(&npDaemon, &daemon_running, &g_stats, &g_enroll, restart_daemon_cb);
 
-#ifdef NOPORTS_TEST_WIFI_AP
+#if defined(NOPORTS_TEST_WIFI_AP)
   // Post-network setup runs now since AP IP is available immediately
   post_network_setup();
+#elif defined(NOPORTS_WIFI_STA)
+  Serial.println("[main] Web server started — waiting for WiFi IP...");
 #else
   Serial.println("[main] Web server started — waiting for Ethernet IP...");
 #endif
 
-  Serial.printf("[main] Free heap: %u bytes\n", ESP.getFreeHeap());
+  Serial.printf("[main] Free heap: %u bytes (8-bit)\n", heap_free8());
 }
 
 // ─── loop() ───────────────────────────────────────────────────────────────
@@ -574,10 +701,15 @@ void loop() {
     static uint32_t _last_recover_ms = 0;
     if (millis() - _last_heap_ms > 10000) {
       _last_heap_ms = millis();
-      uint32_t free_h = ESP.getFreeHeap();
-      uint32_t min_h  = ESP.getMinFreeHeap();
-      uint32_t large  = ESP.getMaxAllocHeap();
-      Serial.printf("[mem] free=%u min=%u largest=%u\n", free_h, min_h, large);
+      uint32_t free_h = heap_free8();
+      uint32_t min_h  = heap_min8();
+      uint32_t large  = heap_largest8();
+      // Loop-task stack headroom (bytes never touched) — the daemon, RSA and
+      // at_client's 8 KB receive buffers all run on this stack, so this is
+      // the number to watch before anyone trims ARDUINO_LOOP_STACK_SIZE.
+      uint32_t stack_hw = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+      Serial.printf("[mem] free=%u min=%u largest=%u stack_hw=%u\n",
+                    free_h, min_h, large, stack_hw);
 
       if (free_h < HEAP_REBOOT_BYTES) {
         reboot_with_reason("heap critically low");
@@ -621,7 +753,7 @@ void loop() {
       }
       if (_sup_active) {
         if (!g_net_up) {
-          // Network outage: the ETH event handlers re-arm post_network_setup()
+          // Network outage: the network event handlers re-arm post_network_setup()
           // and restart the daemon when the link returns — stand down.
           _sup_active = false;
         } else if ((int32_t)(millis() - _sup_next_ms) >= 0) {
@@ -637,16 +769,19 @@ void loop() {
     }
   }
 
-  // Ethernet watchdog (production only)
-#ifndef NOPORTS_TEST_WIFI_AP
+  // Link watchdog — belt-and-braces behind the event handlers.  For WiFi the
+  // stack auto-reconnects (setAutoReconnect); this only catches a missed event.
+#if defined(NOPORTS_NET_ETH)
   if (g_net_up && millis() - g_last_eth_check > ETH_CHECK_INTERVAL_MS) {
     g_last_eth_check = millis();
-    if (!ETH.linkUp()) {
-      Serial.println("[ETH] Link lost — stopping daemon, awaiting reconnect");
-      g_net_up        = false;
-      g_post_net_done = false;  // re-arm post_network_setup for when link returns
-      if (daemon_running) { npDaemon.stop(); daemon_running = false; }
-    }
+    if (!ETH.linkUp())
+      on_network_down("[ETH] Link lost — stopping daemon, awaiting reconnect");
+  }
+#elif defined(NOPORTS_WIFI_STA)
+  if (g_net_up && millis() - g_last_eth_check > ETH_CHECK_INTERVAL_MS) {
+    g_last_eth_check = millis();
+    if (WiFi.status() != WL_CONNECTED)
+      on_network_down("[WiFi] Not connected — stopping daemon, awaiting reconnect");
   }
 #endif
 
