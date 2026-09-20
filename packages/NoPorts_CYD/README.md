@@ -28,6 +28,9 @@ NoPorts daemon with touchscreen UI for the **CYD (Cheap Yellow Display)** ESP32-
   reset are I2C commands to the board's companion MCU, not GPIOs; boards older
   than V1.3 need `-DCROWPANEL_ADVANCE_REV=120` (V1.2) and V1.0 is not
   supported.
+  `crowpanel_adv7_idf5` is an experimental variant on arduino-esp32 3.x that
+  drives the panel through ESP-IDF's esp_lcd driver with bounce buffers, the
+  proper fix for torn frames under heavy network traffic.
 
 ## Memory Optimization
 
