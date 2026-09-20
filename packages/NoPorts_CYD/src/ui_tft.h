@@ -9,8 +9,16 @@
 #ifndef UI_TFT_H
 #define UI_TFT_H
 
+#if defined(CROWPANEL_ADVANCE_7)
+// Elecrow CrowPanel Advance 7.0: LovyanGFX RGB panel, UI drawn on a 320x240
+// canvas that is pushed to the 800x480 panel at 2x.  CrowCanvas exposes the
+// TFT_eSPI signatures the screens use, so the rest of the UI is unchanged.
+#include "crowpanel_adv7.h"
+typedef CrowCanvas TFT_eSPI;
+#else
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
+#endif
 #include <Preferences.h>
 #include <Wire.h>
 #include <freertos/FreeRTOS.h>
@@ -22,7 +30,13 @@
 // ---------------------------------------------------------------------------
 #undef TFT_WIDTH
 #undef TFT_HEIGHT
+#if defined(CROWPANEL_ADVANCE_7)
+// 5:3 panel (800x480) shown at 2x — a 400x240 canvas fills it exactly.
+// Every screen lays itself out from TFT_WIDTH, so the extra width is used.
+#define TFT_WIDTH  400
+#else
 #define TFT_WIDTH  320
+#endif
 #define TFT_HEIGHT 240
 
 // Application version — shown on every boot/status screen and the dashboard
@@ -167,7 +181,7 @@ bool ui_touch_is_calibrated();
  */
 TFT_eSPI& ui_get_tft();
 
-#if !defined(ESP32S3_2432S028R)
+#if !defined(ESP32S3_2432S028R) && !defined(CROWPANEL_ADVANCE_7)
 /**
  * @brief Get reference to touch controller (CYD/ESP32 only — not on FNK0104 S3)
  */

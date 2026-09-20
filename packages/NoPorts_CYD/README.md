@@ -20,6 +20,14 @@ NoPorts daemon with touchscreen UI for the **CYD (Cheap Yellow Display)** ESP32-
 
 - **ESP32-2432S028R** (CYD) - standard version with micro-USB
 - **ESP32-2432S028Rv2** (CYD2USB) - newer version with micro-USB + USB-C
+- **Freenove FNK0104** (ESP32-S3, 2.8" IPS, FT6336U capacitive touch) -
+  `cyd2usb_s3`
+- **Elecrow CrowPanel Advance 7.0-HMI** (ESP32-S3-N16R8, 7" 800x480 IPS, GT911
+  capacitive touch, CH340K UART) - `crowpanel_adv7`. The UI is drawn on a
+  400x240 PSRAM canvas and shown at 2x, filling the panel. Backlight and touch
+  reset are I2C commands to the board's companion MCU, not GPIOs; boards older
+  than V1.3 need `-DCROWPANEL_ADVANCE_REV=120` (V1.2) and V1.0 is not
+  supported.
 
 ## Memory Optimization
 
@@ -48,6 +56,13 @@ pio run -e cyd -t upload
 
 # For CYD2USB (micro-USB + USB-C)
 pio run -e cyd2usb -t upload
+
+# For Freenove FNK0104 (ESP32-S3, native USB)
+pio run -e cyd2usb_s3 -t upload
+
+# For Elecrow CrowPanel Advance 7.0 (ESP32-S3, CH340K UART — needs the WCH
+# CH34x driver on macOS; the port appears as /dev/cu.wchusbserial*)
+pio run -e crowpanel_adv7 -t upload
 ```
 
 ### Serial Monitor
@@ -124,6 +139,14 @@ Custom partition table in `partitions.csv` allocates:
 - Run touch calibration
 - Adjust `TOUCH_MIN/MAX` values
 - Check IRQ pin (GPIO 36) connection
+
+### CrowPanel Advance 7.0 stays black
+- The serial log will still look healthy: the panel scans regardless of the
+  backlight. Check the board revision on the back silkscreen and build with
+  the matching `-DCROWPANEL_ADVANCE_REV` (130 for V1.3+, 120 for V1.2).
+- `[crow] nothing at 0x30` means a V1.0 board (PCA9557 expander), unsupported.
+- `[crow] no GT911 at 0x5D or 0x14` means the touch reset did not take; power
+  cycle the board rather than just resetting it.
 
 ### Memory Issues
 Monitor free heap in serial output:

@@ -60,9 +60,9 @@ static const char* _kb_keys[] = {
 static const int _kb_key_count = sizeof(_kb_keys) / sizeof(_kb_keys[0]);
 
 #define KEYS_PER_ROW 10
-#define KEY_WIDTH    30
 #define KEY_HEIGHT   18
 #define KEY_SPACING  1
+#define KEY_WIDTH    ((TFT_WIDTH - 10 - (KEYS_PER_ROW - 1) * KEY_SPACING) / KEYS_PER_ROW)  // 30 @320, 38 @400
 
 // ---------------------------------------------------------------------------
 // Helpers
