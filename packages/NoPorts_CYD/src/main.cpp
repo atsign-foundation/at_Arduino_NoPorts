@@ -18,6 +18,7 @@
 #include <WiFi.h>
 #include <esp_wifi.h>   // esp_wifi_set_ps / WIFI_PS_NONE
 #include <esp_task_wdt.h>
+#include <esp_idf_version.h>
 #include "esp_idf_version.h"
 #if ESP_IDF_VERSION_MAJOR >= 5
   #include <esp_sntp.h>        // IDF 5+: esp_sntp_stop()
@@ -1004,8 +1005,20 @@ void setup() {
     g_reboot_reason.magic = 0;
   }
 
-  // Hardware watchdog — IDF 4.x API (seconds, not ms struct like IDF 5.x)
+  // Hardware watchdog.  IDF 5 (arduino-esp32 3.x) starts it itself and takes
+  // a config struct; IDF 4 takes seconds.
+#if ESP_IDF_VERSION_MAJOR >= 5
+  {
+    esp_task_wdt_config_t wdt_cfg = {
+      .timeout_ms     = 60000,
+      .idle_core_mask = 0,
+      .trigger_panic  = true,
+    };
+    esp_task_wdt_reconfigure(&wdt_cfg);
+  }
+#else
   esp_task_wdt_init(60, true);  // 60 s timeout, panic+reboot on trigger
+#endif
   esp_task_wdt_add(NULL);       // subscribe the Arduino loop task
   Serial.println("[wdt] Hardware watchdog: 60 s");
 

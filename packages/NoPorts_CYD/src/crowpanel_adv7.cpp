@@ -7,8 +7,22 @@
 #include "crowpanel_adv7.h"
 #include <Wire.h>
 #include <esp_heap_caps.h>
-#include <lgfx/v1/platforms/esp32s3/Bus_RGB.hpp>
-#include <lgfx/v1/platforms/esp32s3/Panel_RGB.hpp>
+// Two panel back-ends:
+//   default            LovyanGFX Bus_RGB/Panel_RGB — DMA scans the framebuffer
+//                      straight out of PSRAM.  Works on arduino-esp32 2.x.
+//   CROWPANEL_ESP_LCD  ESP-IDF 5 esp_lcd RGB driver with BOUNCE BUFFERS: the
+//                      DMA is fed from two small internal-RAM buffers that the
+//                      driver refills from the PSRAM framebuffer, so PSRAM
+//                      contention (WiFi/TLS bursts) can no longer starve the
+//                      scan-out and tear a frame.  Needs arduino-esp32 3.x
+//                      (pioarduino) — env crowpanel_adv7_idf5.
+#if defined(CROWPANEL_ESP_LCD)
+  #include <esp_lcd_panel_ops.h>
+  #include <esp_lcd_panel_rgb.h>
+#else
+  #include <lgfx/v1/platforms/esp32s3/Bus_RGB.hpp>
+  #include <lgfx/v1/platforms/esp32s3/Panel_RGB.hpp>
+#endif
 
 // ---------------------------------------------------------------------------
 // Pins.  Every value is quoted from Elecrow's LovyanGFX_Driver.h and
@@ -61,6 +75,69 @@ constexpr uint32_t TOUCH_POLL_MS      = 20;
 
 constexpr uint32_t FLUSH_PERIOD_MS    = 50;       // dirty-flag check interval
 
+#if defined(CROWPANEL_ESP_LCD)
+// ---------------------------------------------------------------------------
+// esp_lcd RGB panel with bounce buffers (see header comment)
+// ---------------------------------------------------------------------------
+constexpr int BOUNCE_LINES = 10;   // 2 x (800 px x 10 lines x 2 B) = 32 KB internal DMA RAM
+esp_lcd_panel_handle_t g_panel = nullptr;
+
+bool panel_init() {
+  esp_lcd_rgb_panel_config_t cfg = {};
+  cfg.clk_src = LCD_CLK_SRC_DEFAULT;
+  cfg.timings.pclk_hz = LCD_PCLK_HZ;
+  cfg.timings.h_res   = CROW_PANEL_W;
+  cfg.timings.v_res   = CROW_PANEL_H;
+  cfg.timings.hsync_pulse_width = LCD_PULSE_WIDTH;
+  cfg.timings.hsync_back_porch  = LCD_BACK_PORCH;
+  cfg.timings.hsync_front_porch = LCD_FRONT_PORCH;
+  cfg.timings.vsync_pulse_width = LCD_PULSE_WIDTH;
+  cfg.timings.vsync_back_porch  = LCD_BACK_PORCH;
+  cfg.timings.vsync_front_porch = LCD_FRONT_PORCH;
+  // Same electrical settings as the LovyanGFX config: sync idle low,
+  // DE idle low, data clocked on the falling PCLK edge, PCLK idles high.
+  cfg.timings.flags.hsync_idle_low  = 1;
+  cfg.timings.flags.vsync_idle_low  = 1;
+  cfg.timings.flags.de_idle_high    = 0;
+  cfg.timings.flags.pclk_active_neg = 1;
+  cfg.timings.flags.pclk_idle_high  = 1;
+  cfg.data_width     = 16;
+  cfg.bits_per_pixel = 16;
+  cfg.num_fbs        = 1;
+  cfg.bounce_buffer_size_px = CROW_PANEL_W * BOUNCE_LINES;
+  cfg.dma_burst_size = 64;
+  cfg.hsync_gpio_num = LCD_HSYNC;
+  cfg.vsync_gpio_num = LCD_VSYNC;
+  cfg.de_gpio_num    = LCD_DE;
+  cfg.pclk_gpio_num  = LCD_PCLK;
+  cfg.disp_gpio_num  = -1;
+  const int data_pins[16] = { LCD_B0, LCD_B1, LCD_B2, LCD_B3, LCD_B4,
+                              LCD_G0, LCD_G1, LCD_G2, LCD_G3, LCD_G4, LCD_G5,
+                              LCD_R0, LCD_R1, LCD_R2, LCD_R3, LCD_R4 };
+  for (int i = 0; i < 16; i++) cfg.data_gpio_nums[i] = data_pins[i];
+  cfg.flags.fb_in_psram        = 1;
+  cfg.flags.bb_invalidate_cache = 1;   // drop bounce reads from cache so they do not evict useful lines
+
+  esp_err_t err = esp_lcd_new_rgb_panel(&cfg, &g_panel);
+  if (err != ESP_OK) { Serial.printf("[crow] esp_lcd_new_rgb_panel failed: %d\n", (int)err); return false; }
+  if ((err = esp_lcd_panel_reset(g_panel)) != ESP_OK) { Serial.printf("[crow] panel reset failed: %d\n", (int)err); return false; }
+  if ((err = esp_lcd_panel_init(g_panel))  != ESP_OK) { Serial.printf("[crow] panel init failed: %d\n", (int)err); return false; }
+  return true;
+}
+
+// Write one 800 x CROW_SCALE block of native RGB565 at panel row py.
+inline void panel_write_block(int py, const uint16_t *px) {
+  esp_lcd_panel_draw_bitmap(g_panel, CROW_OFFSET_X, py, CROW_OFFSET_X + CROW_CANVAS_W * CROW_SCALE, py + CROW_SCALE, px);
+}
+
+void panel_clear() {
+  uint16_t *zero = (uint16_t *)heap_caps_calloc((size_t)CROW_PANEL_W * CROW_SCALE, sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!zero) return;
+  for (int py = 0; py < CROW_PANEL_H; py += CROW_SCALE) esp_lcd_panel_draw_bitmap(g_panel, 0, py, CROW_PANEL_W, py + CROW_SCALE, zero);
+  heap_caps_free(zero);
+}
+
+#else
 // ---------------------------------------------------------------------------
 // LovyanGFX device: LCD_CAM RGB bus → 800x480 panel, framebuffer in PSRAM
 // ---------------------------------------------------------------------------
@@ -98,6 +175,18 @@ class CrowLCD : public lgfx::LGFX_Device {
 };
 
 CrowLCD     g_lcd;
+
+bool panel_init() {
+  if (!g_lcd.init()) return false;
+  g_lcd.setColorDepth(16);
+  return true;
+}
+inline void panel_write_block(int py, const uint16_t *px) {
+  g_lcd.pushImage(CROW_OFFSET_X, py, CROW_CANVAS_W * CROW_SCALE, CROW_SCALE, px);
+}
+void panel_clear() { g_lcd.fillScreen(0); }
+#endif  // CROWPANEL_ESP_LCD
+
 CrowCanvas *g_canvas   = nullptr;
 bool        g_lcd_ok   = false;
 uint8_t     g_gt911    = 0;          // address that answered, 0 = none
@@ -193,9 +282,19 @@ uint16_t *g_shadow  = nullptr;   // 320 x 240, PSRAM: last rows pushed
 
 void flush_canvas(int32_t y0, int32_t y1) {
   if (!g_lcd_ok || !g_canvas || !g_row_src || !g_row_dst || !g_shadow) return;
+#if !defined(CROWPANEL_ESP_LCD)
   g_lcd.startWrite();
+#endif
   for (int y = y0; y <= y1; y++) {
+#if defined(CROWPANEL_ESP_LCD)
+    // Typed read → native little-endian RGB565, which is what the 16-bit bus
+    // (D15..D11 = R, D10..D5 = G, D4..D0 = B) and esp_lcd expect.
+    g_canvas->readRect(0, y, CROW_CANVAS_W, 1, (lgfx::rgb565_t *)g_row_src);
+#else
+    // uint16_t read and uint16_t push share LovyanGFX's byte-order
+    // convention, so the pair round-trips without caring what it is.
     g_canvas->readRect(0, y, CROW_CANVAS_W, 1, g_row_src);
+#endif
     uint16_t *shadow = g_shadow + (size_t)y * CROW_CANVAS_W;
     if (memcmp(shadow, g_row_src, CROW_CANVAS_W * sizeof(uint16_t)) == 0) continue;
     memcpy(shadow, g_row_src, CROW_CANVAS_W * sizeof(uint16_t));
@@ -206,10 +305,11 @@ void flush_canvas(int32_t y0, int32_t y1) {
       d0[2 * x] = p; d0[2 * x + 1] = p;
       d1[2 * x] = p; d1[2 * x + 1] = p;
     }
-    g_lcd.pushImage(CROW_OFFSET_X, CROW_OFFSET_Y + y * CROW_SCALE,
-                    CROW_CANVAS_W * CROW_SCALE, CROW_SCALE, g_row_dst);
+    panel_write_block(CROW_OFFSET_Y + y * CROW_SCALE, g_row_dst);
   }
+#if !defined(CROWPANEL_ESP_LCD)
   g_lcd.endWrite();
+#endif
 }
 
 void flush_task(void *) {
@@ -265,12 +365,11 @@ bool crow_display_init(CrowCanvas &canvas) {
                 CROWPANEL_ADVANCE_REV / 100, (CROWPANEL_ADVANCE_REV / 10) % 10,
                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
 
-  g_lcd_ok = g_lcd.init();
+  g_lcd_ok = panel_init();
   if (!g_lcd_ok) {
     Serial.println("[crow] RGB panel init FAILED");
   } else {
-    g_lcd.setColorDepth(16);
-    g_lcd.fillScreen(0);
+    panel_clear();
   }
 
   if (!canvas.init()) return false;
@@ -301,7 +400,11 @@ bool crow_display_init(CrowCanvas &canvas) {
   // Flush task on core 0 (the Arduino loop and UI drawing run on core 1).
   xTaskCreatePinnedToCore(flush_task, "crow_flush", 4096, nullptr, 1, nullptr, 0);
 
-  Serial.printf("[crow] pclk %u Hz\n", (unsigned)LCD_PCLK_HZ);
+#if defined(CROWPANEL_ESP_LCD)
+  Serial.printf("[crow] pclk %u Hz, esp_lcd back-end, %d-line bounce buffers\n", (unsigned)LCD_PCLK_HZ, BOUNCE_LINES);
+#else
+  Serial.printf("[crow] pclk %u Hz, LovyanGFX Bus_RGB back-end\n", (unsigned)LCD_PCLK_HZ);
+#endif
   Serial.printf("[crow] panel %s, canvas %dx%d @%dx → %dx%d at (%d,%d)\n",
                 g_lcd_ok ? "up" : "DOWN", CROW_CANVAS_W, CROW_CANVAS_H, CROW_SCALE,
                 CROW_CANVAS_W * CROW_SCALE, CROW_CANVAS_H * CROW_SCALE, CROW_OFFSET_X, CROW_OFFSET_Y);
