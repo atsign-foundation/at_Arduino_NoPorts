@@ -53,6 +53,13 @@ jobs:
             flash_size: 16MB
             flash_freq: 80m
             bootloader_offset: "0x0"
+          - name: NoPorts_CYD-crowpanel_adv7
+            project: packages/NoPorts_CYD
+            pio_env: crowpanel_adv7
+            chip: esp32s3
+            flash_size: 16MB
+            flash_freq: 80m
+            bootloader_offset: "0x0"
 
     steps:
       - name: Checkout
