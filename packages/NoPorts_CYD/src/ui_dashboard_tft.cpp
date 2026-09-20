@@ -69,14 +69,13 @@ static uint32_t _prev_bytes_out = 0;
 static String _atsign;
 static String _device;
 
-// Bottom row button layout — 6 uniform 49px buttons with 4px gaps
-// LED(49) gap(4) LCD(49) gap(4) WiFi(49) gap(4) Cfg(49) gap(4) Rules(49) gap(4) Reset(49)
-// Total: 6*49 + 5*4 + 2*3(margins) = 294+20+6 = 320 ✓
+// Bottom row button layout — 6 uniform buttons with 4px gaps, sized to fill
+// TFT_WIDTH: 49 px at 320 (6*49 + 5*4 + 2*3 = 320), 62 px at 400.
 #define BTN_H         26
 #define BTN_Y         (TFT_HEIGHT - BTN_H - 2)
-#define BTN_W         49
 #define BTN_GAP        4
 #define BTN_MARGIN     3
+#define BTN_W         ((TFT_WIDTH - 2 * BTN_MARGIN - 5 * BTN_GAP) / 6)
 // Button x positions
 #define LED_BTN_X     BTN_MARGIN
 #define LCD_BTN_X     (BTN_MARGIN + 1*(BTN_W + BTN_GAP))

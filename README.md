@@ -31,6 +31,7 @@ All tunnel traffic is **end-to-end encrypted** (AES-256-CTR) and
 |---|---|---|---|---|
 | **CYD** (ESP32-2432S028R / v2) | ESP32 | WiFi | 2.8" touchscreen | `NoPorts_CYD` |
 | **Freenove FNK0104** (CYD S3) | ESP32-S3 | WiFi | 2.8" touchscreen | `NoPorts_CYD` |
+| **Elecrow CrowPanel Advance 7.0** | ESP32-S3 | WiFi | 7" 800x480 touchscreen | `NoPorts_CYD` |
 | **M5Stack Unit PoE-P4** | ESP32-P4 | Fast Ethernet (10/100) + PoE | Web UI | `NoPorts_PoE` |
 
 ### CYD — Cheap Yellow Display
@@ -84,7 +85,7 @@ at_Arduino_NoPorts/
 <!-- pyml disable-num-lines 4 md013-->
 | Package | Target hardware | Description |
 |---|---|---|
-| **[NoPorts_CYD](packages/NoPorts_CYD/)** | ESP32-2432S028R, ESP32-S3 CYD variants | Touchscreen UI — WiFi setup, enrollment, live dashboard. |
+| **[NoPorts_CYD](packages/NoPorts_CYD/)** | ESP32-2432S028R, ESP32-S3 CYD variants, Elecrow CrowPanel Advance 7.0 | Touchscreen UI — WiFi setup, enrollment, live dashboard. |
 | **[NoPorts_PoE](packages/NoPorts_PoE/)** | M5Stack Unit PoE-P4 (ESP32-P4) | Headless daemon with web UI. Connects over Fast Ethernet (10/100), powered by PoE. |
 
 ---

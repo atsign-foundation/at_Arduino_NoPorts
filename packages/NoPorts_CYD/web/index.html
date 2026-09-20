@@ -202,6 +202,13 @@
       <span class="name">CYD2USB S3</span>
       <span class="chip">ESP32-S3 · Freenove FNK0104</span>
     </button>
+    <button class="board-btn"
+            data-manifest="manifest-crowpanel_adv7.json"
+            onclick="selectBoard(this)">
+      <img class="board-img" src="board-crowpanel.svg" alt="CrowPanel Advance 7.0 board">
+      <span class="name">CrowPanel Advance 7.0</span>
+      <span class="chip">ESP32-S3 · Elecrow 7" 800×480</span>
+    </button>
   </div>
 </div>
 
@@ -258,9 +265,11 @@
       PlatformIO monitor).
     </li>
     <li>
-      <b>No serial port appears</b> — try a different USB cable (some are
-      charge-only), or close any other app using the port (Arduino IDE,
-      PlatformIO monitor).
+      <b>CrowPanel Advance on macOS: no serial port</b> — its CH340K USB chip
+      is not covered by the built-in Apple driver. Install the
+      <a href="https://github.com/WCHSoftGroup/ch34xser_macos" target="_blank" rel="noopener">WCH CH34x driver</a>,
+      approve it under System Settings → Login Items &amp; Extensions →
+      Driver Extensions, then reconnect. Windows and Linux need no driver.
     </li>
   </ol>
 </div>

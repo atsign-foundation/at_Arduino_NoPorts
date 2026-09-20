@@ -19,7 +19,9 @@ static TFT_eSPI tft = TFT_eSPI();
 // CYD2USB: Touch uses a separate SPI bus (HSPI) with its own pins
 // MOSI=32, MISO=39, SCLK=25, CS=33, IRQ=36
 // FNK0104 (ESP32-S3): uses FT6336U capacitive I2C touch — XPT2046 not present
-#if !defined(ESP32S3_2432S028R)
+#if defined(CROWPANEL_ADVANCE_7)
+// CrowPanel Advance: GT911 touch and the panel live in crowpanel_adv7.cpp
+#elif !defined(ESP32S3_2432S028R)
 static XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
 #else
 // FNK0104: single WS2812B on GPIO 42
@@ -63,8 +65,8 @@ static void _draw_crosshair(int16_t sx, int16_t sy, uint16_t color) {
 
 // Wait for touch and return raw XPT2046 coordinates
 static TS_Point _wait_for_touch_raw() {
-#if defined(ESP32S3_2432S028R)
-  return TS_Point(0, 0, 0);  // No XPT2046 on FNK0104
+#if defined(ESP32S3_2432S028R) || defined(CROWPANEL_ADVANCE_7)
+  return TS_Point(0, 0, 0);  // capacitive touch: no calibration
 #else
   // Wait for release first
   while (touch.touched()) { delay(10); }
@@ -186,6 +188,9 @@ static void _load_calibration() {
 }
 
 bool ui_touch_is_calibrated() {
+#if defined(CROWPANEL_ADVANCE_7)
+  return true;   // capacitive GT911 reports panel pixels directly
+#endif
   return prefs.getBool("cal_done", false);
 }
 
@@ -194,6 +199,12 @@ bool ui_touch_is_calibrated() {
 // ---------------------------------------------------------------------------
 
 void ui_tft_init() {
+#if defined(CROWPANEL_ADVANCE_7)
+  // CrowPanel Advance: RGB panel, PSRAM canvas, companion-MCU backlight,
+  // GT911 touch and the 2x flush task are all brought up here.
+  crow_display_init(tft);
+  tft.fillScreen(COLOR_BG_DARK);
+#else
   // Turn on backlight (DISPLAY_BCKL: GPIO 21 on CYD, GPIO 45 on FNK0104)
   pinMode(DISPLAY_BCKL, OUTPUT);
   digitalWrite(DISPLAY_BCKL, HIGH);
@@ -202,9 +213,12 @@ void ui_tft_init() {
   tft.init();
   tft.setRotation(1);  // Landscape mode
   tft.fillScreen(COLOR_BG_DARK);
+#endif
   
   // Initialize touch
-#if !defined(ESP32S3_2432S028R)
+#if defined(CROWPANEL_ADVANCE_7)
+  // done in crow_display_init()
+#elif !defined(ESP32S3_2432S028R)
   // CYD2USB (ESP32): XPT2046 resistive touch on dedicated HSPI pins
   // SCLK=25, MISO=39, MOSI=32, CS=33, IRQ=36
   // TFT_eSPI uses its own SPIClass instance, so the global SPI can be
@@ -229,7 +243,7 @@ void ui_tft_init() {
   _ws2812.clear();
   _ws2812.show();
   Serial.println("[ui_tft] WS2812B LED initialized");
-#else
+#elif !defined(CROWPANEL_ADVANCE_7)
   // CYD/ESP32: three discrete active-LOW LEDs on GPIO 4/16/17
   pinMode(LED_R, OUTPUT);
   pinMode(LED_G, OUTPUT);
@@ -258,7 +272,7 @@ TFT_eSPI& ui_get_tft() {
   return tft;
 }
 
-#if !defined(ESP32S3_2432S028R)
+#if !defined(ESP32S3_2432S028R) && !defined(CROWPANEL_ADVANCE_7)
 XPT2046_Touchscreen& ui_get_touch() {
   return touch;
 }
@@ -269,7 +283,35 @@ XPT2046_Touchscreen& ui_get_touch() {
 // ---------------------------------------------------------------------------
 
 bool ui_touch_read(int16_t *x, int16_t *y) {
-#if defined(ESP32S3_2432S028R)
+#if defined(CROWPANEL_ADVANCE_7)
+  // CrowPanel Advance: GT911 polled in crowpanel_adv7.cpp and already mapped
+  // to canvas coordinates.  Same edge-trigger / sustained-release logic as
+  // the other boards so screens see exactly one event per tap.
+  int16_t cx, cy;
+  if (!crow_touch_read(&cx, &cy)) {
+    if (_touch_down || _touch_fired) {
+      unsigned long now = millis();
+      if (_release_start == 0) {
+        _release_start = now;
+      } else if (now - _release_start >= TOUCH_RELEASE_MS) {
+        _touch_down  = false;
+        _touch_fired = false;
+        _release_start = 0;
+      }
+    }
+    return false;
+  }
+  _release_start = 0;
+  if (_touch_fired) return false;  // already reported this press
+  unsigned long now = millis();
+  if (_touch_down && (now - _last_touch_time < TOUCH_DEBOUNCE_MS)) return false;
+  *x = constrain(cx, 0, TFT_WIDTH  - 1);
+  *y = constrain(cy, 0, TFT_HEIGHT - 1);
+  _touch_down  = true;
+  _touch_fired = true;
+  _last_touch_time = now;
+  return true;
+#elif defined(ESP32S3_2432S028R)
   // FNK0104: FT6336U capacitive I2C touch
   // Read TD_STATUS + P1 X/Y in a single burst from reg 0x02
   Wire.beginTransmission(FT6336U_ADDR);
@@ -463,12 +505,18 @@ static bool _breathe_r = false, _breathe_g = false, _breathe_b = false;
 static uint32_t _breathe_start_ms = 0;  // millis() when armed, for phase continuity
 
 void ui_set_backlight(bool on) {
+#if defined(CROWPANEL_ADVANCE_7)
+  crow_backlight(on);   // I2C command to the companion MCU, not a GPIO
+#else
   digitalWrite(DISPLAY_BCKL, on ? HIGH : LOW);
+#endif
 }
 
 void ui_set_led(bool r, bool g, bool b) {
   _breathe_active = false;  // solid colour cancels breathe
-#if defined(ESP32S3_2432S028R)
+#if defined(CROWPANEL_ADVANCE_7)
+  (void)r; (void)g; (void)b;   // no status LED on the CrowPanel
+#elif defined(ESP32S3_2432S028R)
   // FNK0104: WS2812B NeoPixel — map bool r/g/b to full RGB byte values
   _ws2812.setPixelColor(0, _ws2812.Color(r ? 80 : 0, g ? 80 : 0, b ? 80 : 0));
   _ws2812.show();
@@ -503,7 +551,9 @@ void ui_led_tick() {
   float gamma = rise * rise;
   uint8_t val = (uint8_t)(gamma * 60.0f + 0.5f);  // peak ≈ 24%
 
-#if defined(ESP32S3_2432S028R)
+#if defined(CROWPANEL_ADVANCE_7)
+  (void)val;
+#elif defined(ESP32S3_2432S028R)
   _ws2812.setPixelColor(0, _ws2812.Color(
     _breathe_r ? val : 0,
     _breathe_g ? val : 0,

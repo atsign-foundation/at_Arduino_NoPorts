@@ -42,9 +42,9 @@
 // Root server editor keyboard (same geometry as the enrollment screen)
 #define KB_TOP_Y       125
 #define KEYS_PER_ROW   10
-#define KEY_WIDTH      30
 #define KEY_HEIGHT     18
 #define KEY_SPACING     1
+#define KEY_WIDTH      ((TFT_WIDTH - 10 - (KEYS_PER_ROW - 1) * KEY_SPACING) / KEYS_PER_ROW)  // 30 @320, 38 @400
 
 // ---------------------------------------------------------------------------
 // State
