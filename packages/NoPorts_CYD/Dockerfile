@@ -58,7 +58,7 @@ RUN mkdir -p lib/NoPorts
 WORKDIR /build/packages/NoPorts_CYD
 
 # Fetch all registry packages + ESP32 toolchain (cached unless platformio.ini changes)
-RUN platformio pkg install -e cyd2usb -e cyd2usb_s3
+RUN platformio pkg install -e cyd2usb -e cyd2usb_s3 -e crowpanel_adv7
 
 # ---------------------------------------------------------------------------
 # Now copy the full source and build
@@ -70,7 +70,7 @@ COPY packages/NoPorts_CYD/  packages/NoPorts_CYD/
 
 WORKDIR /build/packages/NoPorts_CYD
 
-RUN platformio run -e cyd2usb -e cyd2usb_s3
+RUN platformio run -e cyd2usb -e cyd2usb_s3 -e crowpanel_adv7
 
 # ---------------------------------------------------------------------------
 # Merge each environment into a single self-contained binary.
@@ -93,7 +93,14 @@ RUN BOOT=$(find /root/.platformio/packages -name "boot_app0.bin" | head -1) && \
         0x0     .pio/build/cyd2usb_s3/bootloader.bin \
         0x8000  .pio/build/cyd2usb_s3/partitions.bin \
         0xe000  "$BOOT" \
-        0x10000 .pio/build/cyd2usb_s3/firmware.bin
+        0x10000 .pio/build/cyd2usb_s3/firmware.bin && \
+    \
+    esptool.py --chip esp32s3 merge_bin \
+        -o merged-crowpanel_adv7.bin \
+        0x0     .pio/build/crowpanel_adv7/bootloader.bin \
+        0x8000  .pio/build/crowpanel_adv7/partitions.bin \
+        0xe000  "$BOOT" \
+        0x10000 .pio/build/crowpanel_adv7/firmware.bin
 
 # Binaries for upgrade manifests — exactly what PlatformIO flashes on every upload:
 #   bootloader @ 0x1000 (ESP32) or 0x0 (ESP32-S3)
@@ -103,15 +110,18 @@ RUN BOOT=$(find /root/.platformio/packages -name "boot_app0.bin" | head -1) && \
 # NVS at 0x9000 is a separate 4KB sector never touched by any of these offsets.
 RUN cp .pio/build/cyd2usb/firmware.bin      firmware-cyd2usb.bin       && \
     cp .pio/build/cyd2usb_s3/firmware.bin   firmware-cyd2usb_s3.bin    && \
+    cp .pio/build/crowpanel_adv7/firmware.bin   firmware-crowpanel_adv7.bin   && \
     cp .pio/build/cyd2usb/partitions.bin    partitions-cyd2usb.bin     && \
     cp .pio/build/cyd2usb_s3/partitions.bin partitions-cyd2usb_s3.bin  && \
+    cp .pio/build/crowpanel_adv7/partitions.bin partitions-crowpanel_adv7.bin && \
     cp .pio/build/cyd2usb/bootloader.bin    bootloader-cyd2usb.bin     && \
     cp .pio/build/cyd2usb_s3/bootloader.bin bootloader-cyd2usb_s3.bin  && \
+    cp .pio/build/crowpanel_adv7/bootloader.bin bootloader-crowpanel_adv7.bin && \
     BOOT=$(find /root/.platformio/packages -name "boot_app0.bin" | head -1) && \
     cp "$BOOT" boot_app0.bin && \
-    wc -c firmware-cyd2usb.bin firmware-cyd2usb_s3.bin \
-               partitions-cyd2usb.bin partitions-cyd2usb_s3.bin \
-               bootloader-cyd2usb.bin bootloader-cyd2usb_s3.bin \
+    wc -c firmware-cyd2usb.bin firmware-cyd2usb_s3.bin firmware-crowpanel_adv7.bin \
+               partitions-cyd2usb.bin partitions-cyd2usb_s3.bin partitions-crowpanel_adv7.bin \
+               bootloader-cyd2usb.bin bootloader-cyd2usb_s3.bin bootloader-crowpanel_adv7.bin \
                boot_app0.bin
 
 # ---------------------------------------------------------------------------
@@ -133,6 +143,7 @@ COPY --from=builder /esp-web-tools/ /usr/share/nginx/html/esp-web-tools/
 # Merged firmware binaries (used by factory-reset manifests)
 COPY --from=builder /build/packages/NoPorts_CYD/merged-cyd2usb.bin     /usr/share/nginx/html/
 COPY --from=builder /build/packages/NoPorts_CYD/merged-cyd2usb_s3.bin  /usr/share/nginx/html/
+COPY --from=builder /build/packages/NoPorts_CYD/merged-crowpanel_adv7.bin /usr/share/nginx/html/
 
 # Upgrade binaries (mirrors exact PlatformIO upload sequence)
 COPY --from=builder /build/packages/NoPorts_CYD/firmware-cyd2usb.bin       /usr/share/nginx/html/
@@ -141,10 +152,13 @@ COPY --from=builder /build/packages/NoPorts_CYD/partitions-cyd2usb.bin     /usr/
 COPY --from=builder /build/packages/NoPorts_CYD/partitions-cyd2usb_s3.bin  /usr/share/nginx/html/
 COPY --from=builder /build/packages/NoPorts_CYD/bootloader-cyd2usb.bin     /usr/share/nginx/html/
 COPY --from=builder /build/packages/NoPorts_CYD/bootloader-cyd2usb_s3.bin  /usr/share/nginx/html/
+COPY --from=builder /build/packages/NoPorts_CYD/firmware-crowpanel_adv7.bin   /usr/share/nginx/html/
+COPY --from=builder /build/packages/NoPorts_CYD/partitions-crowpanel_adv7.bin /usr/share/nginx/html/
+COPY --from=builder /build/packages/NoPorts_CYD/bootloader-crowpanel_adv7.bin /usr/share/nginx/html/
 COPY --from=builder /build/packages/NoPorts_CYD/boot_app0.bin               /usr/share/nginx/html/
 
 EXPOSE 80
 
 LABEL org.opencontainers.image.title="NoPorts CYD Flasher" \
-      org.opencontainers.image.description="Browser-based firmware installer for NoPorts CYD / ESP32-S3 devices" \
+      org.opencontainers.image.description="Browser-based firmware installer for NoPorts CYD / ESP32-S3 / CrowPanel devices" \
       org.opencontainers.image.source="https://github.com/atsign-foundation/noports"
