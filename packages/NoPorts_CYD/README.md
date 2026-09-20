@@ -148,6 +148,12 @@ Custom partition table in `partitions.csv` allocates:
 - `[crow] no GT911 at 0x5D or 0x14` means the touch reset did not take; power
   cycle the board rather than just resetting it.
 
+### CrowPanel Advance 7.0 shows an occasional torn frame
+- The panel scans its framebuffer out of PSRAM, and WiFi/TLS bursts can starve
+  that DMA for one frame. The env ships `-DCROWPANEL_PCLK_HZ=14000000`
+  (~34 Hz refresh) instead of Elecrow's 16 MHz for exactly this reason. Lower
+  it further if it persists; raise it back toward 16000000 if you see flicker.
+
 ### Memory Issues
 Monitor free heap in serial output:
 ```

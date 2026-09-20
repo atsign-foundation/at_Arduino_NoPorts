@@ -15,8 +15,13 @@
  *
  * PSRAM bandwidth is the scarce resource: the RGB panel scans its framebuffer
  * out of PSRAM continuously and any other PSRAM traffic shows up as shimmer.
- * So the canvas is only read when a draw call has flagged it dirty, and only
- * the rows that actually changed (against a shadow copy) are written.
+ * So every draw call records which canvas rows it touched, the flush reads
+ * only those rows, and only the ones that actually changed (against a shadow
+ * copy) are written to the framebuffer.
+ *
+ * If the panel still shows an occasional torn frame under heavy WiFi/TLS
+ * load, lowering the pixel clock reduces the scan-out's PSRAM demand:
+ *   -DCROWPANEL_PCLK_HZ=14000000   (default: 16 MHz on V1.3+, 21 MHz on V1.2)
  *
  * Pin map and companion-MCU protocol are taken verbatim from Elecrow's own
  * LovyanGFX_Driver.h / V1.5 schematic as documented in
@@ -54,7 +59,8 @@ using lgfx::BL_DATUM; using lgfx::BC_DATUM; using lgfx::BR_DATUM;
 
 // Minimal stand-in for XPT2046_Touchscreen's TS_Point, which ui_tft.cpp's
 // (unused here) calibration code returns.
-void crow_mark_dirty();
+void crow_mark_dirty();                              // whole canvas
+void crow_mark_dirty_rows(int32_t y0, int32_t y1);   // inclusive row range
 
 struct TS_Point {
   int16_t x = 0, y = 0, z = 0;
@@ -82,26 +88,27 @@ class CrowCanvas : public lgfx::LGFX_Sprite {
   int32_t textWidth(const char *s, uint8_t font) { return lgfx::LGFX_Sprite::textWidth(s, fontFor(font)); }
   int32_t textWidth(const String &s, uint8_t font) { return textWidth(s.c_str(), font); }
 
-  // Text: same overloads as LovyanGFX, plus the dirty flag.
-  size_t drawString(const char *s, int32_t x, int32_t y, uint8_t font) { crow_mark_dirty(); return lgfx::LGFX_Sprite::drawString(s, x, y, font); }
-  size_t drawString(const char *s, int32_t x, int32_t y)               { crow_mark_dirty(); return lgfx::LGFX_Sprite::drawString(s, x, y); }
+  // Text: same overloads as LovyanGFX, plus dirty-row tracking.  The datum
+  // can put the glyphs above or below y, so mark one font height either side.
+  size_t drawString(const char *s, int32_t x, int32_t y, uint8_t font) { int32_t h = fontHeight(font); crow_mark_dirty_rows(y - h, y + h); return lgfx::LGFX_Sprite::drawString(s, x, y, font); }
+  size_t drawString(const char *s, int32_t x, int32_t y)               { int32_t h = fontHeight();     crow_mark_dirty_rows(y - h, y + h); return lgfx::LGFX_Sprite::drawString(s, x, y); }
   size_t drawString(const String &s, int32_t x, int32_t y, uint8_t font) { return drawString(s.c_str(), x, y, font); }
   size_t drawString(const String &s, int32_t x, int32_t y)             { return drawString(s.c_str(), x, y); }
 
-  // RGB565 colour forcing (see class comment) + dirty flag
+  // RGB565 colour forcing (see class comment) + dirty-row tracking
   void fillScreen(uint32_t c)                                            { crow_mark_dirty(); lgfx::LGFX_Sprite::fillScreen((uint16_t)c); }
   void setTextColor(uint32_t fg)                                         { lgfx::LGFX_Sprite::setTextColor((uint16_t)fg); }
   void setTextColor(uint32_t fg, uint32_t bg)                            { lgfx::LGFX_Sprite::setTextColor((uint16_t)fg, (uint16_t)bg); }
-  void fillRect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t c)  { crow_mark_dirty(); lgfx::LGFX_Sprite::fillRect(x, y, w, h, (uint16_t)c); }
-  void drawRect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t c)  { crow_mark_dirty(); lgfx::LGFX_Sprite::drawRect(x, y, w, h, (uint16_t)c); }
-  void fillRoundRect(int32_t x, int32_t y, int32_t w, int32_t h, int32_t r, uint32_t c) { crow_mark_dirty(); lgfx::LGFX_Sprite::fillRoundRect(x, y, w, h, r, (uint16_t)c); }
-  void drawRoundRect(int32_t x, int32_t y, int32_t w, int32_t h, int32_t r, uint32_t c) { crow_mark_dirty(); lgfx::LGFX_Sprite::drawRoundRect(x, y, w, h, r, (uint16_t)c); }
-  void drawLine(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t c) { crow_mark_dirty(); lgfx::LGFX_Sprite::drawLine(x0, y0, x1, y1, (uint16_t)c); }
-  void fillCircle(int32_t x, int32_t y, int32_t r, uint32_t c)           { crow_mark_dirty(); lgfx::LGFX_Sprite::fillCircle(x, y, r, (uint16_t)c); }
-  void drawCircle(int32_t x, int32_t y, int32_t r, uint32_t c)           { crow_mark_dirty(); lgfx::LGFX_Sprite::drawCircle(x, y, r, (uint16_t)c); }
-  void drawPixel(int32_t x, int32_t y, uint32_t c)                       { crow_mark_dirty(); lgfx::LGFX_Sprite::drawPixel(x, y, (uint16_t)c); }
-  void drawFastHLine(int32_t x, int32_t y, int32_t w, uint32_t c)        { crow_mark_dirty(); lgfx::LGFX_Sprite::drawFastHLine(x, y, w, (uint16_t)c); }
-  void drawFastVLine(int32_t x, int32_t y, int32_t h, uint32_t c)        { crow_mark_dirty(); lgfx::LGFX_Sprite::drawFastVLine(x, y, h, (uint16_t)c); }
+  void fillRect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t c)  { crow_mark_dirty_rows(y, y + h); lgfx::LGFX_Sprite::fillRect(x, y, w, h, (uint16_t)c); }
+  void drawRect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t c)  { crow_mark_dirty_rows(y, y + h); lgfx::LGFX_Sprite::drawRect(x, y, w, h, (uint16_t)c); }
+  void fillRoundRect(int32_t x, int32_t y, int32_t w, int32_t h, int32_t r, uint32_t c) { crow_mark_dirty_rows(y, y + h); lgfx::LGFX_Sprite::fillRoundRect(x, y, w, h, r, (uint16_t)c); }
+  void drawRoundRect(int32_t x, int32_t y, int32_t w, int32_t h, int32_t r, uint32_t c) { crow_mark_dirty_rows(y, y + h); lgfx::LGFX_Sprite::drawRoundRect(x, y, w, h, r, (uint16_t)c); }
+  void drawLine(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t c) { crow_mark_dirty_rows(y0 < y1 ? y0 : y1, y0 < y1 ? y1 : y0); lgfx::LGFX_Sprite::drawLine(x0, y0, x1, y1, (uint16_t)c); }
+  void fillCircle(int32_t x, int32_t y, int32_t r, uint32_t c)           { crow_mark_dirty_rows(y - r, y + r); lgfx::LGFX_Sprite::fillCircle(x, y, r, (uint16_t)c); }
+  void drawCircle(int32_t x, int32_t y, int32_t r, uint32_t c)           { crow_mark_dirty_rows(y - r, y + r); lgfx::LGFX_Sprite::drawCircle(x, y, r, (uint16_t)c); }
+  void drawPixel(int32_t x, int32_t y, uint32_t c)                       { crow_mark_dirty_rows(y, y); lgfx::LGFX_Sprite::drawPixel(x, y, (uint16_t)c); }
+  void drawFastHLine(int32_t x, int32_t y, int32_t w, uint32_t c)        { crow_mark_dirty_rows(y, y); lgfx::LGFX_Sprite::drawFastHLine(x, y, w, (uint16_t)c); }
+  void drawFastVLine(int32_t x, int32_t y, int32_t h, uint32_t c)        { crow_mark_dirty_rows(y, y + h); lgfx::LGFX_Sprite::drawFastVLine(x, y, h, (uint16_t)c); }
 
   static const lgfx::IFont *fontFor(uint8_t font);
 };
