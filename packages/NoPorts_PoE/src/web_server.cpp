@@ -7,6 +7,22 @@
 #include <ETH.h>
 #include "led.h"
 #endif
+#if defined(NOPORTS_WIFI_STA) || defined(NOPORTS_TEST_WIFI_AP)
+#include <WiFi.h>
+#endif
+
+// Device IP as seen by browsers — depends on which network stack this build uses.
+static String _device_ip() {
+#if defined(NOPORTS_TEST_WIFI_AP)
+  return WiFi.softAPIP().toString();
+#elif defined(NOPORTS_WIFI_STA)
+  return WiFi.localIP().toString();
+#elif defined(NOPORTS_POE_P4)
+  return ETH.localIP().toString();
+#else
+  return "0.0.0.0";
+#endif
+}
 
 extern "C" {
 #include "atauth.h"
@@ -127,12 +143,7 @@ static bool _host_allowed(const String &raw) {
   h.toLowerCase();
   if (h == "localhost" || h == "127.0.0.1") return true;
   if (h == "noports-poe.local") return true;
-#ifdef NOPORTS_POE_P4
-  if (h == ETH.localIP().toString()) return true;
-#endif
-#ifdef NOPORTS_TEST_WIFI_AP
-  if (h == WiFi.softAPIP().toString()) return true;
-#endif
+  if (h == _device_ip()) return true;
   return false;
 }
 
@@ -268,14 +279,7 @@ static void _handle_status() {
     }
   }
 
-  String ip;
-#ifdef NOPORTS_TEST_WIFI_AP
-  ip = WiFi.softAPIP().toString();
-#elif defined(NOPORTS_POE_P4)
-  ip = ETH.localIP().toString();
-#else
-  ip = "0.0.0.0";
-#endif
+  String ip = _device_ip();
 
   String j;
   j.reserve(512);
@@ -404,7 +408,7 @@ static void _handle_setup_get() {
   b += "<p class=hint>Comma-separated list of atSigns allowed to open tunnels.</p>";
   b += "<label>PermitOpen rules <span style='color:#E84040'>*</span>";
   b += "<input id=po placeholder='localhost:22,localhost:2222'></label>";
-  b += "<p class=hint>host:port pairs this device will relay. Use *:0 to allow all.</p>";
+  b += "<p class=hint>host:port pairs this device will relay. Use *:* to allow all.</p>";
   b += "<label>Root server<input id=root placeholder='root.atsign.org' value='";
   b += nvs_load(NVS_KEY_ROOT); b += "'></label>";
   b += "<p class=hint>Leave blank for root.atsign.org. Optional :port (default 64). "
@@ -654,7 +658,7 @@ static void _handle_settings_get() {
   b += "<label>Manager atSign(s)<textarea id=mgrs rows=3>"; b += mgrs; b += "</textarea></label>";
   b += "<p class=hint>One per line or comma-separated. These atSigns can open tunnels.</p>";
   b += "<label>PermitOpen rules<textarea id=po rows=3>"; b += po; b += "</textarea></label>";
-  b += "<p class=hint>host:port per line or comma-separated. Use *:0 to allow all.</p>";
+  b += "<p class=hint>host:port per line or comma-separated. Use *:* to allow all.</p>";
   b += "</div>";
 
   b += "<div id=pol_block class=";
@@ -1279,13 +1283,7 @@ void web_server_clear_restart() {
 }
 
 String web_server_ip() {
-#ifdef NOPORTS_TEST_WIFI_AP
-  return WiFi.softAPIP().toString();
-#elif defined(NOPORTS_POE_P4)
-  return ETH.localIP().toString();
-#else
-  return "0.0.0.0";
-#endif
+  return _device_ip();
 }
 
 bool web_server_is_local() {

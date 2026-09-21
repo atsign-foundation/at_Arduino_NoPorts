@@ -12,7 +12,13 @@ Preferences& nvs_prefs() {
 }
 
 String nvs_load(const char *key) {
-  return nvs_prefs().getString(key, "");
+  Preferences &p = nvs_prefs();
+  // Preferences logs an ERROR-level "nvs_get_str len fail ... NOT_FOUND" for
+  // every missing key (arduino-esp32 2.x).  Optional settings such as
+  // max_relays are legitimately absent until the user saves the Config page,
+  // so probe first and keep the boot log clean.
+  if (!p.isKey(key)) return "";
+  return p.getString(key, "");
 }
 
 void nvs_save(const char *key, const char *value) {

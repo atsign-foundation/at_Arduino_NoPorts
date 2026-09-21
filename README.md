@@ -119,6 +119,53 @@ USB power needed).
 4. Navigate to the device's IP address in a browser, sign in with the admin
 PIN, and complete configuration.
 
+### Stock ESP32 Quick Start (WiFi) — experimental
+
+> **Not a supported target yet.** On a classic ESP32-WROOM-32 (no PSRAM) the
+> firmware boots, enrols and opens a tunnel, but it does not stay up reliably
+> under traffic — see [Headroom on a WROOM-32](#headroom-on-a-wroom-32).
+> Use the M5Stack PoE-P4, or an ESP32-S3 board with PSRAM, for anything you
+> depend on.
+
+The PoE firmware can also be built for an off-the-shelf ESP32 dev board over
+WiFi instead of Ethernet. You get the same web UI, admin PIN and OTP enrolment
+flow as the PoE-P4, so no `.atKeys` file has to be prepared on your laptop.
+
+1. Clone the repo and open `packages/NoPorts_PoE` in PlatformIO.
+2. Build and flash with your **2.4 GHz** WiFi credentials passed through the
+shell environment (they are compiled in and never written to git):
+
+   ```bash
+   cd packages/NoPorts_PoE
+   NOPORTS_WIFI_SSID='MyNetwork' NOPORTS_WIFI_PASS='MyPassword' \
+     pio run -e esp32_wifi --target upload
+   pio device monitor
+   ```
+
+3. Note the web UI admin PIN printed to the serial console at boot.
+4. Browse to `http://noports-poe.local` (or the IP printed on serial), sign in
+with the admin PIN, complete setup, then enrol with an OTP from your atSign app.
+
+The build fails with a clear message if `NOPORTS_WIFI_SSID` is unset.
+On-device WiFi provisioning (no rebuild to change networks) is planned as a
+follow-up.
+
+#### Headroom on a WROOM-32
+
+Without PSRAM the daemon's two TLS sessions leave roughly 25 KB of usable heap
+with one tunnel open. Relay traffic pushes that lower, and when it crosses the
+daemon's heap-recovery thresholds the daemon restarts and, if that does not
+help, the board reboots. In practice a WROOM-32 does not hold a session
+reliably. The limit comes from the fixed 16 KB TLS record buffers baked into
+the prebuilt Arduino framework; dynamic buffers would roughly halve the idle
+cost of each session, but that change cannot yet be applied through pioarduino.
+The experimental `esp32_wifi_tuned` environment rebuilds the ESP-IDF libraries
+from `packages/NoPorts_PoE/sdkconfig.noports`, and today only the lwIP part of
+that tuning takes effect (see the notes in that file), so it is not a fix
+either. Until the TLS buffers can be tuned, treat the stock ESP32 build as a
+development target only and prefer an ESP32-S3 board with PSRAM, where the
+ceiling does not apply.
+
 #### Web UI admin PIN
 
 The config web UI is protected by an admin PIN. On first boot the device
